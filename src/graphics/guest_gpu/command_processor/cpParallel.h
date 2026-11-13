@@ -118,12 +118,62 @@
 //    stays off (dual streams).
 // A "CpPar 10s: 1b3 ..." line reports the run-ahead (ops, overlap, promotions by reason, fix-ups,
 // insertions, op lock waits).
+//
+// Astro Bot PC (KYTY_CP_PAR=1b4, 13/11/2026; needs what 1b3 needs, otherwise runs as 1b1): 1b3
+// with a large run-ahead window. Measured (Aerial Garden, KYTY_CP_PAR_CENSUS): every WAIT_REG_MEM
+// of a submission waits on an address last written by that same submission; the playable config
+// writes end-of-pipe labels when they are recorded (KYTY_LABEL_MODE=record). So:
+//  - The run-ahead also executes N + 1's own CP writes and its waits on them (RunAheadSubmission,
+//    graphicsRun.cpp, "1b4 decision"): RELEASE_MEM / EVENT_WRITE_EOP labels and WRITE_DATA written
+//    at record time, barrier-only RELEASE_MEM / EVENT_WRITE (cache flushes: a barrier recorded in
+//    its own ring), DMA_DATA without GDS (buffer cache copies and fills, recorded in its ring, so
+//    ordered after N on the GPU timeline), and WAIT_REG_MEM whose awaited dwords were last written
+//    by N + 1 itself, still hold that value and are GPU-clean (no synchronizing read); it answers
+//    the sequencer like Thread_Gpu. A "CP address book" (op lock) keeps the last CP writer and
+//    value of every written dword, from both threads.
+//  - It still promotes (serially, in order, as 1b3): any end-of-pipe interrupt or event-queue
+//    signal (Interrupt: their order against N's interrupts is visible to the guest); clock and
+//    timestamp writes (Clock); GDS reads and DMA_DATA with GDS (Gds: synchronizing, one GDS);
+//    occlusion dumps (Occlusion); a label TryDeferLabel would defer (LabelDefer: completion/split
+//    label modes, KYTY_LABEL_COMPLETION_RANGES, a pending proxy label, or any deferred label pending
+//    in record mode; the completion runner is FIFO per tick, so N + 1's deferred write would land
+//    before N's later ones: the run-ahead never queues deferred labels); a write to a GPU-dirty
+//    range (GpuDirty: the write would synchronize); a write to an address that is not a learned
+//    CP-internal label (External, KYTY_CP_PAR_WRITES=local, the default: a record-time write of
+//    N + 1 is visible to the guest CPU before N's remaining labels, e.g. a "frame done" label that
+//    lets the guest reuse memory N's remaining draws still upload; only dwords that a WAIT_REG_MEM
+//    of the submission that wrote them has awaited, and that no other submission awaited, are taken
+//    as CP-internal; KYTY_CP_PAR_WRITES=all allows any address, for measurement only); a wait on a
+//    dword not last written by N + 1, changed since, unclean, or that would not pass (ForeignWait);
+//    flips, LOD statistics, constant RAM dumps, predication, COND_EXEC, branches, lockstep reads,
+//    indirect and register-less draws as in 1b3. Deferred end-of-pipe flush requests
+//    (BufferFlushForEop) only count up: optional submits stay deferred while the run-ahead is dirty.
+//  - Interleave points: Thread_Gpu releases the op lock before each op of N once no op that may
+//    submit on purpose, flip, wait on a tick or need a service command remains in N ("hard": flips,
+//    flip waits, predication, COND_EXEC, branches, lockstep reads, indirect draws and dispatches,
+//    occlusion dumps, GDS end-of-pipe reads, DMA_DATA with GDS, LOD statistics, constant RAM
+//    dumps, handoffs; published at N's StreamEnd as in 1b3, which the sequencer always emits
+//    before any op of N + 1). N's labels, writes, DMA_DATA without GDS and waits interleave
+//    (KYTY_CP_PAR_OLDEST_WRITES=hard makes N's WRITE_DATA / DMA_DATA / clock writes hard again:
+//    the run-ahead's draws may read memory at record time that such a write of N changes). A wait
+//    of N that does not pass, or a write of N that synchronizes, then submits while the run-ahead
+//    is dirty: an insertion, as in 1b3 (counted; KYTY_CP_PAR_VERIFY=1 stops). "Once no hard op
+//    remains" rather than "the next op is not hard": a hard op of N reached while the run-ahead has
+//    unmerged packets forces an insertion, whatever stops it then; KYTY_CP_PAR_INTERLEAVE=next
+//    applies the per-op rule anyway, to measure the difference.
+//  - KYTY_CP_PAR_VERIFY=1 also stops at: a run-ahead wait satisfied by a value another submission
+//    wrote; Thread_Gpu reading (WAIT_REG_MEM, DMA_DATA source) a dword the run-ahead wrote during
+//    the overlap; Thread_Gpu writing a dword the run-ahead wrote or read during the overlap; the
+//    run-ahead reading a dword whose last writer is N. Not checked: shader and draw-time reads.
+// A "CpPar 10s: 1b4 ..." line (the 1b3 counters) and a "CpPar 10s: 1b4 window ..." line report
+// run-ahead ops by kind, the new promotions, local waits and writes, interleave points and cross
+// accesses.
 
 #include <cstdint>
 
 namespace Libs::Graphics::CpPar {
 
-enum class Mode : uint8_t { Off, Serial1a, Serial1b1, Serial1b2, Concurrent1b3 };
+enum class Mode : uint8_t { Off, Serial1a, Serial1b1, Serial1b2, Concurrent1b3, Concurrent1b4 };
 
 // KYTY_CP_PAR, read once.
 [[nodiscard]] Mode GetMode();
@@ -134,12 +184,13 @@ enum class Mode : uint8_t { Off, Serial1a, Serial1b1, Serial1b2, Concurrent1b3 }
 // above).
 [[nodiscard]] inline bool SeparateWindows() {
 	return GetMode() == Mode::Serial1b1 || GetMode() == Mode::Serial1b2 ||
-	       GetMode() == Mode::Concurrent1b3;
+	       GetMode() == Mode::Concurrent1b3 || GetMode() == Mode::Concurrent1b4; // Astro Bot PC (1b4)
 }
 // KYTY_CP_PAR=1b2 (and 1b3) requested: context B records into its own target (see above).
 // Whether it is active (recorder requirements met) is StreamsActive().
 [[nodiscard]] inline bool SeparateStreams() {
-	return GetMode() == Mode::Serial1b2 || GetMode() == Mode::Concurrent1b3;
+	return GetMode() == Mode::Serial1b2 || GetMode() == Mode::Concurrent1b3 ||
+	       GetMode() == Mode::Concurrent1b4; // Astro Bot PC (KYTY_CP_PAR=1b4)
 }
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): set once at start-up, before resolver #2 runs, when the two
@@ -160,6 +211,20 @@ inline bool g_concurrent = false;
 [[nodiscard]] inline bool Concurrent() noexcept {
 	return g_concurrent;
 }
+// Astro Bot PC (KYTY_CP_PAR=1b4): set with g_concurrent when the mode is 1b4 (large window).
+inline bool g_wide = false;
+[[nodiscard]] inline bool Wide() noexcept {
+	return g_wide;
+}
+// KYTY_CP_PAR_WRITES=all (1b4): the run-ahead writes any address (not only learned CP-internal
+// labels). KYTY_CP_PAR_OLDEST_WRITES=hard (1b4): N's WRITE_DATA / DMA_DATA / clock writes are hard
+// (no interleave point before the last one). Read once.
+[[nodiscard]] bool WritesAll();
+[[nodiscard]] bool OldestWritesHard();
+// KYTY_CP_PAR_INTERLEAVE=next (1b4, measurement): an interleave point before every op of N that is
+// not hard itself, even with a hard op of N still ahead (that op then forces an insertion if it
+// submits while the run-ahead is dirty). Default: once no hard op remains in N. Read once.
+[[nodiscard]] bool InterleaveNext();
 // KYTY_CP_PAR_VERIFY=1 (1b3): stop at the first insertion (data-order inversion). Read once.
 [[nodiscard]] bool VerifyEnabled();
 // The calling thread executes a run-ahead op before its merge: image accesses use its overlay
@@ -205,8 +270,38 @@ enum class Promotion : uint32_t {
 	NoRegisters, // a draw or dispatch without its own registers (snapshot or prepared slot)
 	Ring,        // its recorder ring is half full (the replay cannot drain it before the merge)
 	Stop,        // hand-over, or the oldest submission ended first
+	// Astro Bot PC (KYTY_CP_PAR=1b4): why a write or wait of the kinds the run-ahead may execute
+	// is promoted anyway (see above).
+	Interrupt,   // end-of-pipe interrupt / event-queue signal
+	LabelDefer,  // TryDeferLabel would defer it (label mode, ranges, proxy, pending deferred labels)
+	Clock,       // reference clock or timestamp write
+	Gds,         // GDS read or DMA_DATA with GDS
+	Occlusion,   // occlusion counter dump
+	External,    // a write to an address that is not a learned CP-internal label
+	GpuDirty,    // a write or wait on a GPU-dirty range (it would synchronize)
+	ForeignWait, // a wait on a dword not last written (with that value) by this submission
 	Count,
 };
+// Astro Bot PC (KYTY_CP_PAR=1b4) statistics: a run-ahead op of kind `kind` (CpSeq::OpKind) executed;
+// a run-ahead wait satisfied by its own write; a run-ahead write to an address checked by the book
+// (learned label, or any with KYTY_CP_PAR_WRITES=all); an interleave point of Thread_Gpu (offered:
+// the op lock released before an op of N; refused: the run-ahead could run but N still has a hard op
+// ahead); a cross access during the overlap (the verify checks above, counted when not stopping);
+// the address book's sizes (written dwords, learned labels).
+enum class Cross : uint32_t {
+	OldestReadAhead,   // Thread_Gpu read a dword the run-ahead wrote
+	OldestWriteAhead,  // Thread_Gpu wrote a dword the run-ahead wrote or read
+	AheadReadOldest,   // the run-ahead read a dword whose last writer is N
+	AheadForeignValue, // a run-ahead wait passed on a value it did not write
+	Count,
+};
+void NoteRunAheadKind(uint32_t kind);
+void NoteLocalWait();
+void NoteLocalWrite();
+void NoteInterleave(bool offered);
+// Counts it; with KYTY_CP_PAR_VERIFY=1, stops the emulator (address for the message).
+void NoteCross(Cross which, uint64_t address);
+void NoteBook(uint64_t written, uint64_t labels);
 void NotePromotion(Promotion reason);
 void NoteRunAheadStart();
 // A run-ahead op executed, holding the op lock for `ns`.

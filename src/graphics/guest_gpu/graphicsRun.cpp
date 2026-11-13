@@ -19,6 +19,18 @@
 #include "graphics/guest_gpu/command_processor/cpSequencer.h"
 #include "graphics/guest_gpu/command_processor/parCensus.h"
 #include "graphics/guest_gpu/command_processor/stateTrace.h"
+
+// Astro Bot PC (KYTY_CP_PAR=1b4) : KYTY_CP_PAR_CLOCK=local (defaut) laisse le second fil ecrire lui-meme les horodatages
+// (COPY_DATA de l'horloge, fins de travail avec horodatage) au lieu de repasser en serie : chaque liste commence par un
+// horodatage, et ces valeurs ne servent qu'aux mesures de temps du jeu (decalees de quelques ms au plus).
+// KYTY_CP_PAR_CLOCK=serial : comportement precedent (promotion).
+static bool ClockLocal() {
+	static const bool local = [] {
+		const char* v = std::getenv("KYTY_CP_PAR_CLOCK");
+		return v == nullptr || std::strcmp(v, "serial") != 0;
+	}();
+	return local;
+}
 #include "graphics/guest_gpu/command_processor/cpVerify.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpuTimestampScale.h"
@@ -124,6 +136,274 @@ CpParRun g_cp_par_run;
 // The resolver context of the calling thread's ops (CommandProcessor::ResolvePrep), 1b3 only.
 thread_local bool t_cp_par_resolve_b = false;
 } // namespace
+
+// Astro Bot PC (KYTY_CP_PAR=1b4, cpParallel.h): the CP address book. Read and written under the CP
+// op lock only (Thread_Gpu's ops of queue-0 submissions and the run-ahead's ops). Per guest dword
+// written by a CP op: the last submission that wrote it and the value (when the op's data says
+// it); the dwords learned as CP-internal labels (awaited by a WAIT_REG_MEM of the submission that
+// last wrote them) and those awaited by another submission (never CP-internal); during an overlap
+// (offer to merge or hand-over), the dwords each side wrote and those the run-ahead read.
+namespace {
+struct CpParBook {
+	struct Write {
+		uint64_t submission = 0;
+		uint32_t value      = 0;
+		bool     known      = false;
+	};
+	std::unordered_map<uint64_t, Write> writes;
+	std::unordered_set<uint64_t>        labels;
+	std::unordered_set<uint64_t>        shared;
+	bool                                overlap = false;
+	std::unordered_set<uint64_t>        ahead_written;
+	std::unordered_set<uint64_t>        ahead_read;
+	std::unordered_set<uint64_t>        oldest_written;
+	void EndOverlap() {
+		overlap = false;
+		ahead_written.clear();
+		ahead_read.clear();
+		oldest_written.clear();
+	}
+};
+CpParBook g_cp_par_book;
+
+// The guest dwords an op writes (at most MaxDwords tracked; the values when known).
+struct CpParRange {
+	static constexpr uint32_t MaxDwords = 64;
+	uint64_t                  address   = 0;
+	uint32_t                  dwords    = 0;
+	bool                      known     = false;
+	uint32_t                  values[2] = {};      // known values (labels)
+	const uint32_t*           source    = nullptr; // known values (WRITE_DATA inline data)
+	[[nodiscard]] uint32_t Value(uint32_t i) const {
+		return source != nullptr ? source[i] : values[i];
+	}
+};
+} // namespace
+
+static bool CpParOpWrites(CpSeq::OpKind kind, const void* payload, const void* data,
+                          CpParRange& range) {
+	using CpSeq::OpKind;
+	range = {};
+	switch (kind) {
+		case OpKind::WriteData: {
+			const auto& op = *static_cast<const CpSeq::WriteDataOp*>(payload);
+			if (op.dw_num == 0 || op.dst == 0) {
+				return false;
+			}
+			const bool  one = ((op.write_control >> 16u) & 0x1u) != 0;
+			const auto* src = static_cast<const uint32_t*>(data);
+			range.address   = op.dst;
+			range.dwords    = one ? 1u : op.dw_num;
+			range.known     = src != nullptr;
+			range.source    = src != nullptr ? (one ? src + (op.dw_num - 1u) : src) : nullptr;
+			break;
+		}
+		case OpKind::EndOfPipe: {
+			const auto& op = *static_cast<const CpSeq::EndOfPipeOp*>(payload);
+			if (op.dst == 0) {
+				return false;
+			}
+			range.address = op.dst;
+			if (op.size == sizeof(uint32_t) && op.event_write_source == 0x01u) {
+				range.dwords = static_cast<uint32_t>(op.value >> 16u) & 0xffffu; // GDS snapshot
+			} else if (op.event_write_source == 0x02u) {
+				range.dwords    = op.size == sizeof(uint64_t) ? 2u : 1u;
+				range.known     = true;
+				range.values[0] = static_cast<uint32_t>(op.value);
+				range.values[1] = static_cast<uint32_t>(op.value >> 32u);
+			} else if (op.event_write_source == 0x01u) {
+				range.dwords    = 1; // 64-bit form with 32-bit data
+				range.known     = true;
+				range.values[0] = static_cast<uint32_t>(op.value);
+			} else {
+				range.dwords = 2; // clock
+			}
+			break;
+		}
+		case OpKind::ReleaseMem: {
+			const auto* body     = static_cast<const CpSeq::ReleaseMemOp*>(payload)->body;
+			const auto  data_sel = (body[1] >> 29u) & 0x7u;
+			range.address        = body[2] | (static_cast<uint64_t>(body[3]) << 32u);
+			if (data_sel == 0 || range.address == 0) {
+				return false;
+			}
+			if (data_sel == 1 || data_sel == 2) {
+				range.dwords    = data_sel == 1 ? 1u : 2u;
+				range.known     = true;
+				range.values[0] = body[4];
+				range.values[1] = body[5];
+			} else if (data_sel == 5) {
+				range.dwords = (body[4] >> 16u) & 0xffffu; // GDS snapshot
+			} else {
+				range.dwords = 2; // clock
+			}
+			break;
+		}
+		case OpKind::ReferenceClock: {
+			const auto& op = *static_cast<const CpSeq::ReferenceClockOp*>(payload);
+			range.address  = op.dst;
+			range.dwords   = op.num_bytes / 4u;
+			break;
+		}
+		case OpKind::DmaData: {
+			const auto& op = *static_cast<const CpSeq::DmaDataOp*>(payload);
+			if ((op.dst_sel != 0 && op.dst_sel != 3) || static_cast<uint32_t>(op.dst) == 0x3022cu) {
+				return false; // GDS, nowhere, the ignored register
+			}
+			range.address = op.dst;
+			range.dwords  = op.num_bytes / 4u;
+			break;
+		}
+		case OpKind::EventWrite: {
+			const auto& op = *static_cast<const CpSeq::EventWriteOp*>(payload);
+			if (op.event_type != 0x39u || op.address == 0) {
+				return false;
+			}
+			range.address = op.address; // occlusion results
+			range.dwords  = 62;
+			break;
+		}
+		default: return false;
+	}
+	range.address &= ~uint64_t {3};
+	range.dwords = std::min(range.dwords, CpParRange::MaxDwords);
+	return range.address != 0 && range.dwords != 0;
+}
+
+// The guest dwords an op reads (WAIT_REG_MEM, DMA_DATA source in memory): false for none.
+static bool CpParOpReads(CpSeq::OpKind kind, const void* payload, uint64_t& address,
+                         uint32_t& dwords) {
+	if (kind == CpSeq::OpKind::WaitRegMem) {
+		const auto& op = *static_cast<const CpSeq::WaitRegMemOp*>(payload);
+		address        = op.addr & ~uint64_t {3};
+		dwords         = op.size == sizeof(uint64_t) ? 2u : 1u;
+		return op.addr != 0;
+	}
+	if (kind == CpSeq::OpKind::DmaData) {
+		const auto& op = *static_cast<const CpSeq::DmaDataOp*>(payload);
+		if ((op.src_sel != 0 && op.src_sel != 3) || op.src == 0 || op.num_bytes == 0) {
+			return false;
+		}
+		address = op.src & ~uint64_t {3};
+		dwords  = std::min(op.num_bytes / 4u, CpParRange::MaxDwords);
+		return dwords != 0;
+	}
+	return false;
+}
+
+// Thread_Gpu, before executing an op of a queue-0 submission: its reads of the run-ahead's writes.
+static void CpParBookBeforeOldestOp(CpSeq::OpKind kind, const void* payload) {
+	auto& book = g_cp_par_book;
+	if (!book.overlap || book.ahead_written.empty()) {
+		return;
+	}
+	uint64_t address = 0;
+	uint32_t dwords  = 0;
+	if (CpParOpReads(kind, payload, address, dwords)) {
+		for (uint32_t i = 0; i < dwords; i++) {
+			if (book.ahead_written.count(address + 4u * i) != 0) {
+				CpPar::NoteCross(CpPar::Cross::OldestReadAhead, address + 4u * i);
+				break;
+			}
+		}
+	}
+}
+
+// Either thread, after an op of `submission` executed (`ahead`: by the run-ahead).
+static void CpParBookAfterOp(CpSeq::OpKind kind, const void* payload, const void* data,
+                             uint64_t submission, bool ahead) {
+	auto&      book = g_cp_par_book;
+	CpParRange range;
+	if (CpParOpWrites(kind, payload, data, range)) {
+		for (uint32_t i = 0; i < range.dwords; i++) {
+			const auto address = range.address + 4u * i;
+			if (!ahead && book.overlap &&
+			    (book.ahead_written.count(address) != 0 || book.ahead_read.count(address) != 0)) {
+				CpPar::NoteCross(CpPar::Cross::OldestWriteAhead, address);
+			}
+			auto& write      = book.writes[address];
+			write.submission = submission;
+			write.known      = range.known && (range.source != nullptr || i < 2u);
+			write.value      = write.known ? range.Value(i) : 0u;
+			if (book.overlap) {
+				(ahead ? book.ahead_written : book.oldest_written).insert(address);
+			}
+		}
+	}
+	// Reads: a WAIT_REG_MEM teaches the labels (CP-internal when the waiting submission wrote the
+	// dword last, shared otherwise); the run-ahead's reads of the overlap are kept.
+	uint64_t read_address = 0;
+	uint32_t read_dwords  = 0;
+	if (CpParOpReads(kind, payload, read_address, read_dwords)) {
+		for (uint32_t i = 0; i < read_dwords; i++) {
+			const auto dword = read_address + 4u * i;
+			if (kind == CpSeq::OpKind::WaitRegMem) {
+				if (const auto found = book.writes.find(dword); found != book.writes.end()) {
+					if (found->second.submission == submission) {
+						if (book.shared.count(dword) == 0) {
+							book.labels.insert(dword);
+						}
+					} else {
+						book.shared.insert(dword);
+						book.labels.erase(dword);
+					}
+				}
+			}
+			if (ahead && book.overlap) {
+				book.ahead_read.insert(dword);
+			}
+		}
+	}
+	// Bounded: forgetting only makes later run-ahead ops promote.
+	if (book.writes.size() > (1u << 18u)) {
+		book.writes.clear();
+	}
+	if (book.labels.size() > (1u << 16u) || book.shared.size() > (1u << 16u)) {
+		book.labels.clear();
+		book.shared.clear();
+	}
+	CpPar::NoteBook(book.writes.size(), book.labels.size());
+}
+
+// Astro Bot PC (KYTY_CP_PAR=1b4, cpParallel.h): an op of the oldest submission no interleave point
+// may precede while the run-ahead could still run (it may submit on purpose, flip, wait on a tick
+// or need a service command; KYTY_CP_PAR_OLDEST_WRITES=hard: also its memory writes the
+// run-ahead's draws may read at record time). Sequencer thread (emission).
+static bool CpParHardForOldest(CpSeq::OpKind kind, const void* payload) {
+	using CpSeq::OpKind;
+	switch (kind) {
+		case OpKind::Flip:
+		case OpKind::WaitFlipDone:
+		case OpKind::Predication:
+		case OpKind::CondExec:
+		case OpKind::Branch:
+		case OpKind::LockstepRead:
+		case OpKind::DrawIndirect:
+		case OpKind::DrawIndirectMulti:
+		case OpKind::DispatchIndirect:
+		case OpKind::LodStats:
+		case OpKind::DumpConstRam:
+		case OpKind::Handoff: return true;
+		case OpKind::EventWrite:
+			return static_cast<const CpSeq::EventWriteOp*>(payload)->event_type == 0x39u; // occlusion
+		case OpKind::EndOfPipe: {
+			// A GDS read (SynchronizeGpu, or a deferred snapshot): 32-bit, GDS source.
+			const auto& op = *static_cast<const CpSeq::EndOfPipeOp*>(payload);
+			return op.size == sizeof(uint32_t) && op.event_write_source == 0x01u;
+		}
+		case OpKind::ReleaseMem: {
+			const auto* body = static_cast<const CpSeq::ReleaseMemOp*>(payload)->body;
+			return ((body[1] >> 29u) & 0x7u) == 5u; // DATA_SEL GDS
+		}
+		case OpKind::DmaData: {
+			const auto& op = *static_cast<const CpSeq::DmaDataOp*>(payload);
+			return op.dst_sel == 1u || op.src_sel == 1u || CpPar::OldestWritesHard();
+		}
+		case OpKind::WriteData:
+		case OpKind::ReferenceClock: return CpPar::OldestWritesHard();
+		default: return false;
+	}
+}
 
 // Astro Bot PC (KYTY_CP_PAR=1b3): the op lock changed threads. The RenderExecutor's shadows of
 // the command buffer describe the other context's stream; a draw-run continuation must not cross.
@@ -326,8 +606,11 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					CpPar::g_streams_active = true;
 					// Astro Bot PC (KYTY_CP_PAR=1b3): the run-ahead instead of the token; the image
 					// state hash bookkeeping is 1b2's only.
-					CpPar::g_concurrent = CpPar::GetMode() == CpPar::Mode::Concurrent1b3;
-					CpPar::g_hash_book  = !CpPar::g_concurrent;
+					CpPar::g_concurrent = CpPar::GetMode() == CpPar::Mode::Concurrent1b3 ||
+					                      CpPar::GetMode() == CpPar::Mode::Concurrent1b4;
+					// Astro Bot PC (KYTY_CP_PAR=1b4): the large run-ahead window (cpParallel.h).
+					CpPar::g_wide      = CpPar::GetMode() == CpPar::Mode::Concurrent1b4;
+					CpPar::g_hash_book = !CpPar::g_concurrent;
 					std::printf("Kyty CpPar: context B records into its own command buffer wrapper "
 					            "and recorder ring (%s)\n",
 					            CpPar::g_concurrent ? "segments per submission, replayed in admission order"
@@ -335,12 +618,19 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 				} else {
 					std::printf("Kyty CpPar: KYTY_CP_PAR=%s needs KYTY_CP_RECORDER=1 without "
 					            "KYTY_CP_RECORDER_VERIFY; running as 1b1\n",
-					            CpPar::GetMode() == CpPar::Mode::Concurrent1b3 ? "1b3" : "1b2");
+					            CpPar::GetMode() == CpPar::Mode::Concurrent1b3   ? "1b3"
+					            : CpPar::GetMode() == CpPar::Mode::Concurrent1b4 ? "1b4" // Astro Bot PC
+					                                                             : "1b2");
 				}
 			}
 			if (CpPar::Concurrent()) {
 				// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h).
 				(void)CpPar::VerifyEnabled();
+				if (CpPar::Wide()) {
+					(void)CpPar::WritesAll(); // Astro Bot PC (KYTY_CP_PAR=1b4): read once, printed
+					(void)CpPar::OldestWritesHard();
+					(void)CpPar::InterleaveNext();
+				}
 				CpPar::SetInsertHook(
 				    [](void* context, uint32_t trigger) {
 					    static_cast<GuestGpu*>(context)->CpParInsert(trigger);
@@ -5346,7 +5636,10 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 		// command or write guest memory a later submission's draws may read at record time.
 		using CpSeq::OpKind;
 		bool quiet = false;
-		switch (kind) {
+		if (CpPar::Wide()) {
+			// Astro Bot PC (KYTY_CP_PAR=1b4): only the hard ops end the interleaving (cpParallel.h).
+			quiet = !CpParHardForOldest(kind, payload);
+		} else switch (kind) {
 			case OpKind::DrawIndex:
 			case OpKind::DrawAuto:
 			case OpKind::DispatchDirect:
@@ -6225,6 +6518,11 @@ void GuestGpu::CpParMaybeOffer(const Submission& submission) {
 	run.resolver_packets = 0;
 	run.retry_op         = 0;
 	run.adopt_pending    = false;
+	if (CpPar::Wide()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b4): the overlap's cross-access sets (op lock held).
+		g_cp_par_book.EndOverlap();
+		g_cp_par_book.overlap = true;
+	}
 	CpPar::OfferRunAhead(&GuestGpu::CpParRunAheadTask, this);
 }
 
@@ -6238,6 +6536,7 @@ bool GuestGpu::CpParHandOver(uint64_t front_sequence) {
 	}
 	// The oldest submission ended first (the queue front is the target): merged if it began.
 	EXIT_IF(run.began || run.switch_back);
+	g_cp_par_book.EndOverlap(); // Astro Bot PC (KYTY_CP_PAR=1b4)
 	run.offered       = false;
 	run.adopt_pending = run.started;
 	return true;
@@ -6246,6 +6545,7 @@ bool GuestGpu::CpParHandOver(uint64_t front_sequence) {
 void GuestGpu::CpParMerge() {
 	auto& run = g_cp_par_run;
 	run.oldest_done.store(true, std::memory_order_release);
+	g_cp_par_book.EndOverlap(); // Astro Bot PC (KYTY_CP_PAR=1b4): the oldest has ended
 	if (!run.began) {
 		return;
 	}
@@ -6378,6 +6678,31 @@ static CpPar::Promotion RunAheadBlocker(CpSeq::OpKind kind, const void* payload)
 	}
 }
 
+// Astro Bot PC (KYTY_CP_PAR=1b4, cpParallel.h): the kinds whose run-ahead decision depends on the
+// op's payload and the CP address book (RunAheadSubmission, under the op lock).
+static bool RunAheadWideKind(CpSeq::OpKind kind) {
+	using CpSeq::OpKind;
+	switch (kind) {
+		case OpKind::EndOfPipe:
+		case OpKind::ReleaseMem:
+		case OpKind::EventWrite:
+		case OpKind::WriteData:
+		case OpKind::DmaData:
+		case OpKind::ReferenceClock:
+		case OpKind::WaitRegMem: return true;
+		default: return false;
+	}
+}
+
+// KYTY_LABEL_COMPLETION_RANGES is set (LabelRangeSelected may defer any label).
+static bool LabelRangesConfigured() {
+	static const bool configured = [] {
+		const auto* value = std::getenv("KYTY_LABEL_COMPLETION_RANGES");
+		return value != nullptr && *value != 0;
+	}();
+	return configured;
+}
+
 uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t submission,
                                               uint32_t context) {
 	using CpPar::Promotion;
@@ -6402,6 +6727,149 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 		CommandProcessor* previous_processor;
 		Pm4Execution*     previous_execution;
 	} scope(*this, execution);
+	// Astro Bot PC (KYTY_CP_PAR=1b4, cpParallel.h): the decision for a write or a wait of the next
+	// submission (op lock held): Promotion::Count executes it. `checked`: a record-time write whose
+	// address the book allowed; `local_wait`: a wait on this submission's own write.
+	auto&      book           = g_cp_par_book;
+	const auto label_deferred = [this] {
+		return LabelCompletionMode() || LabelRangesConfigured() || m_defer_next_label ||
+		       m_renderer.GetGpu().HasDeferredLabels();
+	};
+	const auto check_write = [](uint64_t address, uint64_t bytes, bool& checked) {
+		const auto& book = g_cp_par_book;
+		if (address == 0 || bytes == 0) {
+			return Promotion::Write;
+		}
+		if (!LibKernel::Memory::IsGpuCleanForRead(address, bytes)) {
+			return Promotion::GpuDirty;
+		}
+		if (!CpPar::WritesAll()) {
+			const auto first  = address & ~uint64_t {3};
+			const auto dwords = (address + bytes - first + 3u) / 4u;
+			if (dwords > CpParRange::MaxDwords) {
+				return Promotion::External;
+			}
+			for (uint64_t i = 0; i < dwords; i++) {
+				const auto dword = first + 4u * i;
+				if (book.labels.count(dword) == 0 || book.shared.count(dword) != 0) {
+					return Promotion::External;
+				}
+			}
+		}
+		checked = true;
+		return Promotion::Count;
+	};
+	const auto decide = [&](CpSeq::OpKind kind, const void* payload, const void* data,
+	                        bool& checked, bool& local_wait) {
+		using CpSeq::OpKind;
+		switch (kind) {
+			case OpKind::EventWrite:
+				// Cache flushes and partial flushes: a barrier in its own ring (or ignored).
+				return static_cast<const CpSeq::EventWriteOp*>(payload)->event_type == 0x39u
+				           ? Promotion::Occlusion
+				           : Promotion::Count;
+			case OpKind::WriteData: {
+				const auto& op = *static_cast<const CpSeq::WriteDataOp*>(payload);
+				if (op.dw_num == 0) {
+					return Promotion::Count;
+				}
+				if (LabelCompletionMode() || data == nullptr) {
+					return Promotion::LabelDefer; // split mode may defer it behind a pending label
+				}
+				const bool one = ((op.write_control >> 16u) & 0x1u) != 0;
+				return check_write(op.dst, one ? 4u : uint64_t {op.dw_num} * 4u, checked);
+			}
+			case OpKind::EndOfPipe: {
+				const auto& op = *static_cast<const CpSeq::EndOfPipeOp*>(payload);
+				if (op.interrupt_selector != 0x00u && op.interrupt_selector != 0x03u) {
+					return Promotion::Interrupt;
+				}
+				if (op.event_write_source == 0x04u) {
+					return ClockLocal() ? Promotion::Count : Promotion::Clock; // Astro Bot PC : KYTY_CP_PAR_CLOCK
+				}
+				if (op.size == sizeof(uint32_t) && op.event_write_source == 0x01u) {
+					return Promotion::Gds;
+				}
+				if (op.event_write_source != 0x01u && op.event_write_source != 0x02u) {
+					return Promotion::Write;
+				}
+				if (label_deferred()) {
+					return Promotion::LabelDefer;
+				}
+				const bool wide = op.size == sizeof(uint64_t) && op.event_write_source == 0x02u;
+				return check_write(op.dst, wide ? 8u : 4u, checked);
+			}
+			case OpKind::ReleaseMem: {
+				const auto* body        = static_cast<const CpSeq::ReleaseMemOp*>(payload)->body;
+				const auto  data_sel    = (body[1] >> 29u) & 0x7u;
+				const auto  int_sel     = (body[1] >> 24u) & 0x7u;
+				const auto  release_dst = (body[1] >> 16u) & 0x3u;
+				const auto  dst         = body[2] | (static_cast<uint64_t>(body[3]) << 32u);
+				if (int_sel != 0x00u && int_sel != 0x03u) {
+					return Promotion::Interrupt;
+				}
+				if (data_sel == 0 || (release_dst == 0 && dst == 0)) {
+					return Promotion::Count; // a barrier only
+				}
+				if (data_sel == 5) {
+					return Promotion::Gds;
+				}
+				if (data_sel == 3) {
+					return ClockLocal() ? Promotion::Count : Promotion::Clock; // Astro Bot PC : KYTY_CP_PAR_CLOCK
+				}
+				if ((data_sel != 1 && data_sel != 2) || dst == 0) {
+					return Promotion::Write;
+				}
+				if (label_deferred()) {
+					return Promotion::LabelDefer;
+				}
+				return check_write(dst, data_sel == 1 ? 4u : 8u, checked);
+			}
+			case OpKind::DmaData: {
+				// Buffer cache fills and copies, recorded in its own ring (GPU order after N).
+				const auto& op = *static_cast<const CpSeq::DmaDataOp*>(payload);
+				return op.dst_sel == 1u || op.src_sel == 1u ? Promotion::Gds : Promotion::Count;
+			}
+			case OpKind::ReferenceClock:
+				return ClockLocal() ? Promotion::Count : Promotion::Clock; // Astro Bot PC : KYTY_CP_PAR_CLOCK
+			case OpKind::WaitRegMem: {
+				const auto& op   = *static_cast<const CpSeq::WaitRegMemOp*>(payload);
+				const auto  size = op.size == sizeof(uint64_t) ? 8u : 4u;
+				if (op.addr == 0 || (op.addr & 3u) != 0) {
+					return Promotion::ForeignWait;
+				}
+				uint32_t stored[2] = {};
+				for (uint32_t i = 0; i < size / 4u; i++) {
+					const auto found = book.writes.find(op.addr + 4u * i);
+					if (found == book.writes.end() || found->second.submission != submission ||
+					    !found->second.known) {
+						return Promotion::ForeignWait; // not this submission's own write
+					}
+					stored[i] = found->second.value;
+				}
+				uint64_t value = 0;
+				if (!LibKernel::Memory::IsGpuCleanForRead(op.addr, size) ||
+				    !LibKernel::Memory::TryReadGpuCleanBacking(op.addr, &value, size)) {
+					return Promotion::GpuDirty; // the read would synchronize
+				}
+				if (static_cast<uint32_t>(value) != stored[0] ||
+				    (size == 8u && static_cast<uint32_t>(value >> 32u) != stored[1])) {
+					return Promotion::ForeignWait; // changed since this submission wrote it
+				}
+				const bool passes =
+				    size == 8u ? TestWaitRegMemValue(value, op.ref, op.mask, op.func)
+				               : TestWaitRegMemValue(static_cast<uint32_t>(value),
+				                                     static_cast<uint32_t>(op.ref),
+				                                     static_cast<uint32_t>(op.mask), op.func);
+				if (!passes) {
+					return Promotion::ForeignWait; // it waits for a later write
+				}
+				local_wait = true;
+				return Promotion::Count;
+			}
+			default: return Promotion::Write;
+		}
+	};
 	for (uint32_t idle = 0;;) {
 		if (CpPar::RunAheadStopRequested() || run.oldest_done.load(std::memory_order_acquire)) {
 			return static_cast<uint32_t>(Promotion::Stop);
@@ -6423,7 +6891,9 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 		idle               = 0;
 		const auto kind    = view.Kind();
 		const auto blocker = RunAheadBlocker(kind, view.payload);
-		if (blocker != Promotion::Count) {
+		// Astro Bot PC (KYTY_CP_PAR=1b4): writes and waits are decided under the op lock below.
+		const bool wide_op = CpPar::Wide() && RunAheadWideKind(kind);
+		if (blocker != Promotion::Count && !wide_op) {
 			return static_cast<uint32_t>(blocker);
 		}
 		if (CpPar::OpLockAcquire(1)) {
@@ -6446,6 +6916,16 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 			release();
 			return static_cast<uint32_t>(Promotion::Ring);
 		}
+		// Astro Bot PC (KYTY_CP_PAR=1b4): its own writes and waits (cpParallel.h).
+		bool checked_write = false;
+		bool local_wait    = false;
+		if (wide_op) {
+			const auto reason = decide(kind, view.payload, view.data, checked_write, local_wait);
+			if (reason != Promotion::Count) {
+				release();
+				return static_cast<uint32_t>(reason);
+			}
+		}
 		if (!run.began) {
 			EXIT_IF(run.begun[context] || run.open == context);
 			scheduler.BeginContextSegment();
@@ -6458,6 +6938,7 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 			}
 		}
 		// This context's CP resolver fields (Thread_Gpu's are saved, it is between ops).
+		bool       suspended       = false; // Astro Bot PC (KYTY_CP_PAR=1b4): a wait that did not pass
 		const auto saved_packets   = m_resolver_packets;
 		const auto saved_retry     = m_retry_op;
 		const auto saved_submit_id = m_submit_id;
@@ -6498,12 +6979,45 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 			if (snapshot != nullptr) {
 				scheduler.RestoreRegisters(previous);
 			}
-			EXIT_IF(result.suspended); // draws and dispatches never suspend
-			ParCensus::NoteOp(kind, view.payload); // Astro Bot PC : KYTY_CP_PAR_CENSUS
-			if (snapshot != nullptr) {
-				ResolveSnapshots().Release();
+			if (result.suspended) {
+				// Astro Bot PC (KYTY_CP_PAR=1b4): only a wait suspends (draws and dispatches never
+				// do); it stays at the ring's head and Thread_Gpu retries it after the merge.
+				EXIT_IF(kind != CpSeq::OpKind::WaitRegMem || snapshot != nullptr);
+				m_retry_op = sequence + 1u;
+				suspended  = true;
+			} else {
+				m_retry_op = 0;
+				ParCensus::NoteOp(kind, view.payload); // Astro Bot PC : KYTY_CP_PAR_CENSUS
+				if (snapshot != nullptr) {
+					ResolveSnapshots().Release();
+				}
+				if (local_wait) {
+					// Astro Bot PC (KYTY_CP_PAR=1b4): what it read is its own write (verify checks).
+					const auto& wait  = view.As<CpSeq::WaitRegMemOp>();
+					const auto  size  = wait.size == sizeof(uint64_t) ? 8u : 4u;
+					uint64_t    value = 0;
+					const bool  read  = !CpPar::VerifyEnabled() ||
+					                   LibKernel::Memory::TryReadGpuCleanBacking(wait.addr, &value, size);
+					for (uint32_t i = 0; i < size / 4u; i++) {
+						const auto found = book.writes.find(wait.addr + 4u * i);
+						if (found != book.writes.end() && found->second.submission == run.oldest) {
+							CpPar::NoteCross(CpPar::Cross::AheadReadOldest, wait.addr + 4u * i);
+						}
+						if (CpPar::VerifyEnabled() &&
+						    (!read || found == book.writes.end() || found->second.submission != submission ||
+						     found->second.value != static_cast<uint32_t>(value >> (32u * i)))) {
+							CpPar::NoteCross(CpPar::Cross::AheadForeignValue, wait.addr + 4u * i);
+						}
+					}
+				}
+				ops.Pop();
+				if (CpSeq::IsLockstep(kind)) {
+					sequencer.Answer(sequence, result.value); // Astro Bot PC (KYTY_CP_PAR=1b4)
+				}
+				if (CpPar::Wide()) {
+					CpParBookAfterOp(kind, view.payload, view.data, submission, true);
+				}
 			}
-			ops.Pop();
 		}
 		CpPar::t_overlay = false;
 		Image::CpParEndOp();
@@ -6519,14 +7033,30 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 			CommandRecorder::SetThreadStream(context);
 			m_renderer.GetRenderExecutor().CpParForgetCommandShadows();
 		}
-		run.next_op          = sequence + 1u;
+		if (!suspended) {
+			run.next_op = sequence + 1u;
+		}
 		run.resolver_packets = m_resolver_packets;
 		run.retry_op         = m_retry_op;
 		run.submit_id        = m_submit_id;
 		m_resolver_packets   = saved_packets;
 		m_retry_op           = saved_retry;
 		m_submit_id          = saved_submit_id;
+		if (suspended) {
+			release();
+			return static_cast<uint32_t>(Promotion::ForeignWait);
+		}
 		CpPar::NoteRunAheadOp(CpPar::NowNs() - op_start);
+		if (CpPar::Wide()) {
+			// Astro Bot PC (KYTY_CP_PAR=1b4) statistics.
+			CpPar::NoteRunAheadKind(static_cast<uint32_t>(kind));
+			if (local_wait) {
+				CpPar::NoteLocalWait();
+			}
+			if (checked_write) {
+				CpPar::NoteLocalWrite();
+			}
+		}
 		release();
 		// Its window and snapshot slots are free: a parked sequencer re-checks.
 		sequencer.Poke();
@@ -6653,13 +7183,24 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		const auto& header   = *view.header;
 		if (concurrent && g_cp_par_run.offered && g_cp_par_run.oldest == submission &&
 		    !g_cp_par_run.oldest_done.load(std::memory_order_relaxed) &&
-		    !g_cp_par_run.ended.load(std::memory_order_acquire) &&
-		    CpPar::TailQuiet(submission, sequence)) {
-			// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the interleave point, in the quiet
-			// tail: the run-ahead may execute one op now (the lock is FIFO).
-			CpPar::OpLockRelease(0);
-			if (CpPar::OpLockAcquire(0)) {
-				CpParNoteHolderChange(m_renderer);
+		    !g_cp_par_run.ended.load(std::memory_order_acquire)) {
+			// Astro Bot PC (KYTY_CP_PAR=1b4): KYTY_CP_PAR_INTERLEAVE=next tests N's next op only.
+			const bool point = CpPar::Wide() && CpPar::InterleaveNext()
+			                       ? !CpParHardForOldest(kind, view.payload)
+			                       : CpPar::TailQuiet(submission, sequence);
+			if (point) {
+				// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the interleave point, in the quiet
+				// tail (1b4: once no hard op remains): the run-ahead may execute one op now (the
+				// lock is FIFO).
+				if (CpPar::Wide()) {
+					CpPar::NoteInterleave(true);
+				}
+				CpPar::OpLockRelease(0);
+				if (CpPar::OpLockAcquire(0)) {
+					CpParNoteHolderChange(m_renderer);
+				}
+			} else if (CpPar::Wide()) {
+				CpPar::NoteInterleave(false); // Astro Bot PC (KYTY_CP_PAR=1b4)
 			}
 		}
 		if (kind == CpSeq::OpKind::StreamBegin) {
@@ -6758,6 +7299,9 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			                         diagnostic_args[3], CpSeq::OpKindName(kind));
 		}
 		CommitStats::StepMark(CommitStats::Step::GapLoop);
+		if (concurrent && CpPar::Wide()) {
+			CpParBookBeforeOldestOp(kind, view.payload); // Astro Bot PC (KYTY_CP_PAR=1b4)
+		}
 		CpSeq::Result result;
 		if (CpPar::OnResolver2() &&
 		    (kind == CpSeq::OpKind::Flip || kind == CpSeq::OpKind::WaitFlipDone)) {
@@ -6782,6 +7326,10 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		}
 		m_retry_op = 0;
 		ParCensus::NoteOp(kind, view.payload); // Astro Bot PC : KYTY_CP_PAR_CENSUS
+		if (concurrent && CpPar::Wide()) {
+			// Astro Bot PC (KYTY_CP_PAR=1b4): the CP address book (op lock held).
+			CpParBookAfterOp(kind, view.payload, view.data, submission, false);
+		}
 		if (following && m_verifier->Follows(submission)) {
 			m_verifier->After(view, result);
 		}

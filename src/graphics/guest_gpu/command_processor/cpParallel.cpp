@@ -3,6 +3,8 @@
 
 #include "graphics/guest_gpu/command_processor/cpParallel.h"
 
+#include "graphics/guest_gpu/command_processor/cpOps.h" // Astro Bot PC (KYTY_CP_PAR=1b4): op names
+
 #include "common/assert.h"
 #include "common/hangWatchdog.h"
 #include "common/profiler.h"
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 
@@ -67,6 +70,16 @@ struct Stats {
 	std::array<std::atomic<uint64_t>, 2> lock_wait_ns {};
 	std::array<std::atomic<uint64_t>, 2> lock_takes {};
 	std::atomic<uint64_t> overlap_ns {0};
+	// Astro Bot PC (KYTY_CP_PAR=1b4): run-ahead ops by kind, its waits satisfied by its own writes,
+	// its writes to checked addresses, Thread_Gpu's interleave points, cross accesses, book sizes.
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(CpSeq::OpKind::Count)> runahead_kinds {};
+	std::atomic<uint64_t> local_waits {0};
+	std::atomic<uint64_t> local_writes {0};
+	std::atomic<uint64_t> interleave_offered {0};
+	std::atomic<uint64_t> interleave_refused {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Cross::Count)> cross {};
+	std::atomic<uint64_t> book_written {0};
+	std::atomic<uint64_t> book_labels {0};
 };
 
 Stats& GetStats() {
@@ -425,7 +438,14 @@ Mode GetMode() {
 			            "submission's leading draws ahead, op by op under the CP op lock)\n");
 			return Mode::Concurrent1b3;
 		}
-		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2, 1b3); off\n",
+		if (std::strcmp(value, "1b4") == 0) {
+			// Astro Bot PC (KYTY_CP_PAR=1b4, cpParallel.h).
+			std::printf("Kyty CpPar: KYTY_CP_PAR=1b4 (as 1b3, and the run-ahead also executes the next "
+			            "submission's own CP writes and waits; interleave points at every op of the "
+			            "oldest once no hard op remains in it)\n");
+			return Mode::Concurrent1b4;
+		}
+		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2, 1b3, 1b4); off\n",
 		            value);
 		return Mode::Off;
 	}();
@@ -439,9 +459,96 @@ bool VerifyEnabled() {
 		if (on && GetMode() == Mode::Concurrent1b3) {
 			std::printf("Kyty CpPar: KYTY_CP_PAR_VERIFY=1 (stop at the first insertion)\n");
 		}
+		if (on && GetMode() == Mode::Concurrent1b4) {
+			// Astro Bot PC (KYTY_CP_PAR=1b4).
+			std::printf("Kyty CpPar: KYTY_CP_PAR_VERIFY=1 (stop at the first insertion, foreign wait "
+			            "value or cross access of the overlap)\n");
+		}
 		return on;
 	}();
 	return enabled;
+}
+
+// Astro Bot PC (KYTY_CP_PAR=1b4, cpParallel.h).
+bool WritesAll() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_PAR_WRITES");
+		const bool  all   = value != nullptr && std::strcmp(value, "all") == 0;
+		if (GetMode() == Mode::Concurrent1b4) {
+			std::printf("Kyty CpPar: 1b4 run-ahead writes: %s (KYTY_CP_PAR_WRITES)\n",
+			            all ? "any address (measurement only)" : "learned CP-internal labels only");
+		}
+		return all;
+	}();
+	return enabled;
+}
+
+bool OldestWritesHard() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_PAR_OLDEST_WRITES");
+		const bool  hard  = value != nullptr && std::strcmp(value, "hard") == 0;
+		if (hard && GetMode() == Mode::Concurrent1b4) {
+			std::printf("Kyty CpPar: 1b4: the oldest's WRITE_DATA / DMA_DATA / clock writes are hard "
+			            "(KYTY_CP_PAR_OLDEST_WRITES)\n");
+		}
+		return hard;
+	}();
+	return enabled;
+}
+
+bool InterleaveNext() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_PAR_INTERLEAVE");
+		const bool  next  = value != nullptr && std::strcmp(value, "next") == 0;
+		if (GetMode() == Mode::Concurrent1b4) {
+			std::printf("Kyty CpPar: 1b4 interleave points: %s (KYTY_CP_PAR_INTERLEAVE)\n",
+			            next ? "before every op of the oldest that is not hard (measurement)"
+			                 : "before every op of the oldest once no hard op remains in it");
+		}
+		return next;
+	}();
+	return enabled;
+}
+
+void NoteRunAheadKind(uint32_t kind) {
+	if (kind < static_cast<uint32_t>(CpSeq::OpKind::Count)) {
+		GetStats().runahead_kinds[kind].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void NoteLocalWait() {
+	GetStats().local_waits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteLocalWrite() {
+	GetStats().local_writes.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteInterleave(bool offered) {
+	(offered ? GetStats().interleave_offered : GetStats().interleave_refused)
+	    .fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteCross(Cross which, uint64_t address) {
+	static constexpr const char* names[] = {
+	    "Thread_Gpu read a dword the run-ahead wrote during the overlap",
+	    "Thread_Gpu wrote a dword the run-ahead wrote or read during the overlap",
+	    "the run-ahead read a dword last written by the oldest submission",
+	    "a run-ahead wait passed on a value another submission wrote"};
+	const auto index = static_cast<size_t>(which);
+	if (VerifyEnabled()) {
+		EXIT("Kyty CpPar: KYTY_CP_PAR_VERIFY=1: %s (0x%016" PRIx64 ")\n", names[index], address);
+	}
+	if (GetStats().cross[index].fetch_add(1, std::memory_order_relaxed) == 0) {
+		std::printf("Kyty CpPar: first cross access: %s (0x%016" PRIx64 "; counted in \"CpPar 10s: "
+		            "1b4 window\")\n",
+		            names[index], address);
+	}
+}
+
+void NoteBook(uint64_t written, uint64_t labels) {
+	GetStats().book_written.store(written, std::memory_order_relaxed);
+	GetStats().book_labels.store(labels, std::memory_order_relaxed);
 }
 
 // ---- Astro Bot PC (KYTY_CP_PAR=1b3) ----
@@ -566,8 +673,8 @@ void NoteInsertion(Insertion trigger, uint64_t fixups, uint64_t impossible, uint
 	}
 	if (stats.insertions[index].fetch_add(1, std::memory_order_relaxed) == 0) {
 		std::printf("Kyty CpPar: first insertion forced by %s (data order of the overlap "
-		            "inverted; counted in \"CpPar 10s: 1b3\")\n",
-		            names[index]);
+		            "inverted; counted in \"CpPar 10s: %s\")\n",
+		            names[index], Wide() ? "1b4" : "1b3");
 	}
 	stats.insertion_fixups.fetch_add(fixups, std::memory_order_relaxed);
 	stats.merge_impossible.fetch_add(impossible, std::memory_order_relaxed);
@@ -789,7 +896,7 @@ void MaybeReport() {
 		const auto takes_b    = take(stats.lock_takes[1]);
 		const auto overlap    = take(stats.overlap_ns);
 		const auto ops_ns     = take(stats.runahead_ns);
-		std::printf("CpPar 10s: 1b3: run-ahead %" PRIu64 " starts, %" PRIu64 " ops (%.2f ms "
+		std::printf("CpPar 10s: %s: run-ahead %" PRIu64 " starts, %" PRIu64 " ops (%.2f ms "
 		            "holding the op lock); overlap %.2f ms; "
 		            "promotions: stream-end %" PRIu64 ", lockstep %" PRIu64 ", write %" PRIu64
 		            ", flip %" PRIu64 ", indirect %" PRIu64 ", inherit %" PRIu64
@@ -799,11 +906,50 @@ void MaybeReport() {
 		            ", run-ahead submit %" PRIu64 ", run-ahead drain %" PRIu64
 		            "; op lock: Thread_Gpu %" PRIu64 " takes, %.2f ms waiting; resolver #2 %" PRIu64
 		            " takes, %.2f ms waiting\n",
-		            starts, ops, static_cast<double>(ops_ns) / 1e6, static_cast<double>(overlap) / 1e6,
+		            Wide() ? "1b4" : "1b3", starts, ops, static_cast<double>(ops_ns) / 1e6,
+		            static_cast<double>(overlap) / 1e6,
 		            p[0], p[1], p[2], p[3], p[4], p[5],
 		            p[6], p[7], p[8], merges, images, fixups, ins_fixups, impossible, ins[0], ins[1],
 		            ins[2], takes_a, static_cast<double>(wait_a) / 1e6, takes_b,
 		            static_cast<double>(wait_b) / 1e6);
+		if (Wide()) {
+			// Astro Bot PC (KYTY_CP_PAR=1b4): the window (cpParallel.h).
+			std::string kinds;
+			for (size_t k = 0; k < stats.runahead_kinds.size(); k++) {
+				if (const auto n = take(stats.runahead_kinds[k]); n != 0) {
+					char item[64];
+					std::snprintf(item, sizeof(item), " %s=%" PRIu64,
+					              CpSeq::OpKindName(static_cast<CpSeq::OpKind>(k)), n);
+					kinds += item;
+				}
+			}
+			uint64_t c[static_cast<size_t>(Cross::Count)] = {};
+			for (size_t i = 0; i < std::size(c); i++) {
+				c[i] = take(stats.cross[i]);
+			}
+			const auto fixups_total = fixups + ins_fixups;
+			std::printf("CpPar 10s: 1b4 window: overlap %.2f ms; run-ahead ops by kind:%s; "
+			            "promotions: interrupt %" PRIu64 ", label-defer %" PRIu64 ", clock %" PRIu64
+			            ", gds %" PRIu64 ", occlusion %" PRIu64 ", external %" PRIu64
+			            ", gpu-dirty %" PRIu64 ", foreign-wait %" PRIu64 " (and the 1b3 reasons "
+			            "above); waits satisfied locally %" PRIu64 ", writes to checked addresses %" PRIu64
+			            "; fix-ups emitted %" PRIu64 "; interleave points offered %" PRIu64
+			            ", refused (hard op ahead, or N not fully emitted) %" PRIu64 "; cross accesses: oldest read %" PRIu64
+			            ", oldest write %" PRIu64 ", run-ahead read %" PRIu64 ", foreign value %" PRIu64
+			            "; book %" PRIu64 " dwords, %" PRIu64 " learned labels\n",
+			            static_cast<double>(overlap) / 1e6, kinds.empty() ? " none" : kinds.c_str(),
+			            p[static_cast<size_t>(Promotion::Interrupt)],
+			            p[static_cast<size_t>(Promotion::LabelDefer)],
+			            p[static_cast<size_t>(Promotion::Clock)], p[static_cast<size_t>(Promotion::Gds)],
+			            p[static_cast<size_t>(Promotion::Occlusion)],
+			            p[static_cast<size_t>(Promotion::External)],
+			            p[static_cast<size_t>(Promotion::GpuDirty)],
+			            p[static_cast<size_t>(Promotion::ForeignWait)], take(stats.local_waits),
+			            take(stats.local_writes), fixups_total, take(stats.interleave_offered),
+			            take(stats.interleave_refused), c[0], c[1], c[2], c[3],
+			            stats.book_written.load(std::memory_order_relaxed),
+			            stats.book_labels.load(std::memory_order_relaxed));
+		}
 	}
 	if (StreamsActive() && !Concurrent()) {
 		// Astro Bot PC (KYTY_CP_PAR=1b2): each context's recording target over the last 10 s.
