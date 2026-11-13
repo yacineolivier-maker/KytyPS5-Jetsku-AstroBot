@@ -3665,6 +3665,23 @@ bool BufferCache::VerifyRelaxedSnapshot(uint64_t vaddr, uint64_t size,
 	return false;
 }
 
+bool BufferCache::CensusDirtyState(uint64_t vaddr, uint64_t size, bool& cpu, bool& gpu) const {
+	if (!m_relaxed_queries || !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	MemoryTracker::DirtyState state;
+	if (!m_memory_tracker.QueryDirtyRelaxed(vaddr, size, state)) {
+		return false;
+	}
+	cpu = state.cpu;
+	gpu = state.gpu;
+	return true;
+}
+
+uint32_t BufferCache::CensusFrame() const noexcept {
+	return m_memory_tracker.Frame();
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {

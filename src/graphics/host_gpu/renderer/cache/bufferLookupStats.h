@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_BUFFERLOOKUPSTATS_H_
 
 #include "common/onceValue.h"
+#include "graphics/host_gpu/renderer/cache/bindingCensus.h"
 #include <cstdint>
 
 // KYTY_BUFFER_LOOKUP_STATS=1 (diagnostic, default off): where the command processor's V# binding
@@ -104,6 +105,10 @@ void                   NoteStage(uint64_t epoch);
 inline void SetOutcome(Outcome outcome) {
 	if (Enabled()) {
 		Detail::SetOutcome(outcome);
+	}
+	// Astro Bot PC (KYTY_BINDING_CENSUS, bindingCensus.h): kept whatever KYTY_CP_DIAGNOSTICS is.
+	if (BindingCensus::Enabled()) [[unlikely]] {
+		BindingCensus::SetOutcome(static_cast<uint8_t>(outcome));
 	}
 }
 [[nodiscard]] inline Outcome TakeOutcome() {

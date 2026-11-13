@@ -48,6 +48,11 @@ class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
+	// Astro Bot PC (KYTY_BINDING_CENSUS), diagnostic: MayOverlapImages (lock-free, any thread).
+	[[nodiscard]] bool CensusMayOverlapImages(uint64_t address, uint64_t size) const {
+		return MayOverlapImages(address, size);
+	}
+
 	// A render-target binding with CMASK fast clears enabled (CB_COLORn_INFO.FAST_CLEAR):
 	// the target's CMASK bytes and CB_COLORn_CLEAR_WORD0/1 (KYTY_CMASK_FAST_CLEAR).
 	struct ColorFastClear {

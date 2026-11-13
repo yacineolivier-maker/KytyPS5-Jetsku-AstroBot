@@ -31,6 +31,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
+#include "graphics/presentation/window/hostImportProbe.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -2149,6 +2150,8 @@ void WindowContext::CreateVulkan() {
 			GpuTiming::NoteCalibrationExtensionEnabled(calibration);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		// Astro Bot PC (KYTY_HOST_IMPORT_PROBE, diagnostic): VK_EXT_external_memory_host only then.
+		HostImportProbe::AppendDeviceExtension(device_extensions, available_extensions);
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -2197,6 +2200,8 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.submission_queue.Initialize(graphic_ctx);
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
+	// Astro Bot PC (KYTY_HOST_IMPORT_PROBE, diagnostic, step S0): guest memory import probes.
+	HostImportProbe::Start(graphic_ctx);
 	// KYTY_SPEC_UNMAPPED_NULL (default on): a V# the renderer binds as empty specializes as null.
 	if (const auto* env = std::getenv("KYTY_SPEC_UNMAPPED_NULL"); env == nullptr || std::strcmp(env, "0") != 0) {
 		ShaderRecompiler::IR::SetUnmappedBufferProbe([](uint64_t base, uint64_t size) {
@@ -2228,6 +2233,7 @@ void WindowContext::RecreateSurface() {
 }
 
 WindowContext::~WindowContext() {
+	HostImportProbe::Stop();
 	Vr::OpenXrShutdown();
 	ShutdownSystemOverlayInput();
 	presenter.reset();

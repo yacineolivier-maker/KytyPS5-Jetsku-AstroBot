@@ -589,6 +589,15 @@ public:
 		return m_generation.load(std::memory_order_acquire);
 	}
 
+	// Astro Bot PC (KYTY_HOST_IMPORT_PROBE, diagnostic): every range, under the lock.
+	template <typename F>
+	void ForEachRange(F&& f) {
+		Common::LockGuard lock(m_mutex);
+		for (const auto& r: m_ranges) {
+			f(r);
+		}
+	}
+
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
 
@@ -1674,6 +1683,67 @@ uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size) {
 
 uint64_t VirtualRangesGeneration() noexcept {
 	return g_virtual_ranges != nullptr ? g_virtual_ranges->Generation() : 0;
+}
+
+// ---- Astro Bot PC: diagnostics (KYTY_BINDING_CENSUS, KYTY_HOST_IMPORT_PROBE), memory.h ----
+
+static void DiagFillQueryInfo(const VirtualRanges::Range& r, VirtualQueryInfo* info) {
+	std::memset(info, 0, sizeof(VirtualQueryInfo));
+	info->start        = r.start;
+	info->end          = r.start + r.size;
+	info->offset       = r.offset;
+	info->protection   = r.protection;
+	info->memory_type  = r.memory_type;
+	info->is_flexible  = (r.type == VirtualRangeType::Flexible ? 1 : 0);
+	info->is_direct    = (r.type == VirtualRangeType::Direct ? 1 : 0);
+	info->is_stack     = (r.type == VirtualRangeType::Stack ? 1 : 0);
+	info->is_pooled    = (IsPooledRangeType(r.type) ? 1 : 0);
+	info->is_committed = (IsCommittedRangeType(r.type) ? 1 : 0);
+	CopyVirtualRangeName(info->name, r.name);
+}
+
+bool DiagQueryVirtualRange(uint64_t vaddr, VirtualQueryInfo* info) {
+	if (info == nullptr || g_virtual_ranges == nullptr) {
+		return false;
+	}
+	VirtualRanges::Range r {};
+	if (!g_virtual_ranges->Query(vaddr, 0, &r)) {
+		return false;
+	}
+	DiagFillQueryInfo(r, info);
+	return true;
+}
+
+bool DiagGuestBacking(uint64_t* base, uint64_t* size) {
+	if (g_guest_address_space == nullptr || base == nullptr || size == nullptr) {
+		return false;
+	}
+	*base = g_guest_address_space->GetBackingBase();
+	*size = g_guest_address_space->GetBackingSize();
+	return *base != 0 && *size != 0;
+}
+
+bool DiagFindBackedRange(bool flexible, uint64_t min_size, VirtualQueryInfo* info) {
+	if (info == nullptr || g_virtual_ranges == nullptr || g_guest_address_space == nullptr) {
+		return false;
+	}
+	const auto wanted = flexible ? VirtualRangeType::Flexible : VirtualRangeType::Direct;
+	std::vector<VirtualRanges::Range> candidates;
+	g_virtual_ranges->ForEachRange([&](const VirtualRanges::Range& r) {
+		if (r.type == wanted && r.size >= min_size) {
+			candidates.push_back(r);
+		}
+	});
+	std::sort(candidates.begin(), candidates.end(),
+	          [](const auto& a, const auto& b) { return a.size > b.size; });
+	for (const auto& r: candidates) {
+		// The whole range must be one guest view of the shared backing (MapViewOfFile3).
+		if (g_guest_address_space->BackingContains(r.start, r.size)) {
+			DiagFillQueryInfo(r, info);
+			return true;
+		}
+	}
+	return false;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

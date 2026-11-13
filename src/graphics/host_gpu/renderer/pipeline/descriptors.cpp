@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/cache/bindingCensus.h"
 #include "graphics/host_gpu/renderer/cache/bufferLookupStats.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -2133,9 +2134,20 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		// Astro Bot PC (KYTY_CB_CONST_STATS) : part et cout des tampons ranges dans les listes de commandes du jeu.
 		const bool cb_stats = CbRanges::Enabled();
 		const auto cb_t0    = cb_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		// Astro Bot PC (KYTY_BINDING_CENSUS, step S1): bindings by guest mapping x outcome x time.
+		const bool               census = BindingCensus::Enabled();
+		BindingCensus::Probe     census_probe {};
+		if (census) [[unlikely]] {
+			BindingCensus::Before(m_context, prepared.buffer_sources[i].address,
+			                      prepared.buffer_sources[i].size, census_probe);
+		}
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[i], program.stage, i,
 		                                               buffer_offset, written, uniform_view));
+		if (census) [[unlikely]] {
+			BindingCensus::After(m_context, census_probe, program.info.buffers[i].written,
+			                     program.info.buffers[i].formatted);
+		}
 		if (cb_stats) [[unlikely]] {
 			CbRanges::NoteBinding(CbRanges::Contains(prepared.buffer_sources[i].address),
 			                      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

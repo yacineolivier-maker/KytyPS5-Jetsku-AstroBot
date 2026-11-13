@@ -106,6 +106,12 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fault = false);
 	// Once per completed guest flip (any thread): the frame clock of hot-page detection.
 	void                   AdvanceFrame() noexcept;
+	// Astro Bot PC (KYTY_BINDING_CENSUS, bindingCensus.h), diagnostic: the range's CPU/GPU dirty
+	// bits from the tracker's lock-free mirrors, changing nothing (GPU thread with
+	// KYTY_TRACKER_RELAXED_QUERIES; false otherwise or when a region of the range does not exist).
+	[[nodiscard]] bool     CensusDirtyState(uint64_t vaddr, uint64_t size, bool& cpu, bool& gpu) const;
+	// The tracker's guest frame clock (AdvanceFrame).
+	[[nodiscard]] uint32_t CensusFrame() const noexcept;
 	// While one is alive (GPU thread), CPU-dirty uploads are only queued on the current command
 	// buffer (KYTY_UPLOAD_BATCH, CommandBuffer::RequestUploadCopy); the outermost scope's end
 	// records them all behind one barrier. Every command recorded meanwhile through

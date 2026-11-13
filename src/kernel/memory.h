@@ -183,6 +183,16 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 // The guest virtual ranges' change generation (advanced before every change starts; 0 before
 // they exist). Unchanged since a read made before a ClampRangeSize call: the call's answer holds.
 [[nodiscard]] uint64_t VirtualRangesGeneration() noexcept;
+// Astro Bot PC, diagnostics only (KYTY_BINDING_CENSUS, KYTY_HOST_IMPORT_PROBE). Any thread; they
+// take only the virtual ranges' lock (and the backing's shared lock), never the memory operation
+// lock, so the GPU thread may call them.
+// The guest virtual range holding vaddr (as KernelVirtualQuery flags 0, without is_gpu_prt).
+[[nodiscard]] bool DiagQueryVirtualRange(uint64_t vaddr, VirtualQueryInfo* info);
+// The writable alias view of the whole direct/flexible backing section, and its size.
+[[nodiscard]] bool DiagGuestBacking(uint64_t* base, uint64_t* size);
+// The largest direct (or flexible) range of at least min_size that is one guest view of the
+// shared backing.
+[[nodiscard]] bool DiagFindBackedRange(bool flexible, uint64_t min_size, VirtualQueryInfo* info);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // RenderContext::PrepareHostOverwrite (KYTY_APR_PREPARE_WRITE): false when nothing was watched.

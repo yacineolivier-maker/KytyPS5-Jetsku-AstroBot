@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/cache/bindingCensus.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
@@ -3346,7 +3347,32 @@ struct NativeTierScope {
 	NativeTierScope& operator=(const NativeTierScope&) = delete;
 };
 
+// Astro Bot PC (KYTY_BINDING_CENSUS, bindingCensus.h): the engine thread slot of the native draw
+// op being executed, for the census's per-slot binding time (bindings resolved later, outside the
+// op, count as non-native).
+struct CensusSlotScope {
+	bool on = false;
+	explicit CensusSlotScope(uint32_t op_flags) {
+		if (BindingCensus::Enabled()) [[unlikely]] {
+			on = true;
+			namespace GC = Loader::GameCapture;
+			BindingCensus::SetNativeSlot(
+			    (op_flags & CpSeq::DrawFlagNativeMask) != 0
+			        ? static_cast<uint8_t>(((op_flags >> GC::kNativeOpSlotShift) & GC::kNativeSlotMask) + 1u)
+			        : uint8_t {0});
+		}
+	}
+	~CensusSlotScope() {
+		if (on) [[unlikely]] {
+			BindingCensus::SetNativeSlot(0);
+		}
+	}
+	CensusSlotScope(const CensusSlotScope&)            = delete;
+	CensusSlotScope& operator=(const CensusSlotScope&) = delete;
+};
+
 void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
+	const CensusSlotScope census_slot(op.flags);
 	const NativeResolveTimer native_timer(op.flags, [this](uint32_t flags, uint64_t start) {
 		NoteNativeResolvedOp(flags, start);
 	});
@@ -4022,6 +4048,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 }
 
 void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
+	const CensusSlotScope census_slot(op.flags);
 	const NativeResolveTimer native_timer(op.flags, [this](uint32_t flags, uint64_t start) {
 		NoteNativeResolvedOp(flags, start);
 	});
