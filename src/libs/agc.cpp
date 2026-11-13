@@ -2807,7 +2807,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
 	cmd[4] = index_count;
 	cmd[5] = decode_draw_index_initiator(modifier);
 
-	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_2); // Astro Bot PC : KYTY_GAME_HOOKS=capture
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_2, 6); // Astro Bot PC : KYTY_GAME_HOOKS=capture
 
 	return cmd;
 }
@@ -2914,7 +2914,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_c
 	cmd[1] = index_count;
 	cmd[2] = decode_draw_index_initiator(modifier) | 0x2u;
 
-	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_AUTO); // Astro Bot PC : KYTY_GAME_HOOKS=capture
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_AUTO, 3); // Astro Bot PC : KYTY_GAME_HOOKS=capture
 
 	return cmd;
 }
@@ -2947,7 +2947,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index
 	cmd[3] = index_count;
 	cmd[4] = decode_draw_index_initiator(modifier);
 
-	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_OFFSET_2); // Astro Bot PC : KYTY_GAME_HOOKS=capture
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_OFFSET_2, 5); // Astro Bot PC : KYTY_GAME_HOOKS=capture
 
 	return cmd;
 }

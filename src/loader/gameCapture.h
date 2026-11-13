@@ -29,11 +29,34 @@ extern std::atomic<bool> g_active; // set once the capture hooks are installed
 	return g_active.load(std::memory_order_relaxed);
 }
 
-// PM4 opcode of the packet (IT_DRAW_INDEX_OFFSET_2, IT_DRAW_INDEX_AUTO, ...).
-void NoteDrawPacketSlow(const uint32_t* packet, uint32_t opcode);
-inline void NoteDrawPacket(const uint32_t* packet, uint32_t opcode) {
+// PM4 opcode of the packet (IT_DRAW_INDEX_OFFSET_2, IT_DRAW_INDEX_AUTO, ...) and its size in
+// dwords (header included; 0 for a packet that must never be replaced).
+//
+// KYTY_NATIVE (stage N0, docs\PLAN-PARALLELE.md): when the draw flush of a selected engine
+// thread chose the draw as "native", a direct draw packet (DRAW_INDEX_2, DRAW_INDEX_OFFSET_2,
+// DRAW_INDEX_AUTO) is rewritten here, in place and before libAgc returns it, as a NOP of the same
+// size: header KYTY_PM4(size, IT_NOP, R_NATIVE_DRAW), word 1 = kNativeMagic << 16 | version << 8
+// | thread slot, word 2 = per-thread serial, other words 0. State packets (NUM_INSTANCES, ...)
+// are left as written.
+void NoteDrawPacketSlow(uint32_t* packet, uint32_t opcode, uint32_t size_dw);
+inline void NoteDrawPacket(uint32_t* packet, uint32_t opcode, uint32_t size_dw = 0) {
 	if (Active()) {
-		NoteDrawPacketSlow(packet, opcode);
+		NoteDrawPacketSlow(packet, opcode, size_dw);
+	}
+}
+
+constexpr uint32_t kNativeMagic   = 0x4e41u; // "NA"
+constexpr uint32_t kNativeVersion = 1u;
+
+// Command processor: an R_NATIVE_DRAW marker was parsed (not by a reference / speculative front).
+// `body` points after the header, `body_dw` >= 2.
+void NoteNativeMarker(const uint32_t* body, uint32_t body_dw);
+
+// Guest flips (graphics/presentation/videoOut.cpp), for the per-frame averages.
+extern std::atomic<uint64_t> g_flips;
+inline void NoteFlip() {
+	if (Active()) {
+		g_flips.fetch_add(1, std::memory_order_relaxed);
 	}
 }
 

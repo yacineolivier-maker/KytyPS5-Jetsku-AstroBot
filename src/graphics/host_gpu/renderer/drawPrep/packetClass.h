@@ -65,7 +65,10 @@ enum class PacketClass : uint8_t {
 				}
 				return PacketClass::WindowSafe;
 			}
-			return r == Pm4::R_CONTEXT_STATE || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER
+			// R_NATIVE_DRAW (KYTY_NATIVE): a draw taken by the native backend, nothing for the
+			// emulator's renderer to order.
+			return r == Pm4::R_CONTEXT_STATE || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+			               r == Pm4::R_NATIVE_DRAW
 			           ? PacketClass::WindowSafe
 			           : PacketClass::Fence;
 		}

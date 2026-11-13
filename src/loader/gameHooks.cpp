@@ -30,6 +30,7 @@ void RegisterHooks(); // gameHooksTrace.cpp
 namespace Capture {
 void RegisterHooks();  // gameHooksCapture.cpp
 void OnInstalled();    // gameHooksCapture.cpp: after Install() placed the hooks
+bool NativeRequested(); // gameHooksCapture.cpp: KYTY_NATIVE set (implies the capture hooks)
 } // namespace Capture
 
 struct HookRecord {
@@ -94,6 +95,9 @@ std::vector<std::string> EnvTokens() {
 }
 
 bool Enabled() {
+	if (Capture::NativeRequested()) {
+		return true;
+	}
 	const auto tokens = EnvTokens();
 	return std::any_of(tokens.begin(), tokens.end(), [](const std::string& token) {
 		return token != "0" && token != "off" && token != "none";
@@ -265,7 +269,7 @@ void Install(Program* main_program) {
 	if (SetEnabled("trace")) {
 		Trace::RegisterHooks();
 	}
-	const bool capture = SetEnabled("capture");
+	const bool capture = SetEnabled("capture") || Capture::NativeRequested();
 	if (capture) {
 		Capture::RegisterHooks();
 	}

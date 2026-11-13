@@ -31,7 +31,15 @@
 // used by one thread at a time (one command list), so its shadow needs no lock. Locks: thread
 // and context registration (once each), the 10 s report (try-lock).
 
+//
+// KYTY_NATIVE (stage N0 of the native backend, docs\PLAN-PARALLELE.md): on the selected engine
+// threads, a hooked indexed / auto draw (not indirect, no tessellation stage) is chosen as
+// "native" at its flush exit; the direct draw packet libAgc then writes for it is replaced by a
+// NOP marker of the same size (gameCapture.h), which the command processor counts and drops
+// (pm4Handlers.cpp CpOpNativeDraw). KYTY_NATIVE unset: nothing of this runs.
+
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "kernel/pthread.h"
 #include "loader/gameCapture.h"
 #include "loader/gameHooks.h"
@@ -40,7 +48,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <mutex>
@@ -49,8 +59,115 @@
 #include <vector>
 
 namespace Loader::GameCapture {
-std::atomic<bool> g_active {false};
+std::atomic<bool>     g_active {false};
+std::atomic<uint64_t> g_flips {0};
 } // namespace Loader::GameCapture
+
+namespace Loader::GameHooks::Capture {
+
+// ---- KYTY_NATIVE configuration ------------------------------------------------------------------
+
+namespace {
+
+constexpr uint32_t    kEngineThreads                     = 5;
+constexpr const char* kEngineThreadNames[kEngineThreads] = {"Draw Geometry", "Draw Extra Geometry", "Draw Shadow",
+                                                            "Draw Decal", "DrawThread"};
+constexpr const char* kEngineThreadKeys[kEngineThreads]  = {"geometry", "extra", "shadow", "decal", "drawthread"};
+
+std::string Lower(std::string text) {
+	for (auto& ch: text) {
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	}
+	return text;
+}
+
+std::string Trim(const std::string& text) {
+	const auto begin = text.find_first_not_of(" \t");
+	if (begin == std::string::npos) {
+		return {};
+	}
+	const auto end = text.find_last_not_of(" \t");
+	return text.substr(begin, end - begin + 1);
+}
+
+int EngineThreadSlot(const char* name) {
+	for (uint32_t s = 0; s < kEngineThreads; s++) {
+		if (std::strcmp(name, kEngineThreadNames[s]) == 0) {
+			return static_cast<int>(s);
+		}
+	}
+	return -1;
+}
+
+struct NativeConfig {
+	bool        requested = false; // KYTY_NATIVE set to something other than 0 / off / none
+	bool        valid     = false; // requested, mode supported and at least one thread selected
+	uint32_t    mask      = 0;     // bit = engine thread slot
+	std::string unknown;           // tokens that name no engine thread
+	std::string mode;
+};
+
+NativeConfig ParseNative() {
+	NativeConfig config;
+	const char*  value = std::getenv("KYTY_NATIVE");
+	if (value == nullptr) {
+		return config;
+	}
+	const std::string all = Lower(Trim(value));
+	if (all.empty() || all == "0" || all == "off" || all == "none") {
+		return config;
+	}
+	config.requested = true;
+	std::string token;
+	const auto  take = [&] {
+		const auto t = Lower(Trim(token));
+		token.clear();
+		if (t.empty()) {
+			return;
+		}
+		if (t == "all") {
+			config.mask = (1u << kEngineThreads) - 1u;
+			return;
+		}
+		for (uint32_t s = 0; s < kEngineThreads; s++) {
+			if (t == kEngineThreadKeys[s] || t == Lower(kEngineThreadNames[s])) {
+				config.mask |= 1u << s;
+				return;
+			}
+		}
+		config.unknown += " " + t;
+	};
+	for (const char* p = value;; p++) {
+		if (*p == '\0' || *p == ',' || *p == ';') {
+			take();
+			if (*p == '\0') {
+				break;
+			}
+		} else {
+			token += *p;
+		}
+	}
+	const char* mode = std::getenv("KYTY_NATIVE_MODE");
+	config.mode      = Lower(Trim(mode != nullptr ? mode : ""));
+	if (config.mode.empty()) {
+		config.mode = "drop";
+	}
+	config.valid = config.mode == "drop" && config.mask != 0;
+	return config;
+}
+
+const NativeConfig& Native() {
+	static const NativeConfig config = ParseNative();
+	return config;
+}
+
+} // namespace
+
+bool NativeRequested() {
+	return Native().requested;
+}
+
+} // namespace Loader::GameHooks::Capture
 
 namespace Loader::GameHooks::Capture {
 
@@ -314,6 +431,25 @@ constexpr Family kFamilies[16] = {
     {"srt", Bits(52, 57)},    {"dbnd", Bits(58, 58)}, {"b59", Bits(59, 59)},  {"cons", Bits(60, 60)},
 };
 
+// KYTY_NATIVE counters (per thread).
+enum NCtr : uint32_t {
+	kNChosen,     // draws chosen native at their flush exit
+	kNWritten,    // markers written in place of their draw packet
+	kNIncomplete, // chosen draws whose record is not "complete" (information only)
+	kNFbIndirect, // fallback: indirect draw
+	kNFbTess,     // fallback: tessellation (hull-shader geometry slot)
+	kNFbPacket,   // fallback: the next libAgc draw packet was not a direct draw of known size
+	kNFbLost,     // fallback: window closed without any libAgc draw packet
+	kNCount
+};
+constexpr uint32_t kNFb0 = kNFbIndirect;
+constexpr const char* kNFbNames[] = {"indirect", "tess", "packet", "lost"};
+
+// Markers parsed by the command processor, per thread slot (+1: malformed).
+std::array<std::atomic<uint64_t>, kEngineThreads + 1> g_native_seen {};
+std::array<uint64_t, kEngineThreads + 1>              g_native_seen_last {}; // reporter only
+uint64_t                                              g_flips_last = 0;      // reporter only
+
 enum Scope : uint8_t { kScopeNone, kScopeDrawFlush, kScopeDispatchFlush, kScopeBegin, kScopeToolkit };
 
 struct PendingDraw {
@@ -359,6 +495,14 @@ struct alignas(64) ThreadState {
 	bool        draw_pending = false; // a hooked draw entered, its flush not yet left
 	PendingDraw draw;
 	bool        emit_window = false; // between a hooked draw's flush exit and its packet
+
+	// KYTY_NATIVE: engine thread slot when this thread is selected (-1 otherwise); the open
+	// window means the next direct draw packet of emit_window is replaced by a marker.
+	int         native_slot   = -1;
+	bool        native_window = false;
+	uint32_t    native_serial = 0;
+	std::array<std::atomic<uint64_t>, kNCount> n {};
+	std::array<uint64_t, kNCount>              n_last {}; // reporter only
 
 	// Packet sample of the last record (published by NoteDrawPacket).
 	bool     sample_pending = false;
@@ -407,12 +551,27 @@ ThreadState* T() {
 		std::strncpy(state->name, "?", sizeof(state->name) - 1);
 	}
 	state->thread_id = static_cast<uint32_t>(Libs::LibKernel::PthreadGetthreadid());
+	if (const auto& native = Native(); native.valid) {
+		const int slot = EngineThreadSlot(state->name);
+		if (slot >= 0 && ((native.mask >> static_cast<uint32_t>(slot)) & 1u) != 0) {
+			state->native_slot = slot;
+		}
+	}
 	{
 		std::lock_guard lock(g_threads_mutex);
 		g_threads.push_back(state);
 	}
 	t_state = state;
 	return state;
+}
+
+// Closes the emit window (and a native window still open: its draw wrote no packet).
+void ResetEmit(ThreadState* t) {
+	t->emit_window = false;
+	if (t->native_window) [[unlikely]] {
+		t->native_window = false;
+		Inc(t->n[kNFbLost]);
+	}
 }
 
 ContextState* StateOf(ThreadState* t, uint64_t ctx) {
@@ -600,7 +759,7 @@ uint32_t StaleOutside(ContextState* state) {
 
 void BeginDraw(GuestCallContext& ctx, DrawKind kind) {
 	auto* t         = T();
-	t->emit_window  = false;
+	ResetEmit(t);
 	t->sample_pending = false;
 	t->draw_pending = true;
 	auto& d         = t->draw;
@@ -645,7 +804,7 @@ void OnDrawIndirect(GuestCallContext& ctx) { BeginDraw(ctx, kKindIndirect); }
 
 void OnListBeginEnter(GuestCallContext& ctx) {
 	auto* t        = T();
-	t->emit_window = false;
+	ResetEmit(t);
 	if (auto* state = StateOf(t, ctx.rdi); state != nullptr) {
 		state->epoch++;
 		state->first_pending = true;
@@ -658,7 +817,7 @@ void OnListBeginExit(GuestCallContext& /*ctx*/) {
 
 void OnToolkitEnter(GuestCallContext& ctx) {
 	auto* t        = T();
-	t->emit_window = false;
+	ResetEmit(t);
 	// cb = ctx + 0xe50 and acc = ctx + 0x1208 when called on a backend context.
 	const uint64_t owner = (ctx.rsi == ctx.rdi + (kCtxAcc - kCtxCb)) ? ctx.rdi - kCtxCb : 0;
 	Inc(t->c[kCToolkit]);
@@ -673,7 +832,7 @@ void OnToolkitExit(GuestCallContext& /*ctx*/) {
 void OnDispatchFlushEnter(GuestCallContext& ctx) {
 	auto*          t   = T();
 	const uint64_t cxp = ctx.rdi;
-	t->emit_window     = false;
+	ResetEmit(t);
 	Inc(t->c[kCDispatchFlush]);
 	if (auto* state = StateOf(t, cxp); state != nullptr && state->first_pending) {
 		Inc(t->c[kCFirstDispatch]);
@@ -704,7 +863,7 @@ void Report(int64_t now);
 void OnDrawFlushEnter(GuestCallContext& ctx) {
 	auto*          t   = T();
 	const uint64_t cxp = ctx.rdi;
-	t->emit_window     = false;
+	ResetEmit(t);
 	t->flush_mask      = Rd<uint64_t>(cxp, kCtxDirty);
 	Inc(t->c[kCFlush]);
 	if (auto* state = StateOf(t, cxp); state != nullptr && state->first_pending) {
@@ -955,6 +1114,21 @@ void OnDrawFlushExit(GuestCallContext& /*ctx*/) {
 	t->ring_seq++;
 	r.seq.store(t->ring_seq, std::memory_order_release);
 
+	// KYTY_NATIVE: indexed / auto draws of a selected thread, without tessellation, are native.
+	if (t->native_slot >= 0) [[unlikely]] {
+		if (d.kind == kKindIndirect || d.kind > kKindAutoOfs) {
+			Inc(t->n[kNFbIndirect]);
+		} else if ((r.geom_slot & 1u) != 0) {
+			Inc(t->n[kNFbTess]);
+		} else {
+			t->native_window = true;
+			Inc(t->n[kNChosen]);
+			if (fail != 0) {
+				Inc(t->n[kNIncomplete]);
+			}
+		}
+	}
+
 	// One draw in 1000: published under its packet address when libAgc writes the packet.
 	t->emit_window = true;
 	if (++t->sample_counter % 1000 == 0) {
@@ -1145,12 +1319,69 @@ void Report(int64_t now) {
 	}
 	cp += "\n";
 
+	// KYTY_NATIVE.
+	std::string native;
+	if (Native().valid) {
+		const uint64_t flips_now = GameCapture::g_flips.load(std::memory_order_relaxed);
+		const uint64_t flips     = flips_now - g_flips_last;
+		g_flips_last             = flips_now;
+		std::array<std::array<uint64_t, kNCount>, kEngineThreads> per {};
+		{
+			std::lock_guard lock(g_threads_mutex);
+			for (auto* t: g_threads) {
+				if (t->native_slot < 0) {
+					continue;
+				}
+				for (uint32_t i = 0; i < kNCount; i++) {
+					const auto v = t->n[i].load(std::memory_order_relaxed);
+					per[t->native_slot][i] += v - t->n_last[i];
+					t->n_last[i] = v;
+				}
+			}
+		}
+		std::array<uint64_t, kEngineThreads + 1> seen {};
+		for (uint32_t s = 0; s <= kEngineThreads; s++) {
+			const auto v          = g_native_seen[s].load(std::memory_order_relaxed);
+			seen[s]               = v - g_native_seen_last[s];
+			g_native_seen_last[s] = v;
+		}
+		const auto per_frame = [&](uint64_t v) { return flips == 0 ? 0.0 : static_cast<double>(v) / static_cast<double>(flips); };
+		native = fmt::format("Native 10s ({:.1f} s, mode {}): flips {}", seconds, Native().mode, flips);
+		std::array<uint64_t, kNCount> total {};
+		uint64_t                      total_seen = 0;
+		for (uint32_t s = 0; s < kEngineThreads; s++) {
+			if (((Native().mask >> s) & 1u) == 0) {
+				continue;
+			}
+			const auto& p = per[s];
+			native += fmt::format(" | \"{}\" chosen {} written {} cp-seen {} fallback", kEngineThreadNames[s], p[kNChosen], p[kNWritten], seen[s]);
+			for (uint32_t k = 0; k < 4; k++) native += fmt::format(" {} {}", kNFbNames[k], p[kNFb0 + k]);
+			native += fmt::format(" incomplete {} | per frame chosen {:.1f} written {:.1f} cp-seen {:.1f}", p[kNIncomplete], per_frame(p[kNChosen]),
+			                      per_frame(p[kNWritten]), per_frame(seen[s]));
+			for (uint32_t i = 0; i < kNCount; i++) total[i] += p[i];
+			total_seen += seen[s];
+		}
+		native += fmt::format(" | total chosen {} written {} cp-seen {} (other slots {}, malformed {}) per frame written {:.1f}\n", total[kNChosen],
+		                      total[kNWritten], total_seen,
+		                      [&] {
+			                      uint64_t other = 0;
+			                      for (uint32_t s = 0; s < kEngineThreads; s++) {
+				                      if (((Native().mask >> s) & 1u) == 0) other += seen[s];
+			                      }
+			                      return other;
+		                      }(),
+		                      seen[kEngineThreads], per_frame(total[kNWritten]));
+	}
+
 	Log::WriteToConsoleAndLog(line);
 	Log::WriteToConsoleAndLog(stages);
 	Log::WriteToConsoleAndLog(lists);
 	Log::WriteToConsoleAndLog(cp);
 	if (!sample.empty()) {
 		Log::WriteToConsoleAndLog(sample);
+	}
+	if (!native.empty()) {
+		Log::WriteToConsoleAndLog(native);
 	}
 }
 
@@ -1199,6 +1430,17 @@ void OnInstalled() {
 	const bool ok = IsInstalled(g_id_flush);
 	Log::WriteToConsoleAndLog(fmt::format("GameCapture: {} ({} hooks registered{}{})\n", ok ? "active" : "inactive (draw flush hook not installed)",
 	                                      g_ids.size(), missing.empty() ? "" : ", not installed:", missing));
+	if (const auto& native = Native(); native.requested) {
+		std::string threads;
+		for (uint32_t s = 0; s < kEngineThreads; s++) {
+			if (((native.mask >> s) & 1u) != 0) threads += fmt::format(" \"{}\"", kEngineThreadNames[s]);
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GameNative: KYTY_NATIVE {} | mode {}{} | threads:{}{}{}\n",
+		    !native.valid ? "ignored" : ok ? "active (stage N0)" : "inactive (capture hooks not installed)", native.mode,
+		    native.mode == "drop" ? "" : " (unsupported: only drop)", threads.empty() ? " none" : threads,
+		    native.unknown.empty() ? "" : " | unknown:", native.unknown));
+	}
 	GameCapture::g_active.store(ok, std::memory_order_release);
 }
 
@@ -1210,11 +1452,45 @@ namespace Loader::GameCapture {
 
 using namespace Loader::GameHooks::Capture; // NOLINT(google-build-using-namespace)
 
-void NoteDrawPacketSlow(const uint32_t* packet, uint32_t /*opcode*/) {
+namespace {
+
+// KYTY_NATIVE: the direct draw packet becomes an R_NATIVE_DRAW NOP of the same size.
+bool WriteNativeMarker(ThreadState* t, uint32_t* packet, uint32_t opcode, uint32_t size_dw) {
+	namespace Pm4 = Libs::Graphics::Pm4;
+	const uint32_t expected = opcode == Pm4::IT_DRAW_INDEX_2          ? 6u
+	                          : opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ? 5u
+	                          : opcode == Pm4::IT_DRAW_INDEX_AUTO     ? 3u
+	                                                                   : 0u;
+	if (packet == nullptr || expected == 0 || size_dw != expected || KYTY_PM4_LEN(packet[0]) != size_dw ||
+	    ((packet[0] >> 8u) & 0xffu) != opcode) {
+		return false;
+	}
+	const uint32_t serial = ++t->native_serial;
+	packet[1]             = (kNativeMagic << 16u) | (kNativeVersion << 8u) | static_cast<uint32_t>(t->native_slot);
+	packet[2]             = serial;
+	for (uint32_t i = 3; i < size_dw; i++) {
+		packet[i] = 0;
+	}
+	packet[0] = KYTY_PM4(size_dw, Pm4::IT_NOP, Pm4::R_NATIVE_DRAW);
+	Inc(t->n[kNWritten]);
+	return true;
+}
+
+} // namespace
+
+void NoteDrawPacketSlow(uint32_t* packet, uint32_t opcode, uint32_t size_dw) {
 	auto* t = T();
 	if (t->emit_window) {
 		t->emit_window = false;
 		Inc(t->c[kCHleHooked]);
+		if (t->native_window) [[unlikely]] {
+			t->native_window = false;
+			if (WriteNativeMarker(t, packet, opcode, size_dw)) {
+				t->sample_pending = false; // the CP will not see this draw
+				return;
+			}
+			Inc(t->n[kNFbPacket]);
+		}
 		if (t->sample_pending) {
 			t->sample_pending = false;
 			const auto address = reinterpret_cast<uint64_t>(packet);
@@ -1299,6 +1575,15 @@ void CheckCpDrawSlow(const CpDrawView& view) {
 		    w[5], view.opcode, view.index_count, view.index_offset, view.instances, view.instances_known ? "" : "?", view.ib_base,
 		    view.ib_type, view.rt0_base, view.ps_addr, view.gs_addr, view.hs_addr));
 	}
+}
+
+void NoteNativeMarker(const uint32_t* body, uint32_t body_dw) {
+	uint32_t slot = kEngineThreads; // malformed
+	if (body != nullptr && body_dw >= 2 && (body[0] >> 16u) == kNativeMagic &&
+	    ((body[0] >> 8u) & 0xffu) == kNativeVersion && (body[0] & 0xffu) < kEngineThreads) {
+		slot = body[0] & 0xffu;
+	}
+	g_native_seen[slot].fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace Loader::GameCapture

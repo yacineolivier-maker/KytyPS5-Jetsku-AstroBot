@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "loader/gameCapture.h"
 
 #include <algorithm>
 #include <array>
@@ -2313,6 +2314,20 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 	}
 
 	return dw_num + 1;
+}
+
+// Astro Bot PC (KYTY_NATIVE, loader/gameCapture.h): a draw taken by the native backend. Stage
+// N0 (KYTY_NATIVE_MODE=drop): nothing is drawn, the marker is only counted. No op is emitted in
+// any front mode; the draw-prep window classes it as window-safe (packetClass.h).
+KYTY_CP_OP_PARSER(CpOpNativeDraw) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+
+	const auto body_dw = KYTY_PM4_LEN(cmd_id) - 1u;
+	EXIT_NOT_IMPLEMENTED(body_dw < 2u || body_dw >= dw);
+	if (!cp.IsReferenceFront()) {
+		Loader::GameCapture::NoteNativeMarker(buffer, body_dw);
+	}
+	return body_dw;
 }
 
 KYTY_CP_OP_PARSER(CpOpPushMarker) {

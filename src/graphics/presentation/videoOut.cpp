@@ -31,6 +31,7 @@
 #include "libs/errno.h"
 #include "libs/hmd2.h"
 #include "libs/libs.h"
+#include "loader/gameCapture.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -1091,6 +1092,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	request_id = r.id;
 	PaceLog::NoteReserve(r.id);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
+	Loader::GameCapture::NoteFlip(); // Astro Bot PC : KYTY_NATIVE, moyennes par image
 
 	cfg.flip_status.flipPendingNum++;
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
