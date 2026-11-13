@@ -7105,6 +7105,15 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	// Astro Bot PC (13/11) : KYTY_WIREFRAME=1, diagnostic a la demande du porteur : les dessins avec profondeur (la
+	// geometrie 3D) en fil de fer ; les passes plein ecran (sans profondeur, ou en rectangles) restent pleines.
+	static const bool wireframe = [] {
+		const char* v = std::getenv("KYTY_WIREFRAME");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	if (wireframe && with_depth && !rect_list) {
+		static_params.polygon_mode = vk::PolygonMode::eLine;
+	}
 	NormalizePipelineKey(static_params, with_depth);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {

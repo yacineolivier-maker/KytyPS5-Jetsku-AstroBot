@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/command_processor/stateTrace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -2063,6 +2064,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
 
+		if (raw_cmd_offset != 0xffffffffu) {
+			StateTrace::NoteContext(cmd_offset, 1, &value); // Astro Bot PC : KYTY_STATE_TRACE
+		}
+
 		if (HwCtxTrySetFakeRegister(cmd_offset, value)) {
 			continue;
 		}
@@ -2146,6 +2151,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
 			continue;
 		}
+		StateTrace::NoteShader(cmd_offset, 1, &value); // Astro Bot PC : KYTY_STATE_TRACE
 
 		if (cmd_offset >= Pm4::SH_NUM) {
 			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
@@ -2339,6 +2345,8 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 
 	auto cmd_offset = NormalizeRegisterOffset(buffer[0]);
 
+	StateTrace::NoteContext(cmd_offset, KYTY_PM4_LEN(cmd_id) - 2u, buffer + 1); // Astro Bot PC : KYTY_STATE_TRACE
+
 	if (HwCtxTrySetFakeRegister(cmd_offset, buffer[1])) {
 		return 2;
 	}
@@ -2389,6 +2397,7 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 	}
 
 	EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
+	StateTrace::NoteShader(cmd_offset, KYTY_PM4_LEN(cmd_id) - 2u, buffer + 1); // Astro Bot PC : KYTY_STATE_TRACE
 
 	auto pfunc = g_hw_sh_func[cmd_offset];
 

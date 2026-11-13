@@ -1,3 +1,4 @@
+#include "graphics/guest_gpu/cbRanges.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
@@ -48,6 +49,7 @@
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
+#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -2128,9 +2130,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		}
 		const bool uniform_view = uniform_binding != nullptr &&
 		                          std::ranges::binary_search(uniform_binding->resources, i);
+		// Astro Bot PC (KYTY_CB_CONST_STATS) : part et cout des tampons ranges dans les listes de commandes du jeu.
+		const bool cb_stats = CbRanges::Enabled();
+		const auto cb_t0    = cb_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[i], program.stage, i,
 		                                               buffer_offset, written, uniform_view));
+		if (cb_stats) [[unlikely]] {
+			CbRanges::NoteBinding(CbRanges::Contains(prepared.buffer_sources[i].address),
+			                      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                std::chrono::steady_clock::now() - cb_t0)
+			                                                .count()));
+		}
 		pack_memory_offset(i, buffer_offset);
 	}
 	CommitStats::StepMark(CommitStats::Step::RbBindings);

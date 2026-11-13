@@ -33,6 +33,10 @@ VkResult AcquireNextImage(VkDevice device, VkSwapchainKHR swapchain, uint64_t ti
 VkResult QueuePresent(VkQueue queue, const VkPresentInfoKHR* info);
 // Images affichees par seconde (reelles + generees), mesurees chaque seconde ; 0 si inactif.
 [[nodiscard]] double DisplayedFps();
+// Vrai pendant l'une des 3 premieres presentations de FSR 3 (au plus 3 s chacune) : le fil de la fenetre ne relit
+// pas ses messages. 13/11 : gel 1 lancement sur 6 a la premiere presentation, fil de la fenetre bloque sur un verrou
+// du pilote NVIDIA (crochet de fenetre appele depuis PeekMessage) pendant que la presentation ne revient pas.
+[[nodiscard]] bool HoldWindowPump();
 
 // Image du jeu prete a etre presentee : configure la generation et enregistre sa preparation dans `command`
 // (le tampon de commandes de la presentation, avant la presentation).

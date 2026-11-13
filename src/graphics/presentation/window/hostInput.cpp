@@ -1,3 +1,4 @@
+#include "graphics/presentation/window/fsr3FrameGen.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/hostInputPulse.h"
 
@@ -1038,6 +1039,11 @@ void HostInputToggleMouseToJoystick() {
 }
 
 bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
+	// Astro Bot PC (13/11) : voir Fsr3::HoldWindowPump.
+	if (Fsr3::HoldWindowPump()) {
+		SDL_Delay(1);
+		return false;
+	}
 	// -1 waits without a deadline (until max_wait_ms below).
 	int timeout = g_input_pulse.Poll(SDL_GetTicks(), ApplyHostKey);
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {

@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/command_processor/cpSequencer.h"
+#include "graphics/guest_gpu/command_processor/stateTrace.h"
 #include "graphics/guest_gpu/command_processor/cpVerify.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpuTimestampScale.h"
@@ -2458,6 +2459,7 @@ static void AttachDrawRegisters(Op& op, Args args, DrawPrep::Engine* engine,
                                 const HW::Context& context, const HW::UserConfig& user_config,
                                 const HW::Shader& shaders, const std::function<bool()>& wait,
                                 const std::function<uint32_t()>& take_snapshot) {
+	StateTrace::NoteDraw(); // Astro Bot PC : KYTY_STATE_TRACE
 	if (engine != nullptr && engine->Parallel()) {
 		if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 			// Resolved at commit; the preparation assumes the draw draws (an unused one is
@@ -5271,6 +5273,9 @@ bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
 	// The front's part of GuestGpu::Process's first slice.
 	if (intake.reset_processor) {
 		Reset();
+	}
+	if (intake.graphics) {
+		StateTrace::BeginSubmission(intake.sequence, intake.reset_processor); // Astro Bot PC : KYTY_STATE_TRACE
 	}
 	ResetDeCe();
 	SetFlip({});

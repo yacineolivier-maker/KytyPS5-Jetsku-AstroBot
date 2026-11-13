@@ -1228,15 +1228,24 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
-	{
+	if (Fsr3::Active()) {
+		// Astro Bot PC (KYTY_FSR3_FG) : la presentation FSR 3 peut attendre sans limite son fil d'interpolation
+		// (FrameInterpolationSwapchainVK::queuePresent, WaitForSingleObject INFINITE). Elle ne doit donc pas tenir
+		// queue_mutex : les autres fils de l'emulateur doivent pouvoir soumettre le travail GPU qu'elle attend
+		// (gel du 13/11, 213 s sans image). Ses propres soumissions sur cette file prennent le verrou
+		// (Fsr3 GameQueueSubmit).
+		{
+			Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+			m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
+		}
+		result = static_cast<vk::Result>(Fsr3::QueuePresent(static_cast<VkQueue>(m_window.graphic_ctx.queue),
+		                                                    reinterpret_cast<const VkPresentInfoKHR*>(&present)));
+	} else {
 		// The blit this present waits for goes ahead of game batches still waiting for their
 		// texture copies: the present never waits for them, nor for a signal not yet submitted.
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
-		result = Fsr3::Active()
-		             ? static_cast<vk::Result>(Fsr3::QueuePresent(static_cast<VkQueue>(m_window.graphic_ctx.queue),
-		                                                          reinterpret_cast<const VkPresentInfoKHR*>(&present)))
-		             : m_window.graphic_ctx.queue.presentKHR(&present);
+		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;

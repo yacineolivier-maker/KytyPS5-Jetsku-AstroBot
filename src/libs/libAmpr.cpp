@@ -286,13 +286,15 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		info.file_id         = AprShared::ComputeFileId(guest_path);
 		info.host_path       = real_path;
 
-		if (Common::File::IsDirectoryExisting(real_path)) {
+		// One attribute query instead of three (directory?, file?, size): the game's loader thread resolves
+		// thousands of new paths while a level loads, and each host metadata call costs tens of microseconds.
+		if (const auto host = Common::File::GetInfo(real_path); !host) {
+			info.result = LibKernel::KERNEL_ERROR_ENOENT;
+		} else if (!host->is_file) {
 			info.is_dir    = true;
 			info.file_size = 0x10000;
-		} else if (Common::File::IsFileExisting(real_path)) {
-			info.file_size = Common::File::Size(real_path);
 		} else {
-			info.result = LibKernel::KERNEL_ERROR_ENOENT;
+			info.file_size = host->size;
 		}
 
 		bool log_missing = false;

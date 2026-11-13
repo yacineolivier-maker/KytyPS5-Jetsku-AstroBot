@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/cbRanges.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -39,7 +40,82 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+// Astro Bot PC (13/11) : KYTY_AGC_CALL_STATS=1, diagnostic. Compte les appels du jeu aux fonctions de dessin et de calcul
+// de libAgc (fournies par l'emulateur) et ecrit toutes les 10 s une ligne « AgcCalls 10s: ... ». A comparer avec les
+// dessins executes par le processeur de commandes (ligne « DrawPrep 10s ») : savoir si chaque dessin du jeu passe par
+// une fonction de bibliotheque (point d'interception possible) ou si le moteur ecrit ses commandes lui-meme.
+namespace AgcCallStats {
+enum Fn : uint32_t {
+	CbDispatch, DcbDrawIndex, DcbDrawIndexMultiInstanced, DcbDrawIndexAuto, DcbDrawIndexOffset, DcbDrawIndexIndirect,
+	DcbDrawIndirect, DcbDrawIndirectMulti, DcbDrawIndexIndirectMulti, DcbDispatchIndirect, AcbDispatchIndirect, Count
+};
+static const char* const k_names[Count] = {"CbDispatch", "DcbDrawIndex", "DcbDrawIndexMultiInstanced",
+                                           "DcbDrawIndexAuto", "DcbDrawIndexOffset", "DcbDrawIndexIndirect",
+                                           "DcbDrawIndirect", "DcbDrawIndirectMulti", "DcbDrawIndexIndirectMulti",
+                                           "DcbDispatchIndirect", "AcbDispatchIndirect"};
+static std::atomic<uint64_t> g_counts[Count] {};
+static std::atomic<int64_t>  g_window_start {0};
+// Adresses de retour dans le code du jeu (l'appelant de la fonction de bibliotheque), par fonction.
+static std::mutex                             g_sites_mutex;
+static std::unordered_map<uint64_t, uint64_t> g_sites[Count];
+static void Note(Fn fn, const void* ret) {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_AGC_CALL_STATS");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	g_counts[fn].fetch_add(1, std::memory_order_relaxed);
+	{
+		std::lock_guard lock(g_sites_mutex);
+		g_sites[fn][reinterpret_cast<uint64_t>(ret)]++;
+	}
+	const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	int64_t start = g_window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		g_window_start.compare_exchange_strong(start, now);
+		return;
+	}
+	if (now - start < 10000 || !g_window_start.compare_exchange_strong(start, now)) {
+		return;
+	}
+	std::string line = "AgcCalls 10s:";
+	for (uint32_t i = 0; i < Count; i++) {
+		const auto n = g_counts[i].exchange(0, std::memory_order_relaxed);
+		if (n != 0) {
+			line += " " + std::string(k_names[i]) + "=" + std::to_string(n);
+		}
+	}
+	std::printf("%s\n", line.c_str());
+	// Appelants : les 24 plus frequents de chaque fonction, avec les 24 octets de code avant l'adresse de retour
+	// (l'instruction d'appel), pour les retrouver dans eboot.elf sans connaitre l'adresse de chargement.
+	std::lock_guard lock(g_sites_mutex);
+	for (uint32_t i = 0; i < Count; i++) {
+		std::vector<std::pair<uint64_t, uint64_t>> v(g_sites[i].begin(), g_sites[i].end());
+		g_sites[i].clear();
+		if (v.empty()) {
+			continue;
+		}
+		std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::printf("AgcCallers %s: %zu sites\n", k_names[i], v.size());
+		for (size_t k = 0; k < v.size() && k < 24; k++) {
+			const auto* p = reinterpret_cast<const uint8_t*>(v[k].first);
+			char        hex[24 * 2 + 1] {};
+			for (int b = 0; b < 24; b++) {
+				std::snprintf(hex + b * 2, 3, "%02x", p[b - 24]);
+			}
+			std::printf("AgcCaller %s 0x%016" PRIx64 " %" PRIu64 " %s\n", k_names[i], v[k].first, v[k].second, hex);
+		}
+	}
+	std::fflush(stdout);
+}
+} // namespace AgcCallStats
 
 #ifdef min
 #undef min
@@ -509,6 +585,9 @@ struct CommandBuffer {
 		cursor_up += size_dw;
 		if (CbWatermark::Enabled()) [[unlikely]] {
 			CbWatermark::Note(bottom, top, cursor_up, cursor_down, reserved_dw);
+		}
+		if (CbRanges::Enabled()) [[unlikely]] { // Astro Bot PC : KYTY_CB_CONST_STATS
+			CbRanges::Note(bottom, top);
 		}
 		return ret_ptr;
 	}
@@ -1920,6 +1999,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
                                       uint32_t thread_group_y, uint32_t thread_group_z,
                                       uint32_t modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::CbDispatch, __builtin_return_address(0));
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -2702,6 +2782,7 @@ static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count,
                                         const volatile void* index_addr, uint64_t modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::DcbDrawIndex, __builtin_return_address(0));
 
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
 	     "\t index_addr  = 0x%016" PRIx64 "\n"
@@ -2739,6 +2820,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
                                                       const volatile void* object_ids,
                                                       uint32_t instance_count, uint64_t modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::DcbDrawIndexMultiInstanced, __builtin_return_address(0));
 
 	AgcTrace("\t index_count    = 0x%" PRIx32 "\n"
 	     "\t index_addr     = 0x%016" PRIx64 "\n"
@@ -2813,6 +2895,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_count,
                                             uint64_t modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::DcbDrawIndexAuto, __builtin_return_address(0));
 
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
 	     "\t modifier    = 0x%016" PRIx64 "\n",
@@ -2840,6 +2923,7 @@ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexAutoGetSize() {
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index_offset,
                                               uint32_t index_count, uint64_t modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::DcbDrawIndexOffset, __builtin_return_address(0));
 
 	AgcTrace("\t index_offset = 0x%" PRIx32 "\n"
 	     "\t index_count  = 0x%" PRIx32 "\n"
@@ -2894,6 +2978,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                 uint64_t modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::DcbDrawIndexIndirect, __builtin_return_address(0));
 
 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
 	     "\t modifier    = 0x%016" PRIx64 "\n",
@@ -2921,6 +3006,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                            uint64_t modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::DcbDrawIndirect, __builtin_return_address(0));
 
 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
 	     "\t modifier    = 0x%016" PRIx64 "\n",
@@ -2950,6 +3036,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
                                                 const volatile void* count_addr,
                                                 uint32_t stride_in_bytes, uint64_t modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::DcbDrawIndirectMulti, __builtin_return_address(0));
 
 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
 	     "\t count_indirect     = 0x%" PRIx32 "\n"
@@ -3011,6 +3098,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
                                                      const volatile void* count_addr,
                                                      uint32_t stride_in_bytes, uint64_t modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::DcbDrawIndexIndirectMulti, __builtin_return_address(0));
 
 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
 	     "\t count_indirect     = 0x%" PRIx32 "\n"
@@ -3065,6 +3153,7 @@ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndirectGetSize() {
 uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                uint32_t flags) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::DcbDispatchIndirect, __builtin_return_address(0));
 
 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
 	         "\t flags       = 0x%08" PRIx32 "\n",
@@ -3374,6 +3463,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
                                                const volatile void* indirect_args,
                                                uint32_t             modifier) {
 	PRINT_NAME();
+	AgcCallStats::Note(AgcCallStats::AcbDispatchIndirect, __builtin_return_address(0));
 
 	AgcTrace("\t indirect_args = 0x%016" PRIx64 "\n"
 	         "\t modifier      = 0x%08" PRIx32 "\n",

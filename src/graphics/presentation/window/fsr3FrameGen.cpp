@@ -1,5 +1,6 @@
 #include "graphics/presentation/window/fsr3FrameGen.h"
 
+#include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #ifndef NOMINMAX
@@ -54,6 +55,60 @@ struct State {
 State& S() {
 	static State s;
 	return s;
+}
+
+// Diagnostic des gels : etape FSR 3 en cours et instant de la derniere presentation aboutie. Un fil de
+// surveillance ecrit l'etape bloquee si aucune presentation n'aboutit pendant 10 s.
+enum class Stage : int { Aucune, CreationChaine, CreationContexte, Acquisition, Preparation, Presentation,
+	                     DestructionContexte, DestructionChaine };
+const char* StageName(int s) {
+	static const char* names[] = {"aucune", "creation de la chaine", "creation du contexte", "acquisition d'image",
+	                              "preparation", "presentation", "destruction du contexte", "destruction de la chaine"};
+	return s >= 0 && s < 8 ? names[s] : "?";
+}
+std::atomic<int>     g_stage {0};
+std::atomic<int64_t> g_stage_since {0};
+std::atomic<int64_t> g_last_present {0};
+int64_t NowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+struct StageScope {
+	int previous;
+	explicit StageScope(Stage s): previous(g_stage.exchange(static_cast<int>(s))) { g_stage_since = NowMs(); }
+	~StageScope() {
+		g_stage = previous;
+		g_stage_since = NowMs();
+	}
+};
+void StartWatchdog() {
+	static std::atomic<bool> started {false};
+	if (started.exchange(true)) {
+		return;
+	}
+	g_last_present = NowMs();
+	CreateThread(
+	    nullptr, 0,
+	    [](void*) -> DWORD {
+		    SetThreadDescription(GetCurrentThread(), L"FSR3 surveillance");
+		    int64_t reported_for = -1;
+		    for (;;) {
+			    Sleep(2000);
+			    if (!S().active) {
+				    continue;
+			    }
+			    const int64_t now  = NowMs();
+			    const int64_t last = g_last_present.load();
+			    if (now - last >= 10000 && reported_for != last) {
+				    reported_for = last;
+				    std::printf("FSR 3 : aucune presentation depuis %lld ms ; etape en cours : %s depuis %lld ms\n",
+				                static_cast<long long>(now - last), StageName(g_stage.load()),
+				                static_cast<long long>(now - g_stage_since.load()));
+				    std::fflush(stdout);
+			    }
+		    }
+	    },
+	    nullptr, 0, nullptr);
 }
 
 void Log(const char* what, ffxReturnCode_t code) {
@@ -207,6 +262,32 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL ProcAddr(VkDevice device, const char* n
 	return nullptr;
 }
 
+// Soumissions de FSR 3 sur la file graphique de l'emulateur : depuis ses propres fils comme depuis la presentation.
+// Vulkan exige qu'une file ne recoive jamais deux soumissions a la fois ; l'emulateur soumet sous queue_mutex
+// (section critique, reentrante), FSR 3 doit donc le prendre aussi. Sans cela (submitFunc nul), FSR 3 soumettait
+// en concurrence avec l'emulateur.
+VkResult GameQueueSubmit(uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+	auto*             g = S().graphics;
+	Common::LockGuard lock(g->queue_mutex);
+	return VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit(static_cast<VkQueue>(g->queue), count, submits, fence);
+}
+
+// Sonde : une acquisition ou une presentation FSR 3 de plus de 500 ms est notee (gel ou attente anormale).
+struct SlowProbe {
+	const char*                           what;
+	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	~SlowProbe() {
+		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+		if (ms > 500.0) {
+			static int logged = 0;
+			if (logged++ < 64) {
+				std::printf("FSR 3 : %s a dure %.0f ms\n", what, ms);
+				std::fflush(stdout);
+			}
+		}
+	}
+};
+
 ffxReturnCode_t DispatchCallback(ffxDispatchDescFrameGeneration* params, void* user) {
 	return S().f.Dispatch(static_cast<ffxContext*>(user), &params->header);
 }
@@ -245,13 +326,18 @@ bool CreateSwapchain(GraphicContext& graphics, const VkSwapchainCreateInfoKHR& i
 	desc.allocator          = nullptr;
 	desc.createInfo         = info;
 	desc.createInfo.oldSwapchain = VK_NULL_HANDLE;
-	desc.gameQueue          = {static_cast<VkQueue>(graphics.queue), graphics.queue_family, nullptr};
+	desc.gameQueue          = {static_cast<VkQueue>(graphics.queue), graphics.queue_family, &GameQueueSubmit};
 	desc.asyncComputeQueue  = {static_cast<VkQueue>(graphics.fsr_queues[0]), graphics.queue_family, nullptr};
 	desc.presentQueue       = {static_cast<VkQueue>(graphics.fsr_queues[1]), graphics.queue_family, nullptr};
 	desc.imageAcquireQueue  = {static_cast<VkQueue>(graphics.fsr_queues[2]), graphics.queue_family, nullptr};
 	std::printf("FSR 3 : etape 1, chaine de presentation (files %p %p %p %p, getDeviceProcAddr %p)\n", static_cast<void*>(desc.gameQueue.queue), static_cast<void*>(desc.asyncComputeQueue.queue), static_cast<void*>(desc.presentQueue.queue), static_cast<void*>(desc.imageAcquireQueue.queue), reinterpret_cast<void*>(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr));
 	std::fflush(stdout);
-	auto code               = s.f.CreateContext(&s.swapchain_ctx, &desc.header, nullptr);
+	StartWatchdog();
+	ffxReturnCode_t code;
+	{
+		const StageScope stage(Stage::CreationChaine);
+		code = s.f.CreateContext(&s.swapchain_ctx, &desc.header, nullptr);
+	}
 	std::printf("FSR 3 : etape 1 terminee (code %u)\n", static_cast<unsigned>(code));
 	std::fflush(stdout);
 	if (code != FFX_API_RETURN_OK || handle == VK_NULL_HANDLE) {
@@ -284,7 +370,10 @@ bool CreateSwapchain(GraphicContext& graphics, const VkSwapchainCreateInfoKHR& i
 	fg.backBufferFormat = ffxApiGetSurfaceFormatVK(info.imageFormat);
 	std::printf("FSR 3 : etape 2, contexte de generation\n");
 	std::fflush(stdout);
-	code                = s.f.CreateContext(&s.fg_ctx, &fg.header, nullptr);
+	{
+		const StageScope stage(Stage::CreationContexte);
+		code = s.f.CreateContext(&s.fg_ctx, &fg.header, nullptr);
+	}
 	std::printf("FSR 3 : etape 2 terminee (code %u)\n", static_cast<unsigned>(code));
 	std::fflush(stdout);
 	if (code != FFX_API_RETURN_OK) {
@@ -318,12 +407,16 @@ bool CreateSwapchain(GraphicContext& graphics, const VkSwapchainCreateInfoKHR& i
 
 void DestroySwapchain(GraphicContext& graphics) {
 	auto& s = S();
+	std::printf("FSR 3 : destruction de la chaine (recreation ou fermeture)\n");
+	std::fflush(stdout);
 	if (s.fg_ctx != nullptr) {
+		const StageScope stage(Stage::DestructionContexte);
 		s.f.DestroyContext(&s.fg_ctx, nullptr);
 		s.fg_ctx = nullptr;
 	}
 	if (s.swapchain_ctx != nullptr) {
 		// Detruit aussi la chaine de presentation qu'il a creee.
+		const StageScope stage(Stage::DestructionChaine);
 		s.f.DestroyContext(&s.swapchain_ctx, nullptr);
 		s.swapchain_ctx = nullptr;
 	}
@@ -340,6 +433,8 @@ VkResult GetSwapchainImages(VkDevice device, VkSwapchainKHR swapchain, uint32_t*
 
 VkResult AcquireNextImage(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore,
                           VkFence fence, uint32_t* index) {
+	const SlowProbe  probe {"l'acquisition d'image"};
+	const StageScope stage(Stage::Acquisition);
 	return S().repl.pOutAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, index);
 }
 
@@ -350,9 +445,29 @@ double DisplayedFps() {
 	return g_displayed.load(std::memory_order_relaxed);
 }
 
+static std::atomic<int>     g_presents_done {0};
+static std::atomic<int64_t> g_present_started {0}; // 0 : aucune presentation en cours
+
+bool HoldWindowPump() {
+	if (g_presents_done.load(std::memory_order_relaxed) >= 3) {
+		return false;
+	}
+	const int64_t started = g_present_started.load(std::memory_order_relaxed);
+	return started != 0 && NowMs() - started < 3000;
+}
+
 VkResult QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
-	auto&      s      = S();
-	const auto result = s.repl.pOutQueuePresentKHR(queue, info);
+	auto& s = S();
+	VkResult result;
+	{
+		const SlowProbe  probe {"la presentation"};
+		const StageScope stage(Stage::Presentation);
+		g_present_started = NowMs();
+		result         = s.repl.pOutQueuePresentKHR(queue, info);
+		g_present_started = 0;
+		g_presents_done.fetch_add(1, std::memory_order_relaxed);
+		g_last_present = NowMs();
+	}
 	// Toutes les 5 s : images affichees (presentations reelles de FSR 3) et images du jeu, par seconde.
 	static auto     window_start = std::chrono::steady_clock::now();
 	static uint64_t presents0 = 0, frames0 = 0;
@@ -379,6 +494,7 @@ void PrepareFrame(VkCommandBuffer command) {
 	if (!s.active) {
 		return;
 	}
+	const StageScope stage(Stage::Preparation);
 	if (!s.neutral_ready) {
 		ClearNeutral(command, s.depth, 1.0f);
 		ClearNeutral(command, s.motion, 0.0f);
