@@ -83,6 +83,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 	}
 	switch (op) {
 		case Op::Wrap:
+		case Op::Switch: // Astro Bot PC (KYTY_CP_PAR=1b2): handled by the consumer
 		case Op::Count: EXIT("CommandStream: unexpected packet %u\n", static_cast<uint32_t>(op));
 		case Op::DrainMarker: {
 			const auto& p = reader.Get<DrainMarkerPacket>();

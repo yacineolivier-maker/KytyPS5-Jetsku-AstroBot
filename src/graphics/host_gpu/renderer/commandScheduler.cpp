@@ -123,7 +123,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
     : m_master(graphics,
                role == Role::Guest && CommandRecorder::ConfiguredMode() != CommandRecorder::Mode::Off),
       m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
+      m_command_pool(graphics, m_master), m_command(*this), m_command_b(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
 	if (role == Role::Guest && GpuTiming::Enabled()) {
 		m_gpu_timing = std::make_unique<GpuTimestampRing>(graphics, GpuTimestampRing::GuestPairs);
@@ -217,6 +217,9 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 		EXIT_IF(m_operation_state != OperationState::Open);
 	}
 	m_command.Bind(registers, user_config, shaders);
+	if (m_dual) {
+		m_command_b.Bind(registers, user_config, shaders); // Astro Bot PC (KYTY_CP_PAR=1b2)
+	}
 
 	if (m_command.IsInvalid()) {
 		BeginNext();
@@ -228,7 +231,7 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 }
 
 void CommandScheduler::EndRendering() {
-	if (Active() && !m_command.IsInvalid()) {
+	if (Active() && !Cmd().IsInvalid()) {
 		Current().EndRendering();
 	}
 }
@@ -613,27 +616,109 @@ void CommandScheduler::CheckActive() const {
 }
 
 CommandBuffer& CommandScheduler::Current() {
-	EXIT_IF(m_command.IsInvalid());
-	return m_command;
+	auto& command = Cmd(); // Astro Bot PC (KYTY_CP_PAR=1b2): the calling thread's context
+	EXIT_IF(command.IsInvalid());
+	return command;
+}
+
+uint32_t CommandScheduler::ThreadContext() noexcept {
+	return CommandRecorder::ThreadStream();
+}
+
+// Astro Bot PC (KYTY_CP_PAR=1b2, commandScheduler.h).
+bool CommandScheduler::EnableContextB() {
+	if (m_dual) {
+		return true;
+	}
+	if (m_recorder == nullptr || !m_recorder->EnableSecondStream()) {
+		return false;
+	}
+	m_command_b.m_recorder = m_recorder.get();
+	m_command_b.m_encoder  = &m_recorder->EncoderB();
+	m_command_b.m_buffer   = m_command.m_buffer;
+	if (m_command.m_registers != nullptr) {
+		m_command_b.Bind(*m_command.m_registers, *m_command.m_user_config, *m_command.m_shaders);
+	}
+	// Rendering instance serials and descriptor epochs identify state across draws (draw-run
+	// continuations, RenderExecutor::DrawRunCommandUnchanged); B's never equal A's.
+	m_command_b.m_rendering_serial = uint64_t {1} << 62u;
+	for (auto& epoch: m_command_b.m_descriptor_epochs) {
+		epoch = uint64_t {1} << 62u;
+	}
+	m_dynamic_state_b.Invalidate();
+	m_dual = true;
+	return true;
+}
+
+void CommandScheduler::BeginContextSegment() {
+	EXIT_IF(!m_dual);
+	const auto context = ThreadContext() != 0 ? 1u : 0u;
+	auto&      command = Cmd();
+	// The other context may have submitted and begun a native buffer meanwhile.
+	command.m_buffer = m_command.m_buffer;
+	EXIT_IF(command.m_rendering || command.m_direct_window || !command.m_pending.Empty());
+	// What CommandBuffer::Begin resets: nothing recorded by the other context is assumed.
+	command.m_bound_pipelines = {};
+	for (auto& state: command.m_descriptor_states) {
+		state.layout    = nullptr;
+		state.bound_set = nullptr;
+	}
+	for (auto& epoch: command.m_descriptor_epochs) {
+		epoch++;
+	}
+	command.m_push_constants.valid = false;
+	command.ResetBarrierState();
+	GetDynamicState().Invalidate();
+	m_segment_packets[context] = m_recorder->StreamPackets(context);
+	m_segment_submits[context] = m_submits[context];
+}
+
+CommandScheduler::SegmentCounts CommandScheduler::EndContextSegment() {
+	EXIT_IF(!m_dual);
+	const auto context = ThreadContext() != 0 ? 1u : 0u;
+	auto&      command = Cmd();
+	if (Active() && !command.IsInvalid()) {
+		// As Submit does before its packet: the segment's stream ends outside rendering, with no
+		// batched barrier, upload copy or kept depth ordering left in this wrapper.
+		command.EndRendering();
+		command.FlushBarriers();
+	}
+	command.CloseDirectWindow();
+	m_recorder->EndStreamSegment();
+	SegmentCounts counts;
+	counts.packets = m_recorder->StreamPackets(context) - m_segment_packets[context];
+	counts.submits = m_submits[context] - m_segment_submits[context];
+	if (counts.packets > 1 && m_segment_tick[context] != CurrentTick()) {
+		m_segment_tick[context]   = CurrentTick();
+		counts.new_command_buffer = true;
+	}
+	return counts;
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
-	m_command.Begin();
+	auto& command      = Cmd(); // Astro Bot PC (KYTY_CP_PAR=1b2): the calling thread's context
+	if (m_dual) {
+		// Both wrappers follow the one native buffer; the other context's wrapper is reset at its
+		// next segment's begin.
+		m_command_b.m_buffer = m_command.m_buffer;
+		m_dynamic_state_b.Invalidate();
+	}
+	command.Begin();
 	m_dynamic_state.Invalidate();
 	if (m_recorder != nullptr) {
 		// The recorder begins the native buffer and stamps KYTY_GPU_TIMING / GpuOpProfiler there,
 		// with this recording's tick and start time.
-		m_recorder->Begin(m_command.m_buffer, m_master.CurrentTick(),
+		m_recorder->Begin(command.m_buffer, m_master.CurrentTick(),
 		                  m_gpu_timing ? GpuTiming::NowNs() : 0);
 		if (m_eop_timestamps) {
 			// KYTY_EOP_TIMESTAMPS=gpu: reset the slots whose results were read, as recorder
 			// packets after the recorder's Begin (no drain). Without it no slot would ever become
 			// free.
-			m_eop_timestamps->BeginCommand(m_command.StateSink());
+			m_eop_timestamps->BeginCommand(command.StateSink());
 		}
-		return m_command;
+		return command;
 	}
 	if (m_gpu_timing) {
 		// Reuse the retirement point that just recycled a command buffer: read completed pairs
@@ -655,7 +740,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	const CpGaps::Scope gap(CpGaps::Cat::Flush);
 	HangWatchdog::NoteSubmission();
-	EXIT_IF(m_command.IsInvalid());
+	auto& command = Cmd(); // Astro Bot PC (KYTY_CP_PAR=1b2): the calling thread's context
+	EXIT_IF(command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 	if (m_pre_submit_hook != nullptr && !m_in_pre_submit && Active()) {
@@ -663,7 +749,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		m_in_pre_submit = true;
 		m_pre_submit_hook(m_pre_submit_hook_context);
 		m_in_pre_submit = false;
-		EXIT_IF(m_command.IsInvalid());
+		EXIT_IF(command.IsInvalid());
 	}
 	for (auto* dependency: m_submit_dependencies) {
 		if (dependency == nullptr) {
@@ -722,19 +808,19 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		// other command (or recorded natively in an open direct window); the recorder then stamps
 		// the timing end, ends the buffer and hands it to the broker or the queue. The tick is
 		// allocated here, exactly as in queued mode.
-		m_command.EndRendering();
-		m_command.FlushBarriers();
-		m_command.CloseDirectWindow();
+		command.EndRendering();
+		command.FlushBarriers();
+		command.CloseDirectWindow();
 		CommandStream::SubmitPacket packet;
 		packet.submit       = submit;
 		packet.submit_ns    = submit_ns;
-		packet.debug_op     = m_command.m_debug_op;
-		packet.debug_submit = m_command.m_debug_submit_id;
-		packet.debug_arg0   = m_command.m_debug_arg0;
-		packet.debug_arg1   = m_command.m_debug_arg1;
-		packet.debug_arg2   = m_command.m_debug_arg2;
-		packet.debug_arg3   = m_command.m_debug_arg3;
-		packet.debug_arg4   = m_command.m_debug_arg4;
+		packet.debug_op     = command.m_debug_op;
+		packet.debug_submit = command.m_debug_submit_id;
+		packet.debug_arg0   = command.m_debug_arg0;
+		packet.debug_arg1   = command.m_debug_arg1;
+		packet.debug_arg2   = command.m_debug_arg2;
+		packet.debug_arg3   = command.m_debug_arg3;
+		packet.debug_arg4   = command.m_debug_arg4;
 		{
 			std::lock_guard lock(m_operation_mutex);
 			count_boundary();
@@ -745,21 +831,27 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			m_preserve_current_completion = false;
 		}
 		m_recorder->Submit(packet);
-		m_command.m_buffer = nullptr;
+		command.m_buffer = nullptr;
+		if (m_dual) {
+			// Astro Bot PC (KYTY_CP_PAR=1b2): the other wrapper named the same native buffer.
+			m_command.m_buffer   = nullptr;
+			m_command_b.m_buffer = nullptr;
+			m_submits[ThreadContext() != 0 ? 1u : 0u]++;
+		}
 		return packet.tick;
 	}
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::SubmitEnd");
 		if (m_gpu_timing) {
 			// End's own EndRendering becomes a no-op; the end stamp follows the final store ops.
-			m_command.EndRendering();
+			command.EndRendering();
 			// Pending batched barriers belong before the end stamp, as when recorded directly.
-			m_command.FlushBarriers();
-			m_gpu_timing->EndCommand(m_command.m_buffer);
+			command.FlushBarriers();
+			m_gpu_timing->EndCommand(command.m_buffer);
 		}
-		m_command.End();
+		command.End();
 	}
-	const auto buffer   = m_command.m_buffer;
+	const auto buffer   = command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
@@ -769,13 +861,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		                         .progress = m_master.GetSubmissionProgress(),
 		                         .master_semaphore = m_master.Handle(),
 		                         .command = buffer,
-		                         .debug_op = m_command.m_debug_op,
-		                         .debug_submit = m_command.m_debug_submit_id,
-		                         .debug_arg0 = m_command.m_debug_arg0,
-		                         .debug_arg1 = m_command.m_debug_arg1,
-		                         .debug_arg2 = m_command.m_debug_arg2,
-		                         .debug_arg3 = m_command.m_debug_arg3,
-		                         .debug_arg4 = m_command.m_debug_arg4};
+		                         .debug_op = command.m_debug_op,
+		                         .debug_submit = command.m_debug_submit_id,
+		                         .debug_arg0 = command.m_debug_arg0,
+		                         .debug_arg1 = command.m_debug_arg1,
+		                         .debug_arg2 = command.m_debug_arg2,
+		                         .debug_arg3 = command.m_debug_arg3,
+		                         .debug_arg4 = command.m_debug_arg4};
 		{
 			// The callback runner may already have popped a callback. Record the
 			// boundary at registration, never by inspecting the callback queues here.
@@ -793,7 +885,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			queued.dispatch_ns = m_gpu_timing->Submitted(tick, submit_ns);
 		}
 		graphics.submission_queue.Enqueue(std::move(queued));
-		m_command.m_buffer = nullptr;
+		command.m_buffer = nullptr;
 		return tick;
 	}
 
@@ -845,10 +937,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		DumpDeviceLossDiagnostics(graphics, tick);
 	}
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, tick, command.m_debug_op,
+		                  command.m_debug_submit_id, command.m_debug_arg0,
+		                  command.m_debug_arg1, command.m_debug_arg2, command.m_debug_arg3,
+		                  command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	if (m_gpu_timing) {
@@ -857,7 +949,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		}
 	}
 
-	m_command.m_buffer = nullptr;
+	command.m_buffer = nullptr;
 	return tick;
 }
 

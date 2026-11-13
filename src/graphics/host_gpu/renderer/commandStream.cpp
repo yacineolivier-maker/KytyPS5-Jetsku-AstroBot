@@ -236,6 +236,7 @@ const char* OpName(Op op) noexcept {
 	    "ClearColorImage",
 	    "ClearDepthStencilImage",
 	    "HostCopy",
+	    "Switch", // Astro Bot PC (KYTY_CP_PAR=1b2)
 	};
 	static_assert(std::size(names) == static_cast<size_t>(Op::Count));
 	const auto index = static_cast<size_t>(op);
@@ -892,6 +893,14 @@ uint64_t Encoder::DrainMarker(uint64_t serial) {
 	w.Put(DrainMarkerPacket {serial});
 	Close(w, m_options.verify ? VerifyHash::DrainMarker(serial) : 0);
 	return m_ring.WritePosition();
+}
+
+// Astro Bot PC (KYTY_CP_PAR=1b2): the consumer intercepts it (CommandRecorder::ConsumeAvailable).
+void Encoder::SwitchStream(uint64_t serial) {
+	auto w = Open(Op::Switch, Sz<DrainMarkerPacket>(), false);
+	w.Put(DrainMarkerPacket {serial});
+	Close(w, 0);
+	m_ring.Publish();
 }
 
 void Encoder::beginRendering(const vk::RenderingInfo& info) {

@@ -102,19 +102,21 @@ public:
 	};
 	[[nodiscard]] RegisterBinding BindRegisters(HW::Context& registers, HW::UserConfig& user_config,
 	                                            HW::Shader& shaders) noexcept {
-		const RegisterBinding previous {m_command.m_registers, m_command.m_user_config,
-		                                m_command.m_shaders};
-		m_command.Bind(registers, user_config, shaders);
+		auto&                 command = Cmd(); // Astro Bot PC (KYTY_CP_PAR=1b2)
+		const RegisterBinding previous {command.m_registers, command.m_user_config,
+		                                command.m_shaders};
+		command.Bind(registers, user_config, shaders);
 		return previous;
 	}
 	void RestoreRegisters(const RegisterBinding& binding) noexcept {
-		m_command.m_registers   = binding.registers;
-		m_command.m_user_config = binding.user_config;
-		m_command.m_shaders     = binding.shaders;
+		auto& command         = Cmd(); // Astro Bot PC (KYTY_CP_PAR=1b2)
+		command.m_registers   = binding.registers;
+		command.m_user_config = binding.user_config;
+		command.m_shaders     = binding.shaders;
 	}
 	// The bound shader registers, writable: the command processor's own SH register writes during
 	// an op (an indirect multi-draw's per-record draw index).
-	[[nodiscard]] HW::Shader* BoundShaders() const noexcept { return m_command.m_shaders; }
+	[[nodiscard]] HW::Shader* BoundShaders() const noexcept { return Cmd().m_shaders; }
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -124,7 +126,9 @@ public:
 	[[nodiscard]] EopTimestampRing* GuestTimestamps() const noexcept { return m_eop_timestamps.get(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
-	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
+	[[nodiscard]] DynamicState&    GetDynamicState() noexcept {
+		return m_dual && ThreadContext() != 0 ? m_dynamic_state_b : m_dynamic_state;
+	}
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 	// Recording-thread only; the owner clears it before it is destroyed. Slot 0: TextureCache
@@ -142,7 +146,35 @@ public:
 	// GraphicContext::queue_mutex: the recorder may need it to submit.
 	void WaitRecorded(uint64_t tick, bool from_producer = true);
 
+	// Astro Bot PC (KYTY_CP_PAR=1b2, cpParallel.h): a second recording context. Its CommandBuffer
+	// wrapper (m_command_b: barrier batcher, pipeline/descriptor/push-constant shadows, rendering
+	// instance, register binding) and DynamicState are the calling thread's when its recorder
+	// stream (CommandRecorder::ThreadStream) is 1; both wrappers name the one native command
+	// buffer being recorded. EnableContextB (once, before the second context records; needs the
+	// recorder in thread mode without verify) returns whether it is active. A context's segment
+	// lasts while its thread holds the CP token: EndContextSegment (the giver) ends its rendering
+	// instance, flushes its barrier batch, closes its direct window and ends its recorder segment;
+	// BeginContextSegment (the taker) starts its wrapper with no shadow state, as at a command
+	// buffer's begin. Both on the calling thread's context.
+	bool EnableContextB();
+	[[nodiscard]] bool ContextB() const noexcept { return m_dual; }
+	struct SegmentCounts {
+		uint64_t packets            = 0; // packets encoded in the context's ring during the segment
+		uint64_t submits            = 0; // Submit packets among them
+		bool     new_command_buffer = false; // first segment of the context in its native buffer
+	};
+	void          BeginContextSegment();
+	SegmentCounts EndContextSegment();
+	// The calling thread's context (0 unless it records into stream 1).
+	[[nodiscard]] static uint32_t ThreadContext() noexcept;
+
 private:
+	[[nodiscard]] CommandBuffer& Cmd() noexcept {
+		return m_dual && ThreadContext() != 0 ? m_command_b : m_command;
+	}
+	[[nodiscard]] const CommandBuffer& Cmd() const noexcept {
+		return m_dual && ThreadContext() != 0 ? m_command_b : m_command;
+	}
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
@@ -188,7 +220,16 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	// Astro Bot PC (KYTY_CP_PAR=1b2): the second context's wrapper and dynamic state, and, per
+	// context, its packets and submits at its segment's begin and the tick it last recorded in.
+	CommandBuffer                m_command_b;
 	DynamicState                 m_dynamic_state;
+	DynamicState                 m_dynamic_state_b;
+	bool                         m_dual = false;
+	std::array<uint64_t, 2>      m_segment_packets {};
+	std::array<uint64_t, 2>      m_segment_submits {};
+	std::array<uint64_t, 2>      m_submits {};
+	std::array<uint64_t, 2>      m_segment_tick {};
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

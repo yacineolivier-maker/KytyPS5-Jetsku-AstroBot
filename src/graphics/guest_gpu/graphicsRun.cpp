@@ -28,6 +28,8 @@
 #include "graphics/host_gpu/gpuTouchedPages.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/readFaultDiag.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h" // Astro Bot PC (KYTY_CP_PAR=1b2)
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
@@ -272,6 +274,17 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 		} else if (CpSeq::VerifyMode() != 0) {
 			std::printf("Kyty CpPar: KYTY_CP_SEQ_VERIFY is on; every submission stays on Thread_Gpu\n");
 		} else {
+			if (CpPar::SeparateStreams()) {
+				// Astro Bot PC (KYTY_CP_PAR=1b2, cpParallel.h): context B's own recording target.
+				if (m_renderer.GetCommandScheduler().EnableContextB()) {
+					CpPar::g_streams_active = true;
+					std::printf("Kyty CpPar: context B records into its own command buffer wrapper "
+					            "and recorder ring (segments at every token hand-off)\n");
+				} else {
+					std::printf("Kyty CpPar: KYTY_CP_PAR=1b2 needs KYTY_CP_RECORDER=1 without "
+					            "KYTY_CP_RECORDER_VERIFY; running as 1b1\n");
+				}
+			}
 			CpPar::Hooks hooks;
 			hooks.context = this;
 			hooks.take    = [](void* context) {
@@ -281,9 +294,26 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					g_gpu_state  = gpu;
 				}
 				gpu->m_renderer.GetMutex().BecomeOwner();
+				if (CpPar::StreamsActive()) {
+					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context begins a segment.
+					const uint32_t stream = CpPar::OnResolver2() ? 1u : 0u;
+					CommandRecorder::SetThreadStream(stream);
+					gpu->m_renderer.GetCommandScheduler().BeginContextSegment();
+					gpu->m_renderer.GetRenderExecutor().CpParForgetCommandShadows();
+					CpPar::BeginSegment(stream);
+				}
 			};
 			hooks.give = [](void* context) {
 				auto* gpu = static_cast<GuestGpu*>(context);
+				if (CpPar::StreamsActive()) {
+					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context ends its segment (still
+					// owning the renderer), the merge point of its image states.
+					const uint32_t stream = CpPar::OnResolver2() ? 1u : 0u;
+					CommandRecorder::SetThreadStream(stream);
+					const auto counts = gpu->m_renderer.GetCommandScheduler().EndContextSegment();
+					CpPar::EndSegment(stream, counts.packets, counts.submits,
+					                  counts.new_command_buffer);
+				}
 				gpu->m_renderer.GetMutex().ResignOwner();
 				if (CpPar::OnResolver2()) {
 					g_gpu_thread = false;

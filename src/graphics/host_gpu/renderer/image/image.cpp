@@ -267,10 +267,48 @@ Image::GuestTransitScope::~GuestTransitScope() {
 	g_guest_transit = m_previous;
 }
 
+uint64_t Image::CpParStateHash() const noexcept {
+	// Astro Bot PC (KYTY_CP_PAR=1b2): FNV-1a over what GetBarriers reads and changes.
+	uint64_t   hash = 0xcbf29ce484222325ull;
+	const auto add  = [&hash](uint64_t value) {
+		for (uint32_t i = 0; i < 8; i++) {
+			hash ^= (value >> (i * 8u)) & 0xffu;
+			hash *= 0x100000001b3ull;
+		}
+	};
+	const auto add_state = [&add](const VulkanImageState& s) {
+		add(static_cast<uint64_t>(static_cast<VkPipelineStageFlags2>(s.pl_stage)));
+		add(static_cast<uint64_t>(static_cast<VkAccessFlags2>(s.access_mask)));
+		add(static_cast<uint64_t>(s.layout));
+		add(s.guest ? 1u : 0u);
+	};
+	add_state(backing.state);
+	add(backing.subresource_states.size());
+	for (const auto& s: backing.subresource_states) {
+		add_state(s);
+	}
+	return hash;
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
+	// Astro Bot PC (KYTY_CP_PAR=1b2): the state this access found and the one it leaves, on every
+	// return (cpParallel.h, image state bookkeeping).
+	struct CpParNote {
+		Image*   image  = nullptr;
+		uint64_t before = 0;
+		~CpParNote() {
+			if (image != nullptr) {
+				CpPar::NoteImageState(image, before, image->CpParStateHash());
+			}
+		}
+	} cp_par_note;
+	if (CpPar::StreamsActive()) {
+		cp_par_note.image  = this;
+		cp_par_note.before = CpParStateHash();
+	}
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
@@ -431,6 +469,11 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	                                                      range);
 	if (predicted && skip.verify == 0) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageTransitSkips);
+		if (CpPar::StreamsActive()) {
+			// Astro Bot PC (KYTY_CP_PAR=1b2): an access that found the state it needs.
+			const auto hash = CpParStateHash();
+			CpPar::NoteImageState(this, hash, hash);
+		}
 		return;
 	}
 	KYTY_GPU_OP_SITE("image.transition");
@@ -1110,6 +1153,9 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	if (CpPar::StreamsActive()) {
+		CpPar::ForgetImage(this); // Astro Bot PC (KYTY_CP_PAR=1b2)
+	}
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);

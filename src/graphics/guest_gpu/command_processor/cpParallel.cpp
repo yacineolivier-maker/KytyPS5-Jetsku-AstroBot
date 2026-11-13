@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace Libs::Graphics::CpPar {
 
@@ -39,6 +40,18 @@ struct Stats {
 	std::array<std::atomic<uint64_t>, 2> window_retired {};
 	std::array<uint64_t, 2>              reported_published {};
 	std::array<uint64_t, 2>              reported_retired {};
+	// KYTY_CP_PAR=1b2 (EndSegment, FixUpImage): per context, segments, packets encoded in its
+	// ring, Submit packets among them, native command buffers it recorded into (first segment in
+	// each); image fix-ups checked at merge points and those that would not be no-ops; image
+	// accesses outside any segment.
+	std::array<std::atomic<uint64_t>, 2> segments {};
+	std::array<std::atomic<uint64_t>, 2> segment_packets {};
+	std::array<std::atomic<uint64_t>, 2> segment_submits {};
+	std::array<std::atomic<uint64_t>, 2> segment_buffers {};
+	std::array<std::atomic<uint64_t>, 2> fixups_checked {};
+	std::array<std::atomic<uint64_t>, 2> fixups_needed {};
+	std::atomic<uint64_t>                image_outside {0};
+	std::atomic<uint64_t>                fixups_needed_total {0};
 };
 
 Stats& GetStats() {
@@ -47,6 +60,47 @@ Stats& GetStats() {
 }
 
 thread_local bool t_resolver2 = false;
+
+// Astro Bot PC (KYTY_CP_PAR=1b2): image state bookkeeping (cpParallel.h). An image's state is a
+// hash of its tracked state (Image::CpParStateHash); per context segment, the state each image
+// was first found in (entry requirement) and its last state; `merged`: the state each image was
+// left in by the segments merged so far (or by an access outside any segment).
+struct ImageBook {
+	struct Segment {
+		bool                                       open = false;
+		std::unordered_map<const void*, uint64_t>  entry;
+		std::unordered_map<const void*, uint64_t>  last;
+	};
+	std::mutex                                 mutex;
+	std::array<Segment, 2>                     segments;
+	std::unordered_map<const void*, uint64_t>  merged;
+};
+
+ImageBook& GetImageBook() {
+	static ImageBook book;
+	return book;
+}
+
+// The calling thread's open segment (-1: none). Set by BeginSegment / EndSegment on that thread.
+thread_local int t_segment = -1;
+
+// The merge point of one image of a segment of `context` (EndSegment, book locked): the
+// transition from the state the merged segments left (`global`) to the segment's entry
+// requirement. Stage 1b-iii records it there (into the merged stream, before the segment); in
+// 1b2 execution is in turn, so it must be a no-op: only counted (and the first ones logged).
+void FixUpImage(uint32_t context, const void* image, uint64_t global, uint64_t entry) {
+	auto& stats = GetStats();
+	stats.fixups_checked[context].fetch_add(1, std::memory_order_relaxed);
+	if (global == entry) {
+		return;
+	}
+	stats.fixups_needed[context].fetch_add(1, std::memory_order_relaxed);
+	if (stats.fixups_needed_total.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("Kyty CpPar: image %p of a context %c segment was found in state 0x%016" PRIx64
+		            ", the merged segments left it in 0x%016" PRIx64 " (fix-up not a no-op)\n",
+		            image, context != 0 ? 'B' : 'A', entry, global);
+	}
+}
 
 // The token: exactly one of Thread_Gpu and resolver #2 runs CP work at any time.
 class Resolver2 {
@@ -179,7 +233,12 @@ Mode GetMode() {
 			            "with its own snapshot ring and draw-prep window)\n");
 			return Mode::Serial1b1;
 		}
-		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1); off\n", value);
+		if (std::strcmp(value, "1b2") == 0) {
+			std::printf("Kyty CpPar: KYTY_CP_PAR=1b2 (as 1b1, and context B records into its own "
+			            "command buffer wrapper and stream ring, executed in turn)\n");
+			return Mode::Serial1b2;
+		}
+		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2); off\n", value);
 		return Mode::Off;
 	}();
 	return mode;
@@ -247,6 +306,71 @@ void NotePrep(uint32_t context, uint64_t committed, uint64_t fell_back, uint64_t
 	stats.window_retired[index].store(retired, std::memory_order_relaxed);
 }
 
+// Astro Bot PC (KYTY_CP_PAR=1b2): image state bookkeeping and segments (cpParallel.h).
+void NoteImageState(const void* image, uint64_t before, uint64_t after) {
+	auto&            book = GetImageBook();
+	const int        open = t_segment;
+	std::lock_guard  lock(book.mutex);
+	if (open < 0 || !book.segments[open].open) {
+		book.merged[image] = after;
+		GetStats().image_outside.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	auto& segment = book.segments[open];
+	segment.entry.try_emplace(image, before);
+	segment.last[image] = after;
+}
+
+void ForgetImage(const void* image) {
+	auto&           book = GetImageBook();
+	std::lock_guard lock(book.mutex);
+	book.merged.erase(image);
+	for (auto& segment: book.segments) {
+		segment.entry.erase(image);
+		segment.last.erase(image);
+	}
+}
+
+void BeginSegment(uint32_t context) {
+	const size_t    index = context != 0 ? 1 : 0;
+	auto&           book  = GetImageBook();
+	std::lock_guard lock(book.mutex);
+	EXIT_IF(book.segments[index].open);
+	book.segments[index].open = true;
+	t_segment                 = static_cast<int>(index);
+}
+
+void EndSegment(uint32_t context, uint64_t packets, uint64_t submits, bool new_command_buffer) {
+	const size_t index = context != 0 ? 1 : 0;
+	auto&        stats = GetStats();
+	stats.segments[index].fetch_add(1, std::memory_order_relaxed);
+	stats.segment_packets[index].fetch_add(packets, std::memory_order_relaxed);
+	stats.segment_submits[index].fetch_add(submits, std::memory_order_relaxed);
+	if (new_command_buffer) {
+		stats.segment_buffers[index].fetch_add(1, std::memory_order_relaxed);
+	}
+	auto&           book = GetImageBook();
+	std::lock_guard lock(book.mutex);
+	auto&           segment = book.segments[index];
+	if (!segment.open) {
+		return; // the first hand-off of Thread_Gpu: no segment was begun
+	}
+	// The merge point: each image's entry requirement against the merged state, then the
+	// segment's last states become the merged ones.
+	for (const auto& [image, entry]: segment.entry) {
+		if (const auto found = book.merged.find(image); found != book.merged.end()) {
+			FixUpImage(static_cast<uint32_t>(index), image, found->second, entry);
+		}
+	}
+	for (const auto& [image, last]: segment.last) {
+		book.merged[image] = last;
+	}
+	segment.entry.clear();
+	segment.last.clear();
+	segment.open = false;
+	t_segment    = -1;
+}
+
 void MaybeReport() {
 	static uint64_t last_ns = 0; // Thread_Gpu only
 	const auto      now     = NowNs();
@@ -296,6 +420,26 @@ void MaybeReport() {
 		            ", retired %" PRIu64 ", committed %" PRIu64 ", fell back %" PRIu64 "\n",
 		            values[0][0], values[0][1], values[0][2], values[0][3], values[1][0],
 		            values[1][1], values[1][2], values[1][3]);
+	}
+	if (StreamsActive()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b2): each context's recording target over the last 10 s.
+		uint64_t s[2][6] = {};
+		for (size_t c = 0; c < 2; c++) {
+			s[c][0] = take(stats.segments[c]);
+			s[c][1] = take(stats.segment_packets[c]);
+			s[c][2] = take(stats.segment_submits[c]);
+			s[c][3] = take(stats.segment_buffers[c]);
+			s[c][4] = take(stats.fixups_checked[c]);
+			s[c][5] = take(stats.fixups_needed[c]);
+		}
+		const auto outside = take(stats.image_outside);
+		std::printf("CpPar 10s: streams: B %" PRIu64 " segments, %" PRIu64 " packets, %" PRIu64
+		            " submits, %" PRIu64 " command buffers; A %" PRIu64 " segments, %" PRIu64
+		            " packets, %" PRIu64 " submits, %" PRIu64 " command buffers; image fix-ups "
+		            "checked A %" PRIu64 " B %" PRIu64 ", not no-ops A %" PRIu64 " B %" PRIu64
+		            " (expected 0); image accesses outside segments %" PRIu64 "\n",
+		            s[1][0], s[1][1], s[1][2], s[1][3], s[0][0], s[0][1], s[0][2], s[0][3], s[0][4],
+		            s[1][4], s[0][5], s[1][5], outside);
 	}
 	std::fflush(stdout);
 }

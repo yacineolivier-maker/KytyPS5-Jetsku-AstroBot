@@ -102,6 +102,9 @@ enum class Op : uint16_t {
 	// A host memcpy of guest bytes into mapped memory (KYTY_STREAM_COPY_DEFER, BufferCache): not a
 	// command; replayed in stream order, so before the Submit of the commands that read it.
 	HostCopy,
+	// Astro Bot PC (KYTY_CP_PAR=1b2): not a command. The producer's segment ends here; the replay
+	// continues in the other ring of the recorder (CommandRecorder::EnableSecondStream).
+	Switch,
 	Count,
 };
 
@@ -555,6 +558,10 @@ public:
 	[[nodiscard]] uint64_t Consumed() const noexcept {
 		return m_consumed.load(std::memory_order_acquire);
 	}
+	// Astro Bot PC (KYTY_CP_PAR=1b2): the position published so far (any thread).
+	[[nodiscard]] uint64_t PublishedPosition() const noexcept {
+		return m_published.load(std::memory_order_acquire);
+	}
 
 	// ---- Consumer (one thread) ----
 
@@ -630,6 +637,7 @@ public:
 		switch (op) {
 			case Op::Submit:
 			case Op::DrainMarker:
+			case Op::Switch: // Astro Bot PC (KYTY_CP_PAR=1b2)
 			case Op::Draw:
 			case Op::DrawIndexed:
 			case Op::DrawMeshTasks:
@@ -663,6 +671,8 @@ public:
 	void Submit(const SubmitPacket& submit);
 	// Returns the ring position just past the marker.
 	uint64_t DrainMarker(uint64_t serial);
+	// Astro Bot PC (KYTY_CP_PAR=1b2): an Op::Switch packet (DrainMarkerPacket payload), published.
+	void SwitchStream(uint64_t serial);
 
 	void beginRendering(const vk::RenderingInfo& info);
 	void endRendering();

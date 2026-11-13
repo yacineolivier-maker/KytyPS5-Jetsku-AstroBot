@@ -1090,6 +1090,10 @@ public:
 	// KYTY_DRAW_RUN: RefreshShaders accepted the committed draw's preparation (the structure key the
 	// preparing thread computed describes the draw).
 	void NotePreparedValidated() noexcept { m_prepared_validated = true; }
+	// Astro Bot PC (KYTY_CP_PAR=1b2, cpParallel.h): a recording context's segment begins; the
+	// dynamic-state shadow of the native buffer may describe the other context's commands.
+	// (Draw-run continuations cannot cross contexts: their rendering serials never match.)
+	void CpParForgetCommandShadows() noexcept { m_dynamic_state.valid = false; }
 	// KYTY_DRAW_PREP_BINDINGS texturememo: the memo draw-prep threads read hints from (FindHint).
 	[[nodiscard]] const TextureBindingMemo& GetTextureMemo() const noexcept { return m_texture_memo; }
 

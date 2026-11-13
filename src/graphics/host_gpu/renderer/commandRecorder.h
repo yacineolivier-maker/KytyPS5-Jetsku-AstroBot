@@ -57,6 +57,24 @@ public:
 	// ---- Producer (the CP thread) ----
 
 	[[nodiscard]] CommandStream::Encoder& Encoder() noexcept { return m_encoder; }
+
+	// Astro Bot PC (KYTY_CP_PAR=1b2, cpParallel.h): a second producer stream (its own ring and
+	// encoder) for the second recording context. The calling thread's stream (ThreadStream, 0 by
+	// default) picks the ring that Begin, Submit, Drain and WaitRecorded's wake use. Each stream's
+	// segments end with EndStreamSegment (an Op::Switch packet); the replay follows them from ring
+	// to ring, starting in stream 0. Thread mode without verify only; call before any packet of
+	// stream 1 (returns false, nothing changed, otherwise).
+	bool EnableSecondStream();
+	[[nodiscard]] bool DualStreams() const noexcept { return m_encoder_b != nullptr; }
+	[[nodiscard]] CommandStream::Encoder& EncoderB() noexcept { return *m_encoder_b; }
+	static void                   SetThreadStream(uint32_t stream) noexcept;
+	[[nodiscard]] static uint32_t ThreadStream() noexcept;
+	// The calling thread's stream: ends its segment (the replay continues in the other ring).
+	void EndStreamSegment();
+	// Packets encoded so far by stream stream (its producer thread).
+	[[nodiscard]] uint64_t StreamPackets(uint32_t stream) const noexcept {
+		return stream != 0 && m_encoder_b != nullptr ? m_encoder_b->Packets() : m_encoder.Packets();
+	}
 	// Begin of a guest command buffer: the native buffer the CP picked from its pool.
 	void Begin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns);
 	// Hands the current command buffer to the recorder for vkEndCommandBuffer and submission.
@@ -142,6 +160,21 @@ private:
 	CommandStream::WaitPolicy       m_drain_policy;
 	CommandStream::WaitPolicy       m_idle_policy;
 	std::unique_ptr<NativeExecutor> m_exec;
+	// Astro Bot PC (KYTY_CP_PAR=1b2): stream 1 (null unless EnableSecondStream), the ring the
+	// replay reads now (consumer-local), the Switch packets it followed and the serial of the last
+	// Switch encoded (producers, in turn).
+	std::unique_ptr<CommandStream::Ring>    m_ring_b;
+	std::unique_ptr<CommandStream::Encoder> m_encoder_b;
+	CommandStream::Ring*                    m_consume_ring  = nullptr;
+	uint64_t                                m_switch_serial = 0;
+	[[nodiscard]] CommandStream::Ring& ProducerRing() noexcept {
+		return m_ring_b != nullptr && ThreadStream() != 0 ? *m_ring_b : m_ring;
+	}
+	[[nodiscard]] CommandStream::Encoder& ProducerEncoder() noexcept {
+		return m_encoder_b != nullptr && ThreadStream() != 0 ? *m_encoder_b : m_encoder;
+	}
+	// Every packet of both streams executed (both rings consumed up to what was published).
+	[[nodiscard]] bool StreamsIdle() const noexcept;
 
 	// Verify-hook registry slot (MaxRecorders when not registered).
 	size_t m_registry_slot = SIZE_MAX;

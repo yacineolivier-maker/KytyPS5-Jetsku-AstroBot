@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/slotVector.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -563,9 +564,16 @@ public:
 	// access pair of the old and new scopes can conflict (see KYTY_DEPTH_FEEDBACK_KEEP).
 	void AdoptState(vk::PipelineStageFlags2 stage, vk::AccessFlags2 access,
 	                vk::ImageLayout layout) noexcept {
+		const uint64_t before = CpPar::StreamsActive() ? CpParStateHash() : 0; // Astro Bot PC
 		backing.state = {stage, access, layout};
 		NoteImageStateChange();
+		if (CpPar::StreamsActive()) {
+			CpPar::NoteImageState(this, before, CpParStateHash()); // Astro Bot PC (KYTY_CP_PAR=1b2)
+		}
 	}
+	// Astro Bot PC (KYTY_CP_PAR=1b2, cpParallel.h): a hash of the tracked state (state and
+	// per-subresource states) that layout transitions read and change.
+	[[nodiscard]] uint64_t CpParStateHash() const noexcept;
 
 private:
 	friend struct ImageTestAccess;

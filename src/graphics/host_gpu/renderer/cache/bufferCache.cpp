@@ -4130,6 +4130,10 @@ bool BufferCache::TryDeferStreamCopy(uint8_t* mapped, uint64_t vaddr, uint64_t s
 	if (recorder == nullptr || recorder->GetMode() != CommandRecorder::Mode::Thread) {
 		return false;
 	}
+	if (recorder->DualStreams()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b2): the deferred copies are ordered by positions of one ring.
+		return false;
+	}
 	if (m_deferred_recorder != recorder) {
 		// A different recorder (never in practice): the pending copies of the old one drain first.
 		if (m_deferred_recorder != nullptr && !m_deferred.empty()) {

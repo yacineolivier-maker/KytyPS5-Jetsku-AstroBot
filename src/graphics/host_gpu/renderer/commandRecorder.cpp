@@ -623,6 +623,7 @@ CommandRecorder::CommandRecorder(GraphicContext& graphics, MasterSemaphore& mast
 	m_drain_policy.spin_ns = EnvUnsigned("KYTY_CP_RECORDER_DRAIN_SPIN_US", 2000, 10000000) * 1000u;
 	m_replay.verify        = VerifyEnabled();
 	m_exec                 = std::make_unique<NativeExecutor>(*this);
+	m_consume_ring         = &m_ring; // Astro Bot PC (KYTY_CP_PAR=1b2)
 	m_registry_slot        = VerifyEnabled() ? RegisterRecorder(this) : MaxRecorders;
 	if (mode == Mode::Thread) {
 		m_thread = std::jthread([this](std::stop_token stop) { Run(stop); });
@@ -646,13 +647,50 @@ void CommandRecorder::AfterCommit() {
 	t_replaying = previous;
 }
 
+// Astro Bot PC (KYTY_CP_PAR=1b2, commandRecorder.h): the calling thread's producer stream.
+namespace {
+thread_local uint32_t t_stream = 0;
+} // namespace
+
+void CommandRecorder::SetThreadStream(uint32_t stream) noexcept {
+	t_stream = stream;
+}
+
+uint32_t CommandRecorder::ThreadStream() noexcept {
+	return t_stream;
+}
+
+bool CommandRecorder::EnableSecondStream() {
+	if (m_mode != Mode::Thread || VerifyEnabled() || m_encoder_b != nullptr) {
+		return false;
+	}
+	// Created before the producer of stream 1 exists and before the replay can see a Switch
+	// packet (the first one is encoded by stream 0's first hand-off).
+	m_ring_b    = std::make_unique<CommandStream::Ring>(RingBytes());
+	m_encoder_b = std::make_unique<CommandStream::Encoder>(
+	    *m_ring_b, MakeOptions(m_mode, this, &AfterCommitThunk));
+	return true;
+}
+
+void CommandRecorder::EndStreamSegment() {
+	EXIT_IF(m_encoder_b == nullptr);
+	ProducerEncoder().SwitchStream(++m_switch_serial);
+}
+
+bool CommandRecorder::StreamsIdle() const noexcept {
+	// Each producer's last packet before the other stream's segment is a published (kicked)
+	// Switch: the idle producer's ring is compared up to its published position.
+	return m_ring.Consumed() == m_ring.PublishedPosition() &&
+	       (m_ring_b == nullptr || m_ring_b->Consumed() == m_ring_b->PublishedPosition());
+}
+
 void CommandRecorder::Begin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns) {
-	m_encoder.Begin(command, tick, record_ns);
+	ProducerEncoder().Begin(command, tick, record_ns); // Astro Bot PC (KYTY_CP_PAR=1b2)
 }
 
 void CommandRecorder::Submit(const CommandStream::SubmitPacket& submit) {
 	m_cp_processor.store(CurrentLogicalProcessor(), std::memory_order_relaxed);
-	m_encoder.Submit(submit);
+	ProducerEncoder().Submit(submit); // Astro Bot PC (KYTY_CP_PAR=1b2)
 	PublishCounters();
 }
 
@@ -666,13 +704,16 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	// packet and records nothing until the next one. The window opens without a marker and
 	// without waking a parked recorder (the consumer's seq_cst release of the position orders its
 	// native calls before ours). Inline mode is always idle here.
-	const bool idle = m_ring.Consumed() == m_ring.WritePosition();
+	// Astro Bot PC (KYTY_CP_PAR=1b2): the calling thread's ring; idle only when both rings are
+	// (the replay reaches this ring's marker after the other ring's earlier segments).
+	auto&      ring = ProducerRing();
+	const bool idle = ring.Consumed() == ring.WritePosition() && (m_ring_b == nullptr || StreamsIdle());
 	if (idle) {
 		m_idle_drains++;
 	} else {
-		const auto end = m_encoder.DrainMarker(++m_drain_serial);
+		const auto end = ProducerEncoder().DrainMarker(++m_drain_serial);
 		if (m_mode == Mode::Thread) {
-			m_ring.WaitConsumed(end, m_drain_policy, m_drain_stats);
+			ring.WaitConsumed(end, m_drain_policy, m_drain_stats);
 		}
 	}
 	const auto now = NowNs();
@@ -704,7 +745,7 @@ void CommandRecorder::WaitRecorded(uint64_t tick, bool from_producer) {
 	HangWatchdog::Scope wait("recorder-recorded-tick", reinterpret_cast<uint64_t>(this), tick,
 	                         HangWatchdog::Enabled() ? m_recorded_tick.load() : 0);
 	if (from_producer) {
-		m_ring.Kick(m_encoder.Stats());
+		ProducerRing().Kick(ProducerEncoder().Stats()); // Astro Bot PC (KYTY_CP_PAR=1b2)
 	}
 	const auto start = NowNs();
 	while (m_recorded_tick.load(std::memory_order_acquire) < tick) {
@@ -737,8 +778,15 @@ void CommandRecorder::Stop() {
 	m_test_stall.store(false, std::memory_order_release);
 	if (m_mode == Mode::Thread) {
 		m_ring.WaitConsumed(m_ring.WritePosition(), m_drain_policy, m_drain_stats);
+		if (m_ring_b != nullptr) {
+			// Astro Bot PC (KYTY_CP_PAR=1b2): stream 1's producer is stopped (resolver #2 joined).
+			m_ring_b->WaitConsumed(m_ring_b->PublishedPosition(), m_drain_policy, m_drain_stats);
+		}
 		m_stop.store(true, std::memory_order_seq_cst);
 		m_ring.WakeConsumer();
+		if (m_ring_b != nullptr) {
+			m_ring_b->WakeConsumer();
+		}
 		m_thread.request_stop();
 		if (m_thread.joinable()) {
 			m_thread.join();
@@ -777,7 +825,8 @@ void CommandRecorder::Run(std::stop_token stop) {
 #endif
 	t_replaying = true;
 	while (!stop.stop_requested() && !m_stop.load(std::memory_order_acquire)) {
-		if (!m_ring.WaitPublished(m_stop, m_idle_policy, m_consumer_stats)) {
+		// Astro Bot PC (KYTY_CP_PAR=1b2): the ring the replay reads now (always m_ring otherwise).
+		if (!m_consume_ring->WaitPublished(m_stop, m_idle_policy, m_consumer_stats)) {
 			continue;
 		}
 		while (m_test_stall.load(std::memory_order_acquire) &&
@@ -802,18 +851,28 @@ void CommandRecorder::ConsumeAvailable() {
 	}
 	constexpr uint64_t ReleaseEvery = 64u << 10u;
 	uint64_t           since        = 0;
-	while (const auto* header = m_ring.Peek()) {
+	// Astro Bot PC (KYTY_CP_PAR=1b2): m_consume_ring is m_ring unless a second stream exists; a
+	// Switch packet releases this ring and continues in the other one.
+	while (const auto* header = m_consume_ring->Peek()) {
+		auto& ring = *m_consume_ring;
+		if (header->op == Op::Switch && m_ring_b != nullptr) {
+			ring.Advance(header->size);
+			ring.Release(m_consumer_stats);
+			m_consume_ring = &ring == &m_ring ? m_ring_b.get() : &m_ring;
+			since          = 0;
+			continue;
+		}
 		if (header->op != Op::Wrap) {
 			CommandStream::Replay(*header, *m_exec, m_replay, &OnMismatch, this);
 		}
-		m_ring.Advance(header->size);
+		ring.Advance(header->size);
 		since += header->size;
 		if (since >= ReleaseEvery) {
-			m_ring.Release(m_consumer_stats);
+			ring.Release(m_consumer_stats);
 			since = 0;
 		}
 	}
-	m_ring.Release(m_consumer_stats);
+	m_consume_ring->Release(m_consumer_stats);
 	if (m_mode == Mode::Thread && (++m_placement_batches & 255u) == 0) {
 		SamplePlacement();
 	}

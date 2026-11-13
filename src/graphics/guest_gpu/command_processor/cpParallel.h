@@ -1,8 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_CPPARALLEL_H_
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_CPPARALLEL_H_
 
-// Astro Bot PC (KYTY_CP_PAR), 13/11/2026: parallel translation of the command lists, stage 1a
-// (docs\PLAN-PARALLELE.md). Plumbing only, no concurrency.
+// Astro Bot PC (KYTY_CP_PAR), 13/11/2026: parallel translation of the command lists, stages 1a,
+// 1b-i, 1b-ii (docs\PLAN-PARALLELE.md). Plumbing only, no concurrency.
 //
 // KYTY_CP_PAR unset or "0": off, the emulator behaves exactly as before (nothing here runs).
 // KYTY_CP_PAR=1a (requires KYTY_CP_SEQ=1): the queue-0 graphics submissions of a frame are
@@ -43,6 +43,27 @@
 // predicates follow one window (workerGate.h RunPreparationWorker), and making them serve two
 // would touch the default path.
 //
+// KYTY_CP_PAR=1b2 (stage 1b-ii; 1b1 plus, still executed in turn): context B records into its own
+// target. Design "S" (stream level): the guest CommandScheduler has a second CommandBuffer
+// wrapper (barrier batcher, pipeline/descriptor/push-constant shadows, rendering instance, its own
+// DynamicState) and the CP recorder a second CommandStream ring and encoder. The thread decides
+// the target (CommandRecorder::ThreadStream: resolver #2 -> B, every other thread -> A). Both
+// wrappers name the same native command buffer; one recorder thread replays both rings into it.
+// The order between the rings is carried by Switch packets: every hand-off of the token ends
+// the giver's segment (rendering instance ended, barrier batch flushed, direct window closed,
+// then a Switch packet: "continue in the other ring"), and the taker's segment begins with no
+// CommandBuffer-level shadow state (as at a command buffer's begin). Ticks: unchanged, one tick
+// per native command buffer (per Submit, whichever context submits); a Submit (a flush) of B is
+// encoded in ring B, in its place in the global order, and both wrappers then follow the next
+// native buffer. Needs KYTY_CP_RECORDER=1 (thread) without KYTY_CP_RECORDER_VERIFY; otherwise
+// 1b2 runs as 1b1. KYTY_STREAM_COPY_DEFER is suspended in 1b2 (its ring positions are of one
+// ring).
+// Image layouts (CpPar::NoteImageState): per context segment, the first state each image was
+// found in (its "entry requirement") and its last state; at the segment's end (the merge point,
+// FixUpImage) the entry is compared with the state the image was left in by the segments merged
+// before (or by an access outside any segment). In-turn execution keeps the global state exact,
+// so every such fix-up must be a no-op: "CpPar 10s" counts the ones that would not be.
+//
 // Fallbacks (the submission stays in context A, on Thread_Gpu) are counted by reason; a
 // "CpPar 10s: ..." console line reports them every 10 s with the submissions and resolving time
 // of each thread.
@@ -51,17 +72,40 @@
 
 namespace Libs::Graphics::CpPar {
 
-enum class Mode : uint8_t { Off, Serial1a, Serial1b1 };
+enum class Mode : uint8_t { Off, Serial1a, Serial1b1, Serial1b2 };
 
 // KYTY_CP_PAR, read once.
 [[nodiscard]] Mode GetMode();
 [[nodiscard]] inline bool Enabled() {
 	return GetMode() != Mode::Off;
 }
-// KYTY_CP_PAR=1b1: context B has its own snapshot ring and draw-prep engine (see above).
+// KYTY_CP_PAR=1b1 (and 1b2): context B has its own snapshot ring and draw-prep engine (see above).
 [[nodiscard]] inline bool SeparateWindows() {
-	return GetMode() == Mode::Serial1b1;
+	return GetMode() == Mode::Serial1b1 || GetMode() == Mode::Serial1b2;
 }
+// KYTY_CP_PAR=1b2 requested: context B records into its own target (see above). Whether it is
+// active (recorder requirements met) is StreamsActive().
+[[nodiscard]] inline bool SeparateStreams() {
+	return GetMode() == Mode::Serial1b2;
+}
+
+// Astro Bot PC (KYTY_CP_PAR=1b2): set once at start-up, before resolver #2 runs, when the two
+// recording targets are active; read by Image (state bookkeeping) without a call.
+inline bool g_streams_active = false;
+[[nodiscard]] inline bool StreamsActive() noexcept {
+	return g_streams_active;
+}
+// Image state bookkeeping (see above), any thread: `image` changed (or was found unchanged by
+// an access) from the state hashed as `before` to `after`. Attributed to the calling thread's
+// open segment (resolver #2: B; Thread_Gpu: A), else applied as an access outside segments.
+void NoteImageState(const void* image, uint64_t before, uint64_t after);
+// The image is being destroyed: forget it.
+void ForgetImage(const void* image);
+// Token hand-off (the hooks, 1b2 only): the calling thread's context begins / ends a segment.
+// EndSegment also takes the recording counts of the segment (packets encoded in its ring, Submit
+// packets among them, whether it shared a native command buffer not seen before).
+void BeginSegment(uint32_t context);
+void EndSegment(uint32_t context, uint64_t packets, uint64_t submits, bool new_command_buffer);
 
 enum class Fallback : uint32_t {
 	NoSequencer, // KYTY_CP_SEQ is not 1 (or the sequencer is off): no op ring to split
