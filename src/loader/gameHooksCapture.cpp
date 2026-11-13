@@ -37,6 +37,10 @@
 // "native" at its flush exit; the direct draw packet libAgc then writes for it is replaced by a
 // NOP marker of the same size (gameCapture.h), which the command processor counts and drops
 // (pm4Handlers.cpp CpOpNativeDraw). KYTY_NATIVE unset: nothing of this runs.
+// Stage N1 (KYTY_NATIVE_MODE=splice): before the rewrite, the original packet is published in the
+// slot's native ring under the marker serial (NativeRing, gameCapture.h); the CP looks it up and
+// runs the packet's own handler at the marker (image unchanged). Ring full: the normal packet
+// stays (fallback "ring-full"). KYTY_NATIVE_VERIFY=1: a record miss on the CP exits.
 
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -61,6 +65,7 @@
 namespace Loader::GameCapture {
 std::atomic<bool>     g_active {false};
 std::atomic<uint64_t> g_flips {0};
+std::atomic<uint8_t>  g_native_mode {0};
 } // namespace Loader::GameCapture
 
 namespace Loader::GameHooks::Capture {
@@ -105,6 +110,8 @@ struct NativeConfig {
 	uint32_t    mask      = 0;     // bit = engine thread slot
 	std::string unknown;           // tokens that name no engine thread
 	std::string mode;
+	bool        splice = false;    // KYTY_NATIVE_MODE=splice (stage N1), else drop (N0)
+	bool        verify = false;    // KYTY_NATIVE_VERIFY=1: a splice record miss exits
 };
 
 NativeConfig ParseNative() {
@@ -152,7 +159,10 @@ NativeConfig ParseNative() {
 	if (config.mode.empty()) {
 		config.mode = "drop";
 	}
-	config.valid = config.mode == "drop" && config.mask != 0;
+	config.splice = config.mode == "splice";
+	config.valid  = (config.mode == "drop" || config.splice) && config.mask != 0;
+	const char* verify = std::getenv("KYTY_NATIVE_VERIFY");
+	config.verify      = verify != nullptr && std::strcmp(verify, "0") != 0 && verify[0] != 0;
 	return config;
 }
 
@@ -440,10 +450,45 @@ enum NCtr : uint32_t {
 	kNFbTess,     // fallback: tessellation (hull-shader geometry slot)
 	kNFbPacket,   // fallback: the next libAgc draw packet was not a direct draw of known size
 	kNFbLost,     // fallback: window closed without any libAgc draw packet
+	kNFbRing,     // fallback (splice): the slot's native ring was full, normal packet kept
 	kNCount
 };
 constexpr uint32_t kNFb0 = kNFbIndirect;
-constexpr const char* kNFbNames[] = {"indirect", "tess", "packet", "lost"};
+constexpr const char* kNFbNames[] = {"indirect", "tess", "packet", "lost", "ring-full"};
+constexpr uint32_t    kNFbKinds   = 5;
+
+// KYTY_NATIVE_MODE=splice: per engine-thread slot ring of original draw packets, indexed by the
+// marker serial. One producer (the game thread that owns the slot), readers on the command
+// processor fronts. An entry is a seqlock: `serial` 0 while it is rewritten, then the serial
+// (release). The producer reuses an entry only once the CP consumed a later serial (`consumed`,
+// a running maximum written back by the real parse), so a record stays valid while frames in
+// flight still hold its marker.
+constexpr uint32_t kNativeRingSize = 16384; // power of two; ~3 frames of Extra Geometry draws
+struct NativeEntry {
+	std::atomic<uint32_t>                                  serial {0};
+	std::atomic<uint32_t>                                  size_dw {0};
+	std::array<std::atomic<uint32_t>, GameCapture::kNativeMaxPacketDw> words {};
+};
+struct NativeRing {
+	alignas(64) std::atomic<uint32_t> consumed {0};
+	alignas(64) std::atomic<uint32_t> owner {0}; // thread id + 1 of the producer (claimed once)
+	std::array<NativeEntry, kNativeRingSize> entries {};
+};
+std::array<NativeRing*, kEngineThreads> g_native_rings {}; // allocated at install (splice)
+
+// CP-side splice counters, per slot (+1: malformed marker).
+enum NMiss : uint32_t {
+	kMissMalformed, // magic / version / slot
+	kMissNoRing,    // slot without a ring (mode is not splice)
+	kMissSerial,    // entry overwritten, being rewritten, or never written
+	kMissPacket,    // size / opcode of the record not those of the marker
+	kMissCount
+};
+constexpr const char* kMissNames[kMissCount] = {"malformed", "no-ring", "serial", "packet"};
+std::array<std::atomic<uint64_t>, kEngineThreads + 1>                           g_native_spliced {};
+std::array<uint64_t, kEngineThreads + 1>                                        g_native_spliced_last {};
+std::array<std::array<std::atomic<uint64_t>, kMissCount>, kEngineThreads + 1> g_native_miss {};
+std::array<std::array<uint64_t, kMissCount>, kEngineThreads + 1>              g_native_miss_last {};
 
 // Markers parsed by the command processor, per thread slot (+1: malformed).
 std::array<std::atomic<uint64_t>, kEngineThreads + 1> g_native_seen {};
@@ -555,6 +600,15 @@ ThreadState* T() {
 		const int slot = EngineThreadSlot(state->name);
 		if (slot >= 0 && ((native.mask >> static_cast<uint32_t>(slot)) & 1u) != 0) {
 			state->native_slot = slot;
+			// Splice: one producer per ring; a second thread of the same name stays non-native.
+			if (auto* ring = g_native_rings[slot]; ring != nullptr) {
+				uint32_t expected = 0;
+				if (!ring->owner.compare_exchange_strong(expected, state->thread_id + 1u)) {
+					state->native_slot = -1;
+					Log::WriteToConsoleAndLog(fmt::format("GameNative: thread \"{}\" ({}) not native: slot owned by thread {}\n",
+					                                      state->name, state->thread_id, expected - 1u));
+				}
+			}
 		}
 	}
 	{
@@ -1345,21 +1399,55 @@ void Report(int64_t now) {
 			seen[s]               = v - g_native_seen_last[s];
 			g_native_seen_last[s] = v;
 		}
+		std::array<uint64_t, kEngineThreads + 1>                          spliced {};
+		std::array<std::array<uint64_t, kMissCount>, kEngineThreads + 1> miss {};
+		for (uint32_t s = 0; s <= kEngineThreads; s++) {
+			const auto v             = g_native_spliced[s].load(std::memory_order_relaxed);
+			spliced[s]               = v - g_native_spliced_last[s];
+			g_native_spliced_last[s] = v;
+			for (uint32_t k = 0; k < kMissCount; k++) {
+				const auto m             = g_native_miss[s][k].load(std::memory_order_relaxed);
+				miss[s][k]               = m - g_native_miss_last[s][k];
+				g_native_miss_last[s][k] = m;
+			}
+		}
 		const auto per_frame = [&](uint64_t v) { return flips == 0 ? 0.0 : static_cast<double>(v) / static_cast<double>(flips); };
 		native = fmt::format("Native 10s ({:.1f} s, mode {}): flips {}", seconds, Native().mode, flips);
 		std::array<uint64_t, kNCount> total {};
-		uint64_t                      total_seen = 0;
+		uint64_t                      total_seen    = 0;
+		uint64_t                      total_spliced = 0;
+		uint64_t                      total_miss    = 0;
 		for (uint32_t s = 0; s < kEngineThreads; s++) {
 			if (((Native().mask >> s) & 1u) == 0) {
 				continue;
 			}
 			const auto& p = per[s];
 			native += fmt::format(" | \"{}\" chosen {} written {} cp-seen {} fallback", kEngineThreadNames[s], p[kNChosen], p[kNWritten], seen[s]);
-			for (uint32_t k = 0; k < 4; k++) native += fmt::format(" {} {}", kNFbNames[k], p[kNFb0 + k]);
-			native += fmt::format(" incomplete {} | per frame chosen {:.1f} written {:.1f} cp-seen {:.1f}", p[kNIncomplete], per_frame(p[kNChosen]),
-			                      per_frame(p[kNWritten]), per_frame(seen[s]));
+			for (uint32_t k = 0; k < kNFbKinds; k++) native += fmt::format(" {} {}", kNFbNames[k], p[kNFb0 + k]);
+			native += fmt::format(" incomplete {}", p[kNIncomplete]);
+			if (Native().splice) {
+				uint64_t misses = 0;
+				for (uint32_t k = 0; k < kMissCount; k++) misses += miss[s][k];
+				native += fmt::format(" spliced {} record-miss {}", spliced[s], misses);
+				for (uint32_t k = 0; k < kMissCount; k++) {
+					if (miss[s][k] != 0) native += fmt::format(" ({} {})", kMissNames[k], miss[s][k]);
+				}
+				if (const auto* ring = g_native_rings[s]; ring != nullptr) {
+					native += fmt::format(" ring-consumed {}", ring->consumed.load(std::memory_order_relaxed));
+				}
+			}
+			native += fmt::format(" | per frame chosen {:.1f} written {:.1f} cp-seen {:.1f}", per_frame(p[kNChosen]), per_frame(p[kNWritten]),
+			                      per_frame(seen[s]));
+			if (Native().splice) native += fmt::format(" spliced {:.1f}", per_frame(spliced[s]));
+			total_spliced += spliced[s];
+			for (uint32_t k = 0; k < kMissCount; k++) total_miss += miss[s][k];
 			for (uint32_t i = 0; i < kNCount; i++) total[i] += p[i];
 			total_seen += seen[s];
+		}
+		uint64_t malformed_miss = 0;
+		for (uint32_t k = 0; k < kMissCount; k++) malformed_miss += miss[kEngineThreads][k];
+		if (Native().splice) {
+			native += fmt::format(" | total spliced {} record-miss {} ring-full {}", total_spliced, total_miss + malformed_miss, total[kNFbRing]);
 		}
 		native += fmt::format(" | total chosen {} written {} cp-seen {} (other slots {}, malformed {}) per frame written {:.1f}\n", total[kNChosen],
 		                      total[kNWritten], total_seen,
@@ -1406,6 +1494,13 @@ int Add(uint64_t elf, Kind kind, ObserverFn fn, ObserverFn entry, const std::vec
 } // namespace
 
 void RegisterHooks() {
+	if (const auto& native = Native(); native.valid && native.splice) {
+		for (uint32_t s = 0; s < kEngineThreads; s++) {
+			if (((native.mask >> s) & 1u) != 0 && g_native_rings[s] == nullptr) {
+				g_native_rings[s] = new NativeRing; // never freed (read by the CP until exit)
+			}
+		}
+	}
 	g_id_flush = Add(kFlushDraw, Kind::After, &OnDrawFlushExit, &OnDrawFlushEnter, kBytesFlushDraw, "capture_flush_draw");
 	Add(kFlushDispatch, Kind::After, &OnDispatchFlushExit, &OnDispatchFlushEnter, kBytesFlushDispatch, "capture_flush_dispatch");
 	Add(kDrawIndexed, Kind::Before, &OnDrawIndexed, nullptr, kBytesDrawIndexed, "capture_draw_indexed");
@@ -1436,10 +1531,15 @@ void OnInstalled() {
 			if (((native.mask >> s) & 1u) != 0) threads += fmt::format(" \"{}\"", kEngineThreadNames[s]);
 		}
 		Log::WriteToConsoleAndLog(fmt::format(
-		    "GameNative: KYTY_NATIVE {} | mode {}{} | threads:{}{}{}\n",
-		    !native.valid ? "ignored" : ok ? "active (stage N0)" : "inactive (capture hooks not installed)", native.mode,
-		    native.mode == "drop" ? "" : " (unsupported: only drop)", threads.empty() ? " none" : threads,
-		    native.unknown.empty() ? "" : " | unknown:", native.unknown));
+		    "GameNative: KYTY_NATIVE {} | mode {}{}{} | threads:{}{}{}\n",
+		    !native.valid ? "ignored" : !ok ? "inactive (capture hooks not installed)" : native.splice ? "active (stage N1)" : "active (stage N0)",
+		    native.mode, native.mode == "drop" || native.splice ? "" : " (unsupported: drop or splice)",
+		    native.splice ? fmt::format(" (ring {} entries{})", kNativeRingSize, native.verify ? ", verify" : "") : std::string {},
+		    threads.empty() ? " none" : threads, native.unknown.empty() ? "" : " | unknown:", native.unknown));
+		if (native.valid && ok) {
+			GameCapture::g_native_mode.store(static_cast<uint8_t>(native.splice ? GameCapture::NativeMode::Splice : GameCapture::NativeMode::Drop),
+			                                 std::memory_order_release);
+		}
 	}
 	GameCapture::g_active.store(ok, std::memory_order_release);
 }
@@ -1455,7 +1555,8 @@ using namespace Loader::GameHooks::Capture; // NOLINT(google-build-using-namespa
 namespace {
 
 // KYTY_NATIVE: the direct draw packet becomes an R_NATIVE_DRAW NOP of the same size.
-bool WriteNativeMarker(ThreadState* t, uint32_t* packet, uint32_t opcode, uint32_t size_dw) {
+enum class MarkerResult : uint8_t { NotDirect, Written, RingFull };
+MarkerResult WriteNativeMarker(ThreadState* t, uint32_t* packet, uint32_t opcode, uint32_t size_dw) {
 	namespace Pm4 = Libs::Graphics::Pm4;
 	const uint32_t expected = opcode == Pm4::IT_DRAW_INDEX_2          ? 6u
 	                          : opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ? 5u
@@ -1463,17 +1564,36 @@ bool WriteNativeMarker(ThreadState* t, uint32_t* packet, uint32_t opcode, uint32
 	                                                                   : 0u;
 	if (packet == nullptr || expected == 0 || size_dw != expected || KYTY_PM4_LEN(packet[0]) != size_dw ||
 	    ((packet[0] >> 8u) & 0xffu) != opcode) {
-		return false;
+		return MarkerResult::NotDirect;
 	}
-	const uint32_t serial = ++t->native_serial;
-	packet[1]             = (kNativeMagic << 16u) | (kNativeVersion << 8u) | static_cast<uint32_t>(t->native_slot);
+	const uint32_t serial = t->native_serial + 1u;
+	if (serial == 0) [[unlikely]] {
+		return MarkerResult::NotDirect; // 2^32 draws on one thread: serial 0 = entry being rewritten
+	}
+	if (auto* ring = g_native_rings[t->native_slot]; ring != nullptr) {
+		// Splice: publish the original packet before it becomes a marker.
+		if (serial - ring->consumed.load(std::memory_order_acquire) >= kNativeRingSize) {
+			Inc(t->n[kNFbRing]);
+			return MarkerResult::RingFull; // the normal packet stays
+		}
+		auto& e = ring->entries[serial & (kNativeRingSize - 1u)];
+		e.serial.store(0, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		e.size_dw.store(size_dw, std::memory_order_relaxed);
+		for (uint32_t i = 0; i < size_dw; i++) {
+			e.words[i].store(packet[i], std::memory_order_relaxed);
+		}
+		e.serial.store(serial, std::memory_order_release);
+	}
+	t->native_serial = serial;
+	packet[1]        = (kNativeMagic << 16u) | (kNativeVersion << 8u) | static_cast<uint32_t>(t->native_slot);
 	packet[2]             = serial;
 	for (uint32_t i = 3; i < size_dw; i++) {
 		packet[i] = 0;
 	}
 	packet[0] = KYTY_PM4(size_dw, Pm4::IT_NOP, Pm4::R_NATIVE_DRAW);
 	Inc(t->n[kNWritten]);
-	return true;
+	return MarkerResult::Written;
 }
 
 } // namespace
@@ -1485,11 +1605,14 @@ void NoteDrawPacketSlow(uint32_t* packet, uint32_t opcode, uint32_t size_dw) {
 		Inc(t->c[kCHleHooked]);
 		if (t->native_window) [[unlikely]] {
 			t->native_window = false;
-			if (WriteNativeMarker(t, packet, opcode, size_dw)) {
-				t->sample_pending = false; // the CP will not see this draw
+			const auto result = WriteNativeMarker(t, packet, opcode, size_dw);
+			if (result == MarkerResult::Written) {
+				t->sample_pending = false; // the CP will not see this draw packet
 				return;
 			}
-			Inc(t->n[kNFbPacket]);
+			if (result == MarkerResult::NotDirect) {
+				Inc(t->n[kNFbPacket]);
+			} // RingFull (splice): the normal packet stays, counted as ring-full
 		}
 		if (t->sample_pending) {
 			t->sample_pending = false;
@@ -1577,13 +1700,101 @@ void CheckCpDrawSlow(const CpDrawView& view) {
 	}
 }
 
-void NoteNativeMarker(const uint32_t* body, uint32_t body_dw) {
-	uint32_t slot = kEngineThreads; // malformed
-	if (body != nullptr && body_dw >= 2 && (body[0] >> 16u) == kNativeMagic &&
-	    ((body[0] >> 8u) & 0xffu) == kNativeVersion && (body[0] & 0xffu) < kEngineThreads) {
-		slot = body[0] & 0xffu;
+namespace {
+
+uint32_t MarkerSlot(const uint32_t* body) {
+	if (body != nullptr && (body[0] >> 16u) == kNativeMagic && ((body[0] >> 8u) & 0xffu) == kNativeVersion &&
+	    (body[0] & 0xffu) < kEngineThreads) {
+		return body[0] & 0xffu;
 	}
+	return kEngineThreads; // malformed
+}
+
+[[noreturn]] void NativeVerifyExit(const char* what, const uint32_t* body, uint32_t marker_size_dw, const NativeDrawPacket* packet) {
+	const auto msg = fmt::format("GameNative: KYTY_NATIVE_VERIFY: splice record miss ({}): marker word1 0x{:08x} serial {} size {} | record size {} "
+	                             "header 0x{:08x}\n",
+	                             what, body != nullptr ? body[0] : 0u, body != nullptr ? body[1] : 0u, marker_size_dw,
+	                             packet != nullptr ? packet->size_dw : 0u, packet != nullptr ? packet->words[0] : 0u);
+	Log::WriteToConsoleAndLog(msg);
+	std::fflush(nullptr);
+	std::_Exit(3);
+}
+
+} // namespace
+
+void NoteNativeMarker(const uint32_t* body, uint32_t body_dw) {
+	const uint32_t slot = body_dw >= 2 ? MarkerSlot(body) : kEngineThreads;
 	g_native_seen[slot].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool LookupNativeDraw(const uint32_t* body, uint32_t marker_size_dw, bool consume, NativeDrawPacket& out) {
+	namespace Pm4      = Libs::Graphics::Pm4;
+	const uint32_t slot = marker_size_dw >= 3 ? MarkerSlot(body) : kEngineThreads;
+	const auto     miss = [&](NMiss reason, const NativeDrawPacket* packet) {
+		if (consume) {
+			g_native_miss[slot][reason].fetch_add(1, std::memory_order_relaxed);
+			if (Native().verify) {
+				NativeVerifyExit(kMissNames[reason], body, marker_size_dw, packet);
+			}
+		}
+		return false;
+	};
+	if (slot >= kEngineThreads) {
+		return miss(kMissMalformed, nullptr);
+	}
+	auto* ring = g_native_rings[slot];
+	if (ring == nullptr) {
+		return miss(kMissNoRing, nullptr);
+	}
+	const uint32_t serial = body[1];
+	auto&          e      = ring->entries[serial & (kNativeRingSize - 1u)];
+	const uint32_t s1     = e.serial.load(std::memory_order_acquire);
+	out.size_dw           = e.size_dw.load(std::memory_order_relaxed);
+	const uint32_t n      = std::min<uint32_t>(out.size_dw, kNativeMaxPacketDw);
+	for (uint32_t i = 0; i < n; i++) {
+		out.words[i] = e.words[i].load(std::memory_order_relaxed);
+	}
+	std::atomic_thread_fence(std::memory_order_acquire);
+	const uint32_t s2 = e.serial.load(std::memory_order_relaxed);
+	if (serial == 0 || s1 != serial || s2 != serial) {
+		return miss(kMissSerial, nullptr);
+	}
+	const uint32_t opcode   = (out.words[0] >> 8u) & 0xffu;
+	const uint32_t expected = opcode == Pm4::IT_DRAW_INDEX_2          ? 6u
+	                          : opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ? 5u
+	                          : opcode == Pm4::IT_DRAW_INDEX_AUTO     ? 3u
+	                                                                   : 0u;
+	if (expected == 0 || out.size_dw != expected || out.size_dw != marker_size_dw || KYTY_PM4_LEN(out.words[0]) != out.size_dw) {
+		return miss(kMissPacket, &out);
+	}
+	if (consume) {
+		// Running maximum: lists of one thread may be parsed by two CP threads (KYTY_CP_PAR).
+		uint32_t current = ring->consumed.load(std::memory_order_relaxed);
+		while (static_cast<int32_t>(serial - current) > 0 &&
+		       !ring->consumed.compare_exchange_weak(current, serial, std::memory_order_release, std::memory_order_relaxed)) {
+		}
+	}
+	return true;
+}
+
+void NoteNativeSpliced(const uint32_t* body) {
+	g_native_spliced[MarkerSlot(body)].fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t NativeDumpFrame() {
+	static const uint64_t frame = [] {
+		const char* value = std::getenv("KYTY_NATIVE_DUMP");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0};
+	}();
+	return frame;
+}
+
+const char* NativeDumpDir() {
+	static const std::string dir = [] {
+		const char* value = std::getenv("KYTY_NATIVE_DUMP_DIR");
+		return std::string(value != nullptr && value[0] != 0 ? value : "E:\\JEUX\\ASTROBOT_PC\\Outils_Claude\\work\\native");
+	}();
+	return dir.c_str();
 }
 
 } // namespace Loader::GameCapture

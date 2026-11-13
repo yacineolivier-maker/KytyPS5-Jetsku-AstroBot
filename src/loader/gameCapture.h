@@ -52,6 +52,33 @@ constexpr uint32_t kNativeVersion = 1u;
 // `body` points after the header, `body_dw` >= 2.
 void NoteNativeMarker(const uint32_t* body, uint32_t body_dw);
 
+// KYTY_NATIVE_MODE=splice (stage N1): before writing a marker, the game thread publishes the
+// original draw packet (header included) in its slot's native ring (lock-free, one producer: the
+// game thread; readers: the command processor fronts), indexed by the marker's serial. Ring full
+// (the CP has not consumed far enough): no marker, the normal packet stays (counted). The CP's
+// CpOpNativeDraw looks the record up and runs the original packet's handler at the marker's
+// position, with the CP state of that position, so the image is the emulator's own.
+enum class NativeMode : uint8_t { Off, Drop, Splice };
+extern std::atomic<uint8_t> g_native_mode; // NativeMode, set once the hooks are installed
+[[nodiscard]] inline NativeMode GetNativeMode() {
+	return static_cast<NativeMode>(g_native_mode.load(std::memory_order_relaxed));
+}
+
+constexpr uint32_t kNativeMaxPacketDw = 6; // DRAW_INDEX_2
+
+struct NativeDrawPacket {
+	uint32_t words[kNativeMaxPacketDw] {}; // the original packet, header first
+	uint32_t size_dw = 0;
+};
+
+// Splice lookup for a marker (`marker_size_dw`: the marker's size, header included). `consume`:
+// the parse is the real one (not a reference / speculative front): the record is released to the
+// producer. False on a miss (counted by reason); KYTY_NATIVE_VERIFY=1 exits on a miss.
+[[nodiscard]] bool LookupNativeDraw(const uint32_t* body, uint32_t marker_size_dw, bool consume,
+                                    NativeDrawPacket& out);
+// Splice: the record's packet was handed to its draw handler (real parse only).
+void NoteNativeSpliced(const uint32_t* body);
+
 // Guest flips (graphics/presentation/videoOut.cpp), for the per-frame averages.
 extern std::atomic<uint64_t> g_flips;
 inline void NoteFlip() {
@@ -76,6 +103,12 @@ struct CpDrawView {
 	uint64_t gs_addr      = 0; // SPI_SHADER_PGM_LO/HI_GS
 	uint64_t hs_addr      = 0; // SPI_SHADER_PGM_LO/HI_HS
 };
+
+// KYTY_NATIVE_DUMP=<n> (graphics/presentation/window/swapchain.cpp): the presented frame number
+// to write as a PNG (0 = off), and the directory (KYTY_NATIVE_DUMP_DIR, default
+// E:\JEUX\ASTROBOT_PC\Outils_Claude\work\native).
+[[nodiscard]] uint64_t    NativeDumpFrame();
+[[nodiscard]] const char* NativeDumpDir();
 
 void CheckCpDrawSlow(const CpDrawView& view);
 inline void CheckCpDraw(const CpDrawView& view) {

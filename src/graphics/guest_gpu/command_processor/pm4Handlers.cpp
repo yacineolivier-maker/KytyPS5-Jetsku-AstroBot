@@ -2316,16 +2316,44 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 	return dw_num + 1;
 }
 
-// Astro Bot PC (KYTY_NATIVE, loader/gameCapture.h): a draw taken by the native backend. Stage
-// N0 (KYTY_NATIVE_MODE=drop): nothing is drawn, the marker is only counted. No op is emitted in
-// any front mode; the draw-prep window classes it as window-safe (packetClass.h).
+// Astro Bot PC (KYTY_NATIVE, loader/gameCapture.h): a draw taken by the native backend.
+// - Stage N0 (KYTY_NATIVE_MODE=drop): nothing is drawn, the marker is only counted. No op is
+//   emitted in any front mode; the draw-prep window classes it as window-safe (packetClass.h).
+// - Stage N1 (KYTY_NATIVE_MODE=splice): the original draw packet, kept by the game thread in its
+//   native ring, is handed to its own handler here, at the marker's position: the CP state is
+//   that of this position (every state packet is still in the stream), and the handler does what
+//   it does for any draw in every front mode (direct submit, sequencer publish to the draw-prep
+//   window and op emission, speculative prefetch slot, reference capture). Only the real parse
+//   consumes the record. A record miss is counted and the draw skipped (KYTY_NATIVE_VERIFY=1:
+//   exit).
 KYTY_CP_OP_PARSER(CpOpNativeDraw) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	const auto body_dw = KYTY_PM4_LEN(cmd_id) - 1u;
 	EXIT_NOT_IMPLEMENTED(body_dw < 2u || body_dw >= dw);
-	if (!cp.IsReferenceFront()) {
+	const bool real = !cp.IsReferenceFront();
+	if (real) {
 		Loader::GameCapture::NoteNativeMarker(buffer, body_dw);
+	}
+	if (Loader::GameCapture::GetNativeMode() != Loader::GameCapture::NativeMode::Splice) {
+		return body_dw;
+	}
+	Loader::GameCapture::NativeDrawPacket packet;
+	if (!Loader::GameCapture::LookupNativeDraw(buffer, body_dw + 1u, real, packet)) {
+		return body_dw;
+	}
+	const uint32_t header = packet.words[0];
+	const uint32_t* body  = packet.words + 1;
+	uint32_t        taken = 0;
+	switch ((header >> 8u) & 0xffu) {
+		case Pm4::IT_DRAW_INDEX_2: taken = CpOpDrawIndex(cp, header, body, dw, num_dw); break;
+		case Pm4::IT_DRAW_INDEX_OFFSET_2: taken = CpOpDrawIndexOffset(cp, header, body, dw, num_dw); break;
+		case Pm4::IT_DRAW_INDEX_AUTO: taken = CpOpDrawIndexAuto(cp, header, body, dw, num_dw); break;
+		default: EXIT("R_NATIVE_DRAW: record opcode 0x%02" PRIx32 "\n", (header >> 8u) & 0xffu);
+	}
+	EXIT_NOT_IMPLEMENTED(taken != body_dw);
+	if (real) {
+		Loader::GameCapture::NoteNativeSpliced(buffer);
 	}
 	return body_dw;
 }

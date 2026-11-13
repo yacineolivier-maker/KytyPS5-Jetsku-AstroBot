@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_PACKETCLASS_H_
 
 #include "graphics/guest_gpu/pm4.h"
+#include "loader/gameCapture.h"
 
 #include <cstdint>
 
@@ -66,7 +67,11 @@ enum class PacketClass : uint8_t {
 				return PacketClass::WindowSafe;
 			}
 			// R_NATIVE_DRAW (KYTY_NATIVE): a draw taken by the native backend, nothing for the
-			// emulator's renderer to order.
+			// emulator's renderer to order (drop); a direct draw when the CP splices it back.
+			if (r == Pm4::R_NATIVE_DRAW &&
+			    Loader::GameCapture::GetNativeMode() == Loader::GameCapture::NativeMode::Splice) {
+				return PacketClass::Draw;
+			}
 			return r == Pm4::R_CONTEXT_STATE || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
 			               r == Pm4::R_NATIVE_DRAW
 			           ? PacketClass::WindowSafe

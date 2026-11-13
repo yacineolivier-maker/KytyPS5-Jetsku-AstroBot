@@ -19,18 +19,29 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "loader/gameCapture.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <optional>
+#include <string>
 #include <limits>
 #include <memory>
 #include <span>
 #include <vector>
 #include <vulkan/vk_platform.h>
+
+// KYTY_NATIVE_DUMP (Astro Bot PC): PNG of one presented frame (Presenter::Impl::DumpFrame).
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#define STBIWDEF static inline
+#define STBI_WRITE_NO_STDIO
+#include "stb_image_write.h"
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -375,6 +386,9 @@ struct Presenter::Impl {
 		return image;
 	}
 	void Present();
+	// KYTY_NATIVE_DUMP=<n>: the n-th presented main-bus game frame (blank frames not counted),
+	// read back from the presenter's copy of the guest image and written as frame-<n>.png.
+	void DumpFrame(Frame& frame, uint64_t number);
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -384,6 +398,7 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	uint64_t              dumped_frames = 0; // KYTY_NATIVE_DUMP count (under present_mutex)
 };
 
 vk::SurfaceFormatKHR Swapchain::SelectFormat() {
@@ -1388,6 +1403,16 @@ void Presenter::Present(std::span<const Layer> layers) {
 		}
 		previous = layer;
 	}
+	if (const auto dump = Loader::GameCapture::NativeDumpFrame(); dump != 0) [[unlikely]] {
+		for (const auto& layer: layers) {
+			if (layer.bus == 0 && layer.frame != nullptr && !layer.frame->blank) {
+				if (++m_impl->dumped_frames == dump) {
+					m_impl->DumpFrame(*layer.frame, dump);
+				}
+				break;
+			}
+		}
+	}
 	m_impl->Present();
 }
 
@@ -1465,6 +1490,207 @@ void Presenter::Impl::Present() {
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
+}
+
+namespace {
+
+float HalfToFloat(uint16_t h) {
+	const uint32_t sign = (h >> 15u) & 1u;
+	const uint32_t exp  = (h >> 10u) & 0x1fu;
+	const uint32_t mant = h & 0x3ffu;
+	float          v    = 0.0f;
+	if (exp == 0) {
+		v = static_cast<float>(mant) * (1.0f / 16777216.0f); // 2^-24
+	} else if (exp == 31) {
+		v = mant == 0 ? 65504.0f : 0.0f;
+	} else {
+		v = (1.0f + static_cast<float>(mant) * (1.0f / 1024.0f)) *
+		    static_cast<float>(1u << exp) * (1.0f / 32768.0f); // 2^(exp-15)
+	}
+	return sign != 0 ? -v : v;
+}
+
+uint8_t UnitToByte(float v) {
+	v = std::clamp(v, 0.0f, 1.0f);
+	return static_cast<uint8_t>(v * 255.0f + 0.5f);
+}
+
+void PngWrite(void* context, void* data, int size) {
+	auto* out = static_cast<std::vector<uint8_t>*>(context);
+	out->insert(out->end(), static_cast<uint8_t*>(data), static_cast<uint8_t*>(data) + size);
+}
+
+} // namespace
+
+void Presenter::Impl::DumpFrame(Frame& frame, uint64_t number) {
+	auto&          graphics = window.graphic_ctx;
+	const uint32_t width    = frame.image.extent.width;
+	const uint32_t height   = frame.image.extent.height;
+	const auto     format   = frame.image.format;
+	uint32_t       bpp      = 0;
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32: bpp = 4; break;
+		case vk::Format::eR16G16B16A16Sfloat: bpp = 8; break;
+		default: break;
+	}
+	const auto report = [&](const std::string& text) {
+		LOGF("%s", text.c_str());
+		std::printf("%s", text.c_str());
+		std::fflush(stdout);
+	};
+	if (bpp == 0 || width == 0 || height == 0 || frame.image.image == nullptr) {
+		report("KYTY_NATIVE_DUMP: frame " + std::to_string(number) + ": unsupported format " +
+		       vk::to_string(format) + "\n");
+		return;
+	}
+	const vk::DeviceSize size = vk::DeviceSize {width} * height * bpp;
+
+	vk::BufferCreateInfo info {};
+	info.size        = size;
+	info.usage       = vk::BufferUsageFlagBits::eTransferDst;
+	info.sharingMode = vk::SharingMode::eExclusive;
+	vk::Buffer buffer = nullptr;
+	if (graphics.device.createBuffer(&info, nullptr, &buffer) != vk::Result::eSuccess) {
+		report("KYTY_NATIVE_DUMP: buffer not created\n");
+		return;
+	}
+	vk::MemoryRequirements requirements {};
+	graphics.device.getBufferMemoryRequirements(buffer, &requirements);
+	const auto& memory_properties = graphics.GetPhysicalDeviceMemoryProperties();
+	uint32_t    type              = UINT32_MAX;
+	using F                       = vk::MemoryPropertyFlagBits;
+	for (int pass = 0; pass < 2 && type == UINT32_MAX; pass++) {
+		const vk::MemoryPropertyFlags wanted =
+		    pass == 0 ? (F::eHostVisible | F::eHostCoherent | F::eHostCached) : (F::eHostVisible | F::eHostCoherent);
+		for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
+			if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+			    (memory_properties.memoryTypes[i].propertyFlags & wanted) == wanted) {
+				type = i;
+				break;
+			}
+		}
+	}
+	vk::DeviceMemory memory = nullptr;
+	void*            mapped = nullptr;
+	if (type != UINT32_MAX) {
+		vk::MemoryAllocateInfo allocate {};
+		allocate.allocationSize  = requirements.size;
+		allocate.memoryTypeIndex = type;
+		if (graphics.device.allocateMemory(&allocate, nullptr, &memory) != vk::Result::eSuccess ||
+		    graphics.device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess) {
+			type = UINT32_MAX;
+		}
+	}
+	if (type == UINT32_MAX) {
+		if (memory != nullptr) {
+			graphics.device.freeMemory(memory, nullptr);
+		}
+		graphics.device.destroyBuffer(buffer, nullptr);
+		report("KYTY_NATIVE_DUMP: no host-visible memory\n");
+		return;
+	}
+
+	{
+		// The frame is the presenter's (its GPU copy completed before the flip queue handed it
+		// over); only the presenter's scheduler records here, as for a present.
+		std::optional<RenderLockGuard> render_lock;
+		if (!PresentUnlocked()) {
+			render_lock.emplace(renderer.GetMutex());
+		}
+		auto& command_buffer = present_scheduler.BeginCommand();
+		auto  command        = command_buffer.Handle();
+		frame.Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+		vk::BufferImageCopy region {};
+		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.imageExtent      = vk::Extent3D {width, height, 1};
+		command.copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal, buffer, 1, &region);
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+		const auto tick = present_scheduler.Submit();
+		present_scheduler.Wait(tick);
+		frame.present_tick = std::max(frame.present_tick, tick);
+	}
+
+	std::vector<uint8_t> rgb(size_t {width} * height * 3u);
+	if (graphics.device.mapMemory(memory, 0, VK_WHOLE_SIZE, {}, &mapped) == vk::Result::eSuccess &&
+	    mapped != nullptr) {
+		const auto* src = static_cast<const uint8_t*>(mapped);
+		for (size_t p = 0; p < size_t {width} * height; p++) {
+			uint8_t* d = rgb.data() + p * 3u;
+			if (bpp == 8) {
+				uint16_t h[4];
+				std::memcpy(h, src + p * 8u, sizeof(h));
+				d[0] = UnitToByte(HalfToFloat(h[0]));
+				d[1] = UnitToByte(HalfToFloat(h[1]));
+				d[2] = UnitToByte(HalfToFloat(h[2]));
+				continue;
+			}
+			uint32_t v = 0;
+			std::memcpy(&v, src + p * 4u, sizeof(v));
+			switch (format) {
+				case vk::Format::eB8G8R8A8Unorm:
+				case vk::Format::eB8G8R8A8Srgb:
+					d[0] = static_cast<uint8_t>(v >> 16u);
+					d[1] = static_cast<uint8_t>(v >> 8u);
+					d[2] = static_cast<uint8_t>(v);
+					break;
+				case vk::Format::eA2B10G10R10UnormPack32:
+					d[0] = static_cast<uint8_t>((v & 0x3ffu) >> 2u);
+					d[1] = static_cast<uint8_t>(((v >> 10u) & 0x3ffu) >> 2u);
+					d[2] = static_cast<uint8_t>(((v >> 20u) & 0x3ffu) >> 2u);
+					break;
+				case vk::Format::eA2R10G10B10UnormPack32:
+					d[0] = static_cast<uint8_t>(((v >> 20u) & 0x3ffu) >> 2u);
+					d[1] = static_cast<uint8_t>(((v >> 10u) & 0x3ffu) >> 2u);
+					d[2] = static_cast<uint8_t>((v & 0x3ffu) >> 2u);
+					break;
+				default: // R8G8B8A8
+					d[0] = static_cast<uint8_t>(v);
+					d[1] = static_cast<uint8_t>(v >> 8u);
+					d[2] = static_cast<uint8_t>(v >> 16u);
+					break;
+			}
+		}
+		graphics.device.unmapMemory(memory);
+	} else {
+		mapped = nullptr;
+	}
+	graphics.device.freeMemory(memory, nullptr);
+	graphics.device.destroyBuffer(buffer, nullptr);
+	if (mapped == nullptr) {
+		report("KYTY_NATIVE_DUMP: map failed\n");
+		return;
+	}
+
+	std::vector<uint8_t> png;
+	png.reserve(rgb.size() / 2u);
+	const int ok = stbi_write_png_to_func(&PngWrite, &png, static_cast<int>(width), static_cast<int>(height), 3,
+	                                      rgb.data(), static_cast<int>(width * 3u));
+	std::error_code       error;
+	std::filesystem::path dir(Loader::GameCapture::NativeDumpDir());
+	std::filesystem::create_directories(dir, error);
+	const auto path = dir / ("frame-" + std::to_string(number) + ".png");
+	bool       written = false;
+	if (ok != 0) {
+		std::ofstream file(path, std::ios::binary | std::ios::trunc);
+		file.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+		written = file.good();
+	}
+	report("KYTY_NATIVE_DUMP: frame " + std::to_string(number) + " " + std::to_string(width) + "x" +
+	       std::to_string(height) + " " + vk::to_string(format) + (frame.hdr ? " (hdr)" : "") + " -> " +
+	       path.string() + (written ? "" : " (WRITE FAILED)") + "\n");
 }
 
 void Presenter::Discard(Frame& frame) {
