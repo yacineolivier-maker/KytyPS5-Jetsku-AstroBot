@@ -22,6 +22,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
+#include "loader/gameHooks.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
@@ -1557,6 +1558,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 	if (!m_programs.empty()) {
 		GamePatch::ApplyBuiltin(m_programs.front());
+		GameHooks::Install(m_programs.front()); // KYTY_GAME_HOOKS (off by default)
 	}
 	if (!m_programs.empty() && !m_programs.front()->elf->IsShared()) {
 		Common::GuestProbe::Arm(m_programs.front()->base_vaddr, m_programs.front()->base_size);
@@ -1591,6 +1593,7 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
+	GameHooks::Clear();
 
 	for (auto* p: m_programs) {
 		DeleteProgram(p);
