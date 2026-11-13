@@ -58,16 +58,21 @@ void NoteNativeMarker(const uint32_t* body, uint32_t body_dw);
 // (the CP has not consumed far enough): no marker, the normal packet stays (counted). The CP's
 // CpOpNativeDraw looks the record up and runs the original packet's handler at the marker's
 // position, with the CP state of that position, so the image is the emulator's own.
-enum class NativeMode : uint8_t { Off, Drop, Splice, N2 };
+enum class NativeMode : uint8_t { Off, Drop, Splice, N2, N3 };
 extern std::atomic<uint8_t> g_native_mode; // NativeMode, set once the hooks are installed
 [[nodiscard]] inline NativeMode GetNativeMode() {
 	return static_cast<NativeMode>(g_native_mode.load(std::memory_order_relaxed));
 }
-// The CP hands the original packet to its handler at the marker: N1 (splice) and N2, whose
-// emission is still the emulator's own draw path.
+// The CP hands the original packet to its handler at the marker: N1 (splice), N2 and N3, whose
+// emission is still the emulator's own draw path (N3: with the segment resolution windows below).
 [[nodiscard]] inline bool NativeSplices() {
 	const auto mode = GetNativeMode();
-	return mode == NativeMode::Splice || mode == NativeMode::N2;
+	return mode == NativeMode::Splice || mode == NativeMode::N2 || mode == NativeMode::N3;
+}
+// N2 and N3: game-thread records, op tags, record verification, resolver timing.
+[[nodiscard]] inline bool NativeRecords() {
+	const auto mode = GetNativeMode();
+	return mode == NativeMode::N2 || mode == NativeMode::N3;
 }
 
 // Marker word 1, low byte: bits 0..3 the engine thread slot; bit 7 (N2 only) the draw starts a
@@ -198,6 +203,42 @@ enum NativeRun : uint32_t {
 };
 // Resolver (Thread_Gpu): a native draw op ran from `start_tsc` to `end_tsc`.
 void NoteNativeResolved(uint32_t op_flags, uint64_t start_tsc, uint64_t end_tsc, uint32_t run);
+
+// ---- KYTY_NATIVE_MODE=n3 (stage N3a, docs\PLAN-PARALLELE.md) -------------------------------------
+//
+// N3a = N2 plus "segment resolution windows" in the buffer cache (BufferCache::NativeTierBegin,
+// renderer/cache/bufferCache.h): while the resolver executes a native draw op, a read binding
+// (storage/uniform V#, vertex range, index range: ObtainBuffer neither written nor texel) whose
+// range lies in a window certified earlier in the same native segment is answered from the window
+// (buffer + linear offset), without the binding memo, tracker queries or ObtainBufferNow. A window
+// is learned from the emulator's own result for a read binding of a cache buffer: the aligned range
+// around it (KYTY_NATIVE_N3_WINDOW bytes, default 64 KiB, else its 4 KiB pages) inside that buffer,
+// with no CPU-dirty page (hot pages are CPU-dirty) under an unchanged tracker signature. It holds
+// while the sync epoch (syncEpoch.h), the buffer structure epoch and the unregister count are the
+// ones it was learned under, within one native segment of one engine thread. That is the fact
+// TryLeanReadMiss proves per binding ("no CPU-dirty page, registered buffer covering it: that buffer
+// at Offset(vaddr)"), taken once per window and reused within its epoch, as syncEpoch.h allows
+// (a CPU write between two ordering points races the GPU on the hardware too).
+// KYTY_NATIVE_N3_STRICT=1: every window answer also re-reads the window's tracker signature (the
+// binding memo's own condition). KYTY_NATIVE_N3_TIER=0: n3 without windows (A/B against n2).
+// KYTY_NATIVE_VERIFY=1 (n3): every window answer also runs the normal path, which decides; a
+// different buffer or offset is a mismatch, or a race when the window's signature moved.
+// Per native draw, what the windows did (resolver; the buffer cache fills it, the CP reports it).
+struct NativeN3Draw {
+	uint32_t hits          = 0; // read bindings answered by a window
+	uint32_t learned       = 0; // normal path, then a window recorded from its result
+	uint32_t stream        = 0; // normal path gave a stream copy (CPU-dirty range): no window
+	uint32_t dirty         = 0; // normal path gave a cache buffer, window refused (CPU-dirty pages)
+	uint32_t other         = 0; // normal path, result not a plain cache-buffer answer
+	uint32_t ineligible    = 0; // written / texel / memo off: normal path, never windowed
+	uint32_t inv_epoch     = 0; // window found, sync epoch moved
+	uint32_t inv_structure = 0; // window found, buffer structure changed
+	uint32_t inv_unregister = 0; // window found, a buffer was unregistered
+	uint32_t inv_signature = 0; // window found, tracker signature moved (strict mode)
+	uint32_t verify_checks = 0, verify_races = 0, verify_mismatches = 0;
+};
+// Resolver: a native draw op ran under the windows from `start_tsc` to `end_tsc`.
+void NoteNativeN3(uint32_t op_flags, uint64_t start_tsc, uint64_t end_tsc, const NativeN3Draw& draw);
 
 // Guest flips (graphics/presentation/videoOut.cpp), for the per-frame averages.
 extern std::atomic<uint64_t> g_flips;

@@ -3313,12 +3313,45 @@ void CommandProcessor::NoteNativeResolvedOp(uint32_t flags, uint64_t start) {
 	                     : ex.m_run_targets_kept ? GC::kNrTargets
 	                                             : GC::kNrStarted;
 	GC::NoteNativeResolved(flags, start, end, run);
+	if (m_native_tier_valid) {
+		m_native_tier_valid = false;
+		GC::NoteNativeN3(flags, start, end, m_native_tier_draw);
+	}
 }
+
+// Astro Bot PC (KYTY_NATIVE_MODE=n3, stage N3a): the buffer cache's segment resolution windows
+// (BufferCache::NativeTierBegin) for the duration of a native draw op. Declared after the
+// NativeResolveTimer, so it ends first and the timer's report sees what the windows did.
+struct NativeTierScope {
+	BufferCache*                       cache = nullptr;
+	Loader::GameCapture::NativeN3Draw* out   = nullptr;
+	bool*                              valid = nullptr;
+	NativeTierScope(BufferCache& c, uint32_t op_flags, Loader::GameCapture::NativeN3Draw& draw, bool& draw_valid) {
+		namespace GC = Loader::GameCapture;
+		if ((op_flags & CpSeq::DrawFlagNativeMask) != 0 && GC::GetNativeMode() == GC::NativeMode::N3) [[unlikely]] {
+			cache = &c;
+			out   = &draw;
+			valid = &draw_valid;
+			c.NativeTierBegin((op_flags >> GC::kNativeOpSlotShift) & GC::kNativeSlotMask,
+			                  (op_flags & GC::kNativeOpSegStart) != 0, GC::NativeVerifyEnabled());
+		}
+	}
+	~NativeTierScope() {
+		if (cache != nullptr) [[unlikely]] {
+			*out   = cache->NativeTierEnd();
+			*valid = true;
+		}
+	}
+	NativeTierScope(const NativeTierScope&)            = delete;
+	NativeTierScope& operator=(const NativeTierScope&) = delete;
+};
 
 void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 	const NativeResolveTimer native_timer(op.flags, [this](uint32_t flags, uint64_t start) {
 		NoteNativeResolvedOp(flags, start);
 	});
+	const NativeTierScope native_tier(m_renderer.GetBufferCache(), op.flags, m_native_tier_draw,
+	                                  m_native_tier_valid);
 	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
@@ -3992,6 +4025,8 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 	const NativeResolveTimer native_timer(op.flags, [this](uint32_t flags, uint64_t start) {
 		NoteNativeResolvedOp(flags, start);
 	});
+	const NativeTierScope native_tier(m_renderer.GetBufferCache(), op.flags, m_native_tier_draw,
+	                                  m_native_tier_valid);
 	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {

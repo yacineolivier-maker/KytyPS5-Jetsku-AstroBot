@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "loader/gameCapture.h"
 
 #include <cstdint>
 #include <deque>
@@ -474,6 +475,10 @@ private:
 	HW::UserSgprType m_user_data_marker                 = HW::UserSgprType::Unknown;
 	uint32_t         m_index_type_and_size              = 0;
 	uint32_t         m_native_op_tag                    = 0; // KYTY_NATIVE n2 (SetNativeOpTag)
+	// KYTY_NATIVE n3: what the buffer cache's windows did for the native op just executed
+	// (graphicsRun.cpp NativeTierScope), reported with its timing.
+	Loader::GameCapture::NativeN3Draw m_native_tier_draw {};
+	bool                              m_native_tier_valid = false;
 	uint32_t         m_index_buffer_size                = 0;
 	uint64_t         m_index_base_addr                  = 0;
 	uint64_t         m_draw_indirect_args_base_addr     = 0;

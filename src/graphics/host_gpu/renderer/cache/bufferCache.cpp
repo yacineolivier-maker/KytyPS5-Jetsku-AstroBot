@@ -3674,9 +3674,196 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (!is_written && !is_texel_buffer && m_binding_memo != nullptr && size < BindingMemoMaxSize &&
 	    GuestGpu::IsGpuThread()) {
+		if (m_n3_active) [[unlikely]] {
+			return ObtainReadBindingNative(vaddr, size, id);
+		}
 		return ObtainReadBinding(vaddr, size, id);
 	}
+	if (m_n3_active && GuestGpu::IsGpuThread()) [[unlikely]] {
+		m_n3_draw.ineligible++; // the tier's own thread: another thread never touches m_n3_draw
+	}
 	return ObtainBufferNow(vaddr, size, is_written, is_texel_buffer, id, nullptr);
+}
+
+// ---- Astro Bot PC: KYTY_NATIVE_MODE=n3 segment resolution windows (bufferCache.h, gameCapture.h) ----
+
+namespace {
+struct NativeTierConfig {
+	bool     enabled = true;  // KYTY_NATIVE_N3_TIER=0: n3 without windows
+	bool     strict  = false; // KYTY_NATIVE_N3_STRICT=1
+	uint32_t shift   = 16;    // log2(KYTY_NATIVE_N3_WINDOW), 12..24
+};
+const NativeTierConfig& GetNativeTierConfig() {
+	static const NativeTierConfig config = [] {
+		NativeTierConfig c;
+		if (const char* v = std::getenv("KYTY_NATIVE_N3_TIER"); v != nullptr && std::strcmp(v, "0") == 0) {
+			c.enabled = false;
+		}
+		if (const char* v = std::getenv("KYTY_NATIVE_N3_STRICT"); v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0) {
+			c.strict = true;
+		}
+		if (const char* v = std::getenv("KYTY_NATIVE_N3_WINDOW"); v != nullptr && v[0] != '\0') {
+			const auto bytes = std::strtoull(v, nullptr, 0);
+			if (bytes != 0 && (bytes & (bytes - 1)) == 0) {
+				c.shift = std::clamp(static_cast<uint32_t>(std::countr_zero(bytes)), 12u, 24u);
+			}
+		}
+		std::printf("Kyty native n3 windows: %s, window %llu KiB, %s\n", c.enabled ? "on" : "off (KYTY_NATIVE_N3_TIER=0)",
+		            static_cast<unsigned long long>((uint64_t {1} << c.shift) >> 10u),
+		            c.strict ? "strict (signature re-read per hit)" : "epoch certificates");
+		return c;
+	}();
+	return config;
+}
+} // namespace
+
+void BufferCache::NativeTierBegin(uint32_t slot, bool segment_start, bool verify) {
+	const auto& config = GetNativeTierConfig();
+	m_n3_draw          = {};
+	if (!config.enabled || m_binding_memo == nullptr || !SyncEpoch::Enabled() || !GuestGpu::IsGpuThread()) {
+		m_n3_active = false;
+		return;
+	}
+	if (m_n3_windows == nullptr) {
+		m_n3_windows = std::make_unique<NativeWindow[]>(NativeWindowSlots);
+	}
+	m_n3_shift  = config.shift;
+	m_n3_strict = config.strict;
+	m_n3_verify = verify;
+	if (segment_start || slot != m_n3_slot) {
+		m_n3_generation++;
+		m_n3_slot = slot;
+	}
+	m_n3_active = true;
+}
+
+Loader::GameCapture::NativeN3Draw BufferCache::NativeTierEnd() {
+	m_n3_active = false;
+	return m_n3_draw;
+}
+
+BufferCache::NativeWindow* BufferCache::NativeTierLookup(uint64_t vaddr, uint64_t size) {
+	auto& w = m_n3_windows[static_cast<size_t>(vaddr >> m_n3_shift) & (NativeWindowSlots - 1)];
+	if (w.buffer == nullptr || w.generation != m_n3_generation || vaddr < w.lo || vaddr + size > w.hi) {
+		return nullptr;
+	}
+	// The certificate: nothing ordered changed the window since it was learned.
+	if (w.epoch != SyncEpoch::Current()) {
+		m_n3_draw.inv_epoch++;
+		w.buffer = nullptr;
+		return nullptr;
+	}
+	if (w.structure != m_bda_structure_epoch.load(std::memory_order_acquire)) {
+		m_n3_draw.inv_structure++;
+		w.buffer = nullptr;
+		return nullptr;
+	}
+	if (w.unregister != m_unregister_epoch) {
+		m_n3_draw.inv_unregister++;
+		w.buffer = nullptr;
+		return nullptr;
+	}
+	if (m_n3_strict && m_memory_tracker.RangeSignature(w.lo, w.hi - w.lo) != w.signature) {
+		m_n3_draw.inv_signature++;
+		w.buffer = nullptr;
+		return nullptr;
+	}
+	return &w;
+}
+
+void BufferCache::NativeTierLearn(uint64_t vaddr, uint64_t size, const std::pair<Buffer*, uint64_t>& result) {
+	if (result.first == nullptr || result.first == &m_stream_buffer) {
+		m_n3_draw.stream++;
+		return;
+	}
+	// A plain cache-buffer answer: the page table's owner of the range, covering it, at its linear
+	// offset (TryLeanReadMiss' result).
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (!m_relaxed_queries || owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+		m_n3_draw.other++;
+		return;
+	}
+	auto&      buffer    = m_slot_buffers[*owner];
+	const auto structure = m_bda_structure_epoch.load(std::memory_order_acquire);
+	if (&buffer != result.first || !buffer.IsInBounds(vaddr, size) || buffer.Offset(vaddr) != result.second ||
+	    structure == UINT64_MAX) {
+		m_n3_draw.other++;
+		return;
+	}
+	const uint64_t buffer_lo = buffer.CpuAddress();
+	const uint64_t buffer_hi = buffer_lo + buffer.Size();
+	// The large window first, then the binding's own 4 KiB pages.
+	const uint32_t shifts[2] = {m_n3_shift, 12u};
+	for (const uint32_t shift: shifts) {
+		const uint64_t granule = uint64_t {1} << shift;
+		const uint64_t lo      = std::max(buffer_lo, vaddr & ~(granule - 1));
+		const uint64_t hi      = std::min(buffer_hi, (vaddr + size + granule - 1) & ~(granule - 1));
+		if (hi <= lo || vaddr < lo || vaddr + size > hi) {
+			continue;
+		}
+		// Regions exist, no page is CPU-dirty (hot pages are), and no transition raced the query.
+		const auto before = m_memory_tracker.RangeSignature(lo, hi - lo);
+		bool       dirty  = true;
+		if (before == 0 || !m_memory_tracker.QueryCpuDirtyRelaxed(lo, hi - lo, dirty) || dirty ||
+		    m_memory_tracker.RangeSignature(lo, hi - lo) != before) {
+			continue;
+		}
+		auto& w      = m_n3_windows[static_cast<size_t>(vaddr >> m_n3_shift) & (NativeWindowSlots - 1)];
+		w.lo         = lo;
+		w.hi         = hi;
+		w.buffer     = &buffer;
+		w.generation = m_n3_generation;
+		w.epoch      = SyncEpoch::Current();
+		w.structure  = structure;
+		w.unregister = m_unregister_epoch;
+		w.signature  = before;
+		w.touched    = m_gc_tick; // the normal path touched the buffer
+		m_n3_draw.learned++;
+		return;
+	}
+	m_n3_draw.dirty++;
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBindingNative(uint64_t vaddr, uint64_t size, BufferId id) {
+	if (auto* w = NativeTierLookup(vaddr, size); w != nullptr) {
+		const std::pair<Buffer*, uint64_t> hit {w->buffer, w->buffer->Offset(vaddr)};
+		if (w->touched != m_gc_tick) {
+			TouchBuffer(*w->buffer);
+			w->touched = m_gc_tick;
+		}
+		m_n3_draw.hits++;
+		if (!m_n3_verify) {
+			return hit;
+		}
+		// KYTY_NATIVE_VERIFY=1: the normal path decides; a difference while the window's tracker
+		// signature still holds is a mismatch, otherwise a race (a transition since it was learned).
+		const auto signature = w->signature;
+		const auto lo        = w->lo;
+		const auto hi        = w->hi;
+		m_n3_draw.verify_checks++;
+		const auto normal = ObtainReadBinding(vaddr, size, id);
+		if (normal != hit) {
+			if (m_memory_tracker.RangeSignature(lo, hi - lo) != signature) {
+				m_n3_draw.verify_races++;
+			} else {
+				m_n3_draw.verify_mismatches++;
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::printf("Kyty native n3 verify: window answer differs: addr=0x%016" PRIx64 " size=0x%" PRIx64
+					            " window [0x%016" PRIx64 ", 0x%016" PRIx64 ") offset 0x%" PRIx64 " normal %s offset 0x%" PRIx64 "\n",
+					            vaddr, size, lo, hi, hit.second,
+					            normal.first == &m_stream_buffer ? "stream"
+					            : normal.first == hit.first      ? "same buffer"
+					                                             : "other buffer",
+					            normal.second);
+				}
+			}
+		}
+		return normal;
+	}
+	const auto result = ObtainReadBinding(vaddr, size, id);
+	NativeTierLearn(vaddr, size, result);
+	return result;
 }
 
 void BufferCache::PrefetchReadBinding(uint64_t vaddr, uint64_t size, bool at_find) const noexcept {

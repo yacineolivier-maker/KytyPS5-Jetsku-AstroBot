@@ -2468,7 +2468,7 @@ KYTY_CP_OP_PARSER(CpOpNativeDraw) {
 	// N2: the record (verified against the registers here, on the real parse) and the op tag the
 	// resolver times. The tag comes from the marker alone, so every front emits the same op.
 	uint32_t tag = 0;
-	if (Loader::GameCapture::GetNativeMode() == Loader::GameCapture::NativeMode::N2) {
+	if (Loader::GameCapture::NativeRecords()) {
 		tag = Loader::GameCapture::NativeOpTag(buffer);
 		if (real) {
 			Loader::GameCapture::NativeDraw record;

@@ -46,6 +46,9 @@
 // published under the marker serial in the slot's record ring), native segments (seg_start), the
 // CP's field-by-field comparison of the record with its registers (KYTY_NATIVE_VERIFY=1) and the
 // resolver's Thread_Gpu time per native draw and per segment ("Native 10s" n2 part).
+// Stage N3a (KYTY_NATIVE_MODE=n3, gameCapture.h "KYTY_NATIVE_MODE=n3"): N2, plus the buffer cache's
+// segment resolution windows during every native draw op; "Native 10s" n3 part: draws and
+// Thread_Gpu time by window path, binding outcomes, window invalidations, verify results.
 
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -117,7 +120,8 @@ struct NativeConfig {
 	std::string unknown;           // tokens that name no engine thread
 	std::string mode;
 	bool        splice = false;    // KYTY_NATIVE_MODE=splice (stage N1) or n2, else drop (N0)
-	bool        n2     = false;    // KYTY_NATIVE_MODE=n2 (stage N2: N1 + records, verify, timing)
+	bool        n2     = false;    // KYTY_NATIVE_MODE=n2 or n3 (stage N2: N1 + records, verify, timing)
+	bool        n3     = false;    // KYTY_NATIVE_MODE=n3 (stage N3a: N2 + segment resolution windows)
 	bool        verify = false;    // KYTY_NATIVE_VERIFY=1: a splice record miss exits
 };
 
@@ -166,7 +170,8 @@ NativeConfig ParseNative() {
 	if (config.mode.empty()) {
 		config.mode = "drop";
 	}
-	config.n2     = config.mode == "n2";
+	config.n3     = config.mode == "n3";
+	config.n2     = config.mode == "n2" || config.n3;
 	config.splice = config.mode == "splice" || config.n2;
 	config.valid  = (config.mode == "drop" || config.splice) && config.mask != 0;
 	const char* verify = std::getenv("KYTY_NATIVE_VERIFY");
@@ -529,6 +534,28 @@ struct N2ResolveLast {
 	std::array<uint64_t, 5> seg_hist {};
 };
 std::array<N2ResolveLast, kEngineThreads> g_n2_resolve_last {}; // reporter only
+// n3 (resolver): native draws and their cycles by window path (window: every read binding the
+// windows could see was answered by one; mixed: some; normal: none), the sums of the per-draw
+// NativeN3Draw fields, and resolver segments whose draws after the first all took the window path.
+constexpr uint32_t    kN3Paths               = 3;
+constexpr const char* kN3PathNames[kN3Paths] = {"window", "mixed", "normal"};
+constexpr uint32_t    kN3Fields              = 13;
+constexpr const char* kN3FieldNames[kN3Fields] = {"hits", "learned", "stream", "dirty", "other", "ineligible", "epoch", "structure",
+                                                  "unregister", "signature", "verify-checks", "verify-races", "verify-mismatches"};
+struct N3Resolve {
+	std::array<std::atomic<uint64_t>, kN3Paths>  draws {};
+	std::array<std::atomic<uint64_t>, kN3Paths>  ticks {};
+	std::array<std::atomic<uint64_t>, kN3Fields> fields {};
+	std::atomic<uint64_t>                        segments {0};
+	std::atomic<uint64_t>                        segments_window {0};
+};
+std::array<N3Resolve, kEngineThreads> g_n3_resolve {};
+struct N3ResolveLast {
+	std::array<uint64_t, kN3Paths>  draws {}, ticks {};
+	std::array<uint64_t, kN3Fields> fields {};
+	uint64_t                        segments = 0, segments_window = 0;
+};
+std::array<N3ResolveLast, kEngineThreads> g_n3_resolve_last {}; // reporter only
 std::array<uint64_t, kEngineThreads + 1> g_n2_rec_ok_last {}, g_n2_rec_miss_last {}, g_n2_verified_last {},
     g_n2_verify_bad_last {};
 std::array<uint64_t, GameCapture::kNvCount> g_n2_field_bad_last {}, g_n2_field_unknown_last {};
@@ -1419,6 +1446,52 @@ double N2TicksPerUs() {
 	return per;
 }
 
+// KYTY_NATIVE_MODE=n3 part of a slot (reporter only).
+std::string N3SlotReport(uint32_t s) {
+	auto&                          r    = g_n3_resolve[s];
+	auto&                          last = g_n3_resolve_last[s];
+	const auto                     take = [](std::atomic<uint64_t>& v, uint64_t& l) {
+		const auto now = v.load(std::memory_order_relaxed);
+		const auto d   = now - l;
+		l              = now;
+		return d;
+	};
+	std::array<uint64_t, kN3Paths>  draws {}, ticks {};
+	std::array<uint64_t, kN3Fields> fields {};
+	uint64_t                        all = 0;
+	for (uint32_t k = 0; k < kN3Paths; k++) {
+		draws[k] = take(r.draws[k], last.draws[k]);
+		ticks[k] = take(r.ticks[k], last.ticks[k]);
+		all += draws[k];
+	}
+	for (uint32_t k = 0; k < kN3Fields; k++) fields[k] = take(r.fields[k], last.fields[k]);
+	const auto   segments        = take(r.segments, last.segments);
+	const auto   segments_window = take(r.segments_window, last.segments_window);
+	const double tpu             = g_n2_tsc_per_us;
+	const auto   us              = [&](uint64_t t, uint64_t n) {
+        return tpu <= 0.0 || n == 0 ? 0.0 : static_cast<double>(t) / tpu / static_cast<double>(n);
+	};
+	std::string out = fmt::format(" | emission: emulator path (splice) {} with n3 resolution windows (stage N3a; pre-encoded segments: not yet)", all);
+	out += " | n3 draws by path:";
+	for (uint32_t k = 0; k < kN3Paths; k++) {
+		out += fmt::format(" {} {} ({:.1f}%) {:.2f} us", kN3PathNames[k], draws[k],
+		                   all == 0 ? 0.0 : 100.0 * static_cast<double>(draws[k]) / static_cast<double>(all), us(ticks[k], draws[k]));
+	}
+	const uint64_t bindings = fields[0] + fields[1] + fields[2] + fields[3] + fields[4] + fields[5];
+	out += fmt::format(" | n3 segments {} all-window {} | n3 read bindings {} per draw {:.1f}: window {:.1f}%", segments, segments_window, bindings,
+	                   all == 0 ? 0.0 : static_cast<double>(bindings) / static_cast<double>(all),
+	                   bindings == 0 ? 0.0 : 100.0 * static_cast<double>(fields[0]) / static_cast<double>(bindings));
+	out += " (normal path:";
+	for (uint32_t k = 1; k <= 5; k++) out += fmt::format(" {} {}", kN3FieldNames[k], fields[k]);
+	out += ") window invalidated:";
+	for (uint32_t k = 6; k <= 9; k++) out += fmt::format(" {} {}", kN3FieldNames[k], fields[k]);
+	if (Native().verify) {
+		out += fmt::format(" | n3 verify: checks {} races {} mismatches {}", fields[10], fields[11], fields[12]);
+	}
+	out += " | worker encode: none (N3a)";
+	return out;
+}
+
 std::string N2SlotReport(uint32_t s, uint64_t segments_game, uint64_t rec_incomplete, uint64_t flips) {
 	auto& r    = g_n2_resolve[s];
 	auto& last = g_n2_resolve_last[s];
@@ -1454,11 +1527,15 @@ std::string N2SlotReport(uint32_t s, uint64_t segments_game, uint64_t rec_incomp
 	g_n2_rec_miss_last[s] = miss;
 	const double tpu = g_n2_tsc_per_us;
 	const auto   us  = [&](uint64_t t, uint64_t n) { return tpu <= 0.0 || n == 0 ? 0.0 : static_cast<double>(t) / tpu / static_cast<double>(n); };
-	std::string out = fmt::format(
-	    " | n2: records ok {} miss {} incomplete {} | segments (game) {} | emission: emulator path (splice) {} n2-native 0 (fallback reason: native emission not implemented)"
-	    " | Thread_Gpu {:.2f} us/native draw ({:.2f} ms/frame)",
-	    rec_ok, rec_bad, rec_incomplete, segments_game, all_draws, us(all_ticks, all_draws),
-	    tpu <= 0.0 || flips == 0 ? 0.0 : static_cast<double>(all_ticks) / tpu / 1000.0 / static_cast<double>(flips));
+	std::string out = fmt::format(" | n2: records ok {} miss {} incomplete {} | segments (game) {}", rec_ok, rec_bad, rec_incomplete,
+	                              segments_game);
+	if (Native().n3) {
+		out += N3SlotReport(s);
+	} else {
+		out += fmt::format(" | emission: emulator path (splice) {} n2-native 0 (fallback reason: native emission not implemented)", all_draws);
+	}
+	out += fmt::format(" | Thread_Gpu {:.2f} us/native draw ({:.2f} ms/frame)", us(all_ticks, all_draws),
+	                   tpu <= 0.0 || flips == 0 ? 0.0 : static_cast<double>(all_ticks) / tpu / 1000.0 / static_cast<double>(flips));
 	out += " [";
 	for (uint32_t k = 0; k < GameCapture::kNrCount; k++) {
 		out += fmt::format("{}{} {} ({:.1f}%) {:.2f} us", k == 0 ? "" : ", ", kNrNames[k], draws[k],
@@ -1828,12 +1905,13 @@ void OnInstalled() {
 		}
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "GameNative: KYTY_NATIVE {} | mode {}{}{} | threads:{}{}{}\n",
-		    !native.valid ? "ignored" : !ok ? "inactive (capture hooks not installed)" : native.n2 ? "active (stage N2)" : native.splice ? "active (stage N1)" : "active (stage N0)",
-		    native.mode, native.mode == "drop" || native.splice ? "" : " (unsupported: drop, splice or n2)",
+		    !native.valid ? "ignored" : !ok ? "inactive (capture hooks not installed)" : native.n3 ? "active (stage N3a)" : native.n2 ? "active (stage N2)" : native.splice ? "active (stage N1)" : "active (stage N0)",
+		    native.mode, native.mode == "drop" || native.splice ? "" : " (unsupported: drop, splice, n2 or n3)",
 		    native.splice ? fmt::format(" (ring {} entries{})", kNativeRingSize, native.verify ? ", verify" : "") : std::string {},
 		    threads.empty() ? " none" : threads, native.unknown.empty() ? "" : " | unknown:", native.unknown));
 		if (native.valid && ok) {
-			GameCapture::g_native_mode.store(static_cast<uint8_t>(native.n2       ? GameCapture::NativeMode::N2
+			GameCapture::g_native_mode.store(static_cast<uint8_t>(native.n3       ? GameCapture::NativeMode::N3
+			                                                      : native.n2     ? GameCapture::NativeMode::N2
 			                                                      : native.splice ? GameCapture::NativeMode::Splice
 			                                                                      : GameCapture::NativeMode::Drop),
 			                                 std::memory_order_release);
@@ -2192,6 +2270,57 @@ void NoteNativeResolved(uint32_t op_flags, uint64_t start_tsc, uint64_t end_tsc,
 		span.draws = 0;
 	}
 	span.end = end_tsc;
+	span.draws++;
+}
+
+namespace {
+// Resolver: the open n3 segment (whether its draws after the first all took the window path).
+struct N3Span {
+	int      slot       = -1;
+	uint64_t draws      = 0;
+	bool     all_window = true;
+};
+thread_local N3Span t_n3_span;
+void CloseN3Span(N3Span& span) {
+	if (span.slot < 0) {
+		return;
+	}
+	auto& r = g_n3_resolve[static_cast<uint32_t>(span.slot)];
+	Inc(r.segments);
+	if (span.all_window && span.draws > 1) {
+		Inc(r.segments_window);
+	}
+	span.slot = -1;
+}
+} // namespace
+
+void NoteNativeN3(uint32_t op_flags, uint64_t start_tsc, uint64_t end_tsc, const NativeN3Draw& d) {
+	const uint32_t slot = (op_flags >> kNativeOpSlotShift) & kNativeSlotMask;
+	if (slot >= kEngineThreads) {
+		return;
+	}
+	auto&          r      = g_n3_resolve[slot];
+	const uint32_t normal = d.learned + d.stream + d.dirty + d.other + d.ineligible;
+	const uint32_t path   = d.hits != 0 ? (normal == 0 ? 0u : 1u) : 2u;
+	Inc(r.draws[path]);
+	Inc(r.ticks[path], end_tsc - start_tsc);
+	const uint32_t values[kN3Fields] = {d.hits,           d.learned,       d.stream,         d.dirty,         d.other,
+	                                    d.ineligible,     d.inv_epoch,     d.inv_structure,  d.inv_unregister, d.inv_signature,
+	                                    d.verify_checks,  d.verify_races,  d.verify_mismatches};
+	for (uint32_t k = 0; k < kN3Fields; k++) {
+		if (values[k] != 0) {
+			Inc(r.fields[k], values[k]);
+		}
+	}
+	auto& span = t_n3_span;
+	if ((op_flags & kNativeOpSegStart) != 0 || span.slot != static_cast<int>(slot)) {
+		CloseN3Span(span);
+		span.slot       = static_cast<int>(slot);
+		span.draws      = 0;
+		span.all_window = true;
+	} else if (path != 0) {
+		span.all_window = false; // a draw after the first did not take the window path
+	}
 	span.draws++;
 }
 

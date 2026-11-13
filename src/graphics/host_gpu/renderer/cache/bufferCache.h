@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/writeTickMap.h"
+#include "loader/gameCapture.h"
 
 #include <array>
 #include <atomic>
@@ -157,6 +158,16 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// Astro Bot PC (KYTY_NATIVE_MODE=n3, stage N3a; loader/gameCapture.h "KYTY_NATIVE_MODE=n3"):
+	// segment resolution windows. While a native draw op runs (GPU thread, between Begin and End),
+	// ObtainBuffer's read bindings (neither written nor texel, the binding memo's own class) are
+	// first looked up in the windows of the current native segment; a hit returns the window's
+	// cache buffer at Offset(vaddr). Otherwise the normal path decides, and a window is learned from
+	// its result. `verify`: every hit also runs the normal path, which decides (counted).
+	// `segment_start` (or another engine thread's slot) starts a new set of windows.
+	void NativeTierBegin(uint32_t slot, bool segment_start, bool verify);
+	// Ends the op's scope; what the windows did for it.
+	[[nodiscard]] Loader::GameCapture::NativeN3Draw NativeTierEnd();
 	// KYTY_CP_BINDING_BATCH_PREFETCH (default on, live): a CPU cache hint for the binding memo
 	// slot a later ObtainBuffer(vaddr, size, false, false) on the GPU thread looks up. A stage's
 	// bindings issue all hints first (RenderExecutor::RebindBuffers), so the slots' cache misses
@@ -530,6 +541,33 @@ private:
 	std::array<BindingMemo, BindingHotMemoSlots> m_binding_hot_memo {};
 	uint64_t m_binding_hot_generation = 0;
 	bool     m_binding_hot_enabled = false;
+	// KYTY_NATIVE_MODE=n3 (NativeTierBegin): one window, the aligned range [lo, hi) of `buffer`
+	// with no CPU-dirty page when it was learned, and what it was learned under. Direct-mapped by
+	// vaddr >> m_n3_shift of the binding that learned it; a binding must lie inside [lo, hi).
+	struct NativeWindow {
+		uint64_t lo         = 0;
+		uint64_t hi         = 0;
+		Buffer*  buffer     = nullptr;
+		uint64_t generation = 0; // m_n3_generation (native segment)
+		uint64_t epoch      = 0; // SyncEpoch::Current()
+		uint64_t structure  = 0; // m_bda_structure_epoch
+		uint64_t unregister = 0; // m_unregister_epoch
+		uint64_t signature  = 0; // tracker RangeSignature(lo, hi - lo)
+		uint64_t touched    = UINT64_MAX; // m_gc_tick of the last TouchBuffer
+	};
+	static constexpr size_t NativeWindowSlots = 512;
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainReadBindingNative(uint64_t vaddr, uint64_t size,
+	                                                                   BufferId id);
+	[[nodiscard]] NativeWindow* NativeTierLookup(uint64_t vaddr, uint64_t size);
+	void NativeTierLearn(uint64_t vaddr, uint64_t size, const std::pair<Buffer*, uint64_t>& result);
+	bool                              m_n3_active     = false;
+	bool                              m_n3_verify     = false;
+	bool                              m_n3_strict     = false;
+	uint32_t                          m_n3_shift      = 16;
+	uint32_t                          m_n3_slot       = UINT32_MAX;
+	uint64_t                          m_n3_generation = 1;
+	Loader::GameCapture::NativeN3Draw m_n3_draw;
+	std::unique_ptr<NativeWindow[]>   m_n3_windows;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainReadBinding(uint64_t vaddr, uint64_t size,
 	                                                             BufferId id);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainReadBindingMemo(uint64_t vaddr, uint64_t size,
