@@ -17,7 +17,11 @@ enum class Kind : uint8_t { Draw, Dispatch };
 
 // Cible du dessin en cours (fil GPU). colors : nombre de cibles couleur ; depth : cible de profondeur.
 void SetTarget(uint64_t address, uint32_t width, uint32_t height, uint32_t format, uint32_t colors,
-               bool depth, uint64_t depth_address);
+               bool depth, uint64_t depth_address, uint64_t vs = 0, uint64_t ps = 0);
+
+// Toutes les cibles couleur d'un dessin : une ligne "PassColors" par combinaison nouvelle.
+void NoteColors(const uint64_t* address, const uint32_t* format, const uint32_t* width, const uint32_t* height,
+                uint32_t count);
 
 class Scope {
 public:

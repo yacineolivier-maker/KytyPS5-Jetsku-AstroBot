@@ -8,6 +8,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+#include "graphics/presentation/window/fsr3FrameGen.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -524,13 +525,29 @@ void Swapchain::Create() {
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
 	create_info.clipped = VK_TRUE;
-	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
-	                     "vkCreateSwapchainKHR");
+	// Astro Bot PC (KYTY_FSR3_FG) : chaine de presentation FSR 3 a generation d'images, sinon la normale.
+	bool fsr3 = false;
+	if (Fsr3::Requested()) {
+		VkSwapchainKHR fsr3_handle = VK_NULL_HANDLE;
+		fsr3 = Fsr3::CreateSwapchain(graphics, static_cast<const VkSwapchainCreateInfoKHR&>(create_info), &fsr3_handle);
+		if (fsr3) {
+			m_handle = vk::SwapchainKHR(fsr3_handle);
+		}
+	}
+	if (!fsr3) {
+		RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
+		                     "vkCreateSwapchainKHR");
+	}
 	EXIT_IF(m_handle == nullptr);
 	LOGF("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
+		    if (Fsr3::Active()) {
+			    return static_cast<vk::Result>(Fsr3::GetSwapchainImages(
+			        static_cast<VkDevice>(graphics.device), static_cast<VkSwapchainKHR>(m_handle), count,
+			        reinterpret_cast<VkImage*>(images)));
+		    }
 		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
@@ -622,7 +639,11 @@ void Swapchain::Destroy() {
 		}
 	}
 	if (m_handle != nullptr) {
-		graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		if (Fsr3::Active()) {
+			Fsr3::DestroySwapchain(graphics); // le contexte FSR 3 detruit sa chaine
+		} else {
+			graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		}
 	}
 
 	m_handle        = nullptr;
@@ -708,9 +729,15 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 		m_frame_ticks[m_frame_index] = 0;
 	}
 	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	const auto result =
+	    Fsr3::Active()
+	        ? static_cast<vk::Result>(Fsr3::AcquireNextImage(
+	              static_cast<VkDevice>(m_window.graphic_ctx.device), static_cast<VkSwapchainKHR>(m_handle),
+	              std::numeric_limits<uint64_t>::max(), static_cast<VkSemaphore>(m_image_acquired[m_frame_index]),
+	              VK_NULL_HANDLE, &m_image_index))
+	        : m_window.graphic_ctx.device.acquireNextImageKHR(m_handle, std::numeric_limits<uint64_t>::max(),
+	                                                          m_image_acquired[m_frame_index], nullptr,
+	                                                          &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1168,6 +1195,10 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 		                           &to_present);
 	}
+	// Astro Bot PC (KYTY_FSR3_FG) : preparation de la generation d'images pour cette image du jeu.
+	if (Fsr3::Active()) {
+		Fsr3::PrepareFrame(static_cast<VkCommandBuffer>(vk_command));
+	}
 }
 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
@@ -1202,7 +1233,10 @@ Swapchain::Status Swapchain::Present() {
 		// texture copies: the present never waits for them, nor for a signal not yet submitted.
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
-		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		result = Fsr3::Active()
+		             ? static_cast<vk::Result>(Fsr3::QueuePresent(static_cast<VkQueue>(m_window.graphic_ctx.queue),
+		                                                          reinterpret_cast<const VkPresentInfoKHR*>(&present)))
+		             : m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;

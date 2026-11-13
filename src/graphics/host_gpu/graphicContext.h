@@ -141,6 +141,10 @@ struct GraphicContext {
 	// UploadDma worker submits to it. Buffers it touches are created shared by both families.
 	uint32_t                           transfer_queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          transfer_queue        = nullptr;
+	// Astro Bot PC (KYTY_FSR3_FG) : trois files de queue_family reservees a la chaine de presentation
+	// FSR 3 (calcul asynchrone, presentation, acquisition), a partir de l'indice fsr_queue_base ; 0 = aucune.
+	uint32_t                           fsr_queue_base = 0;
+	vk::Queue                          fsr_queues[3]  = {nullptr, nullptr, nullptr};
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

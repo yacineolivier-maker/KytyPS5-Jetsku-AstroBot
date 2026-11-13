@@ -653,6 +653,8 @@ struct App0Subst {
 	std::string to;
 	bool        is_max = false;
 	double      max    = 0.0;
+	bool        is_mul = false; // Astro Bot PC 13/11 : mul:<facteur>, le nombre est multiplie
+	double      mul    = 1.0;
 };
 
 static const std::vector<App0Subst>& App0Substs() {
@@ -693,6 +695,9 @@ static const std::vector<App0Subst>& App0Substs() {
 			if (rule.to.rfind("max:", 0) == 0) {
 				rule.is_max = true;
 				rule.max    = std::strtod(rule.to.c_str() + 4, nullptr);
+			} else if (rule.to.rfind("mul:", 0) == 0) {
+				rule.is_mul = true;
+				rule.mul    = std::strtod(rule.to.c_str() + 4, nullptr);
 			} else if (rule.from.empty() || rule.from.size() != rule.to.size()) {
 				::printf("App0Subst: ligne ignoree (longueurs differentes) : %s\n", s.c_str());
 				continue;
@@ -720,7 +725,8 @@ static bool App0SubstPathMatches(const App0Subst& rule, const std::string& n) {
 }
 
 // Plafond : le nombre en p[0..width) (jusqu'a '<') ramene a max, ecrit sur la meme largeur. Faux si inchange.
-static bool App0SubstClamp(char* p, size_t width, double max) {
+// mul > 0 : le nombre est remplace par nombre * mul (s'il est positif) au lieu d'etre plafonne.
+static bool App0SubstClamp(char* p, size_t width, double max, double mul = 0.0) {
 	if (width == 0 || width > 31) {
 		return false;
 	}
@@ -728,7 +734,15 @@ static bool App0SubstClamp(char* p, size_t width, double max) {
 	std::memcpy(old_text, p, width);
 	char*       end   = nullptr;
 	const double value = std::strtod(old_text, &end);
-	if (end == old_text || value <= max) {
+	if (end == old_text) {
+		return false;
+	}
+	if (mul > 0.0) {
+		if (value <= 0.0 || mul == 1.0) {
+			return false;
+		}
+		max = value * mul;
+	} else if (value <= max) {
 		return false;
 	}
 	// Plus grand nombre de decimales qui tient dans la largeur ; espaces a droite si la valeur est plus courte.
@@ -768,13 +782,13 @@ void ApplyApp0Substs(const std::string& name, void* buf, uint64_t bytes) {
 				p++;
 				continue;
 			}
-			if (rule.is_max) {
+			if (rule.is_max || rule.is_mul) {
 				char* v = p + rule.from.size();
 				char* e = v;
 				while (e < stop && *e != '<' && *e != '\r' && *e != '\n') {
 					e++;
 				}
-				if (App0SubstClamp(v, static_cast<size_t>(e - v), rule.max)) {
+				if (App0SubstClamp(v, static_cast<size_t>(e - v), rule.max, rule.is_mul ? rule.mul : 0.0)) {
 					hits++;
 				}
 				p = e;

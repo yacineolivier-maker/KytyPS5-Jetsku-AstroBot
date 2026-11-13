@@ -691,11 +691,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	       graphics.side_queue_index != 0 ? "queue 1" : "shared with queue 0", queue_family,
 	       family_queue_count);
 
-	const std::array<float, 2> queue_priorities {1.0f, 1.0f};
+	const std::array<float, 5> queue_priorities {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
 	auto&                      queue_create_info = queue_create_infos[0];
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = graphics.side_queue_index != 0 ? 2u : 1u;
+	// Astro Bot PC : KYTY_FSR3_FG=1 reserve trois files de plus pour la chaine de presentation FSR 3.
+	{
+		const auto* fg = std::getenv("KYTY_FSR3_FG");
+		if (fg != nullptr && std::strcmp(fg, "1") == 0 && family_queue_count >= queue_create_info.queueCount + 3u) {
+			graphics.fsr_queue_base = queue_create_info.queueCount;
+			queue_create_info.queueCount += 3u;
+		}
+		std::printf("FSR 3 : files de presentation %s (KYTY_FSR3_FG)\n",
+		            graphics.fsr_queue_base != 0 ? "reservees" : "non reservees");
+	}
 	queue_create_info.pQueuePriorities = queue_priorities.data();
 	// KYTY_UPLOAD_DMA: one queue of a transfer-only family (the copy engines), for UploadDma.
 	// Not under RenderDoc, whose captures of the extra queue are not needed for analysis.
@@ -2163,6 +2173,14 @@ void WindowContext::CreateVulkan() {
 		graphic_ctx.device.getQueue(graphic_ctx.transfer_queue_family, 0,
 		                            &graphic_ctx.transfer_queue);
 		EXIT_IF(graphic_ctx.transfer_queue == nullptr);
+	}
+	if (graphic_ctx.fsr_queue_base != 0) {
+		// Astro Bot PC (KYTY_FSR3_FG) : files de la chaine de presentation FSR 3.
+		for (uint32_t i = 0; i < 3; i++) {
+			graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.fsr_queue_base + i,
+			                            &graphic_ctx.fsr_queues[i]);
+			EXIT_IF(graphic_ctx.fsr_queues[i] == nullptr);
+		}
 	}
 	if (graphic_ctx.gpu_breadcrumbs_requested) {
 		GpuBreadcrumbs::Initialize(graphic_ctx, graphic_ctx.device_coherent_memory_enabled);

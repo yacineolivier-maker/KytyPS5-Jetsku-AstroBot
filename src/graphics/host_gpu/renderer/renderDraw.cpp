@@ -3844,10 +3844,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const auto& c0 = state.color_info[0];
 		const auto& z  = state.depth_info;
 		const bool  has_color = state.color_count != 0;
+		{
+			uint64_t a[8] {};
+			uint32_t f[8] {}, w[8] {}, h[8] {};
+			const uint32_t n = std::min<uint32_t>(state.color_count, 8u);
+			for (uint32_t i = 0; i < n; i++) {
+				const auto& ci = state.color_info[i].desc.info;
+				a[i] = ci.data.address;
+				f[i] = static_cast<uint32_t>(ci.guest_format);
+				w[i] = ci.extent.width;
+				h[i] = ci.extent.height;
+			}
+			PassStats::NoteColors(a, f, w, h, n);
+		}
 		const auto& info = has_color ? c0.desc.info : z.desc.info;
 		PassStats::SetTarget(info.data.address, info.extent.width, info.extent.height,
 		                     static_cast<uint32_t>(info.guest_format), state.color_count, static_cast<bool>(z.image_id),
-		                     z.image_id ? z.desc.info.data.address : 0u);
+		                     z.image_id ? z.desc.info.data.address : 0u,
+		                     state.vertex_info[0].stage.program != nullptr ? state.vertex_info[0].stage.program->shader_hash : 0u,
+		                     state.ps_active && state.ps_input_info.stage.program != nullptr ? state.ps_input_info.stage.program->shader_hash : 0u);
 	}
 	auto& ucfg = buffer.GetUserConfig();
 	if (m_context.GetOcclusionCounter().DebugLogActive()) {
