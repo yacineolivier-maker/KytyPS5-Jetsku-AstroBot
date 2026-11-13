@@ -146,6 +146,17 @@ private:
 	[[nodiscard]] bool FrameFencePassed(const Submission& submission) const;
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
+	// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h), Thread_Gpu holding the CP op lock unless noted:
+	// a slice of `submission` begins (the replay's ring and this thread's recording context follow
+	// it); the run-ahead of the next queue-0 submission is offered when it may run; the hand-over
+	// of the run-ahead's submission (true when `front` was it; m_queue_mutex not held); the merge
+	// at the oldest submission's end; an insertion (hook, any thread holding the op lock).
+	void        CpParEnterSlice(const Submission& submission);
+	void        CpParMaybeOffer(const Submission& submission);
+	bool        CpParHandOver(uint64_t front_sequence);
+	void        CpParMerge();
+	void        CpParInsert(uint32_t trigger);
+	static void CpParRunAheadTask(void* argument);
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_submission_mutex;

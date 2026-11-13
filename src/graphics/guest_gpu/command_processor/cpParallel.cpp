@@ -52,6 +52,21 @@ struct Stats {
 	std::array<std::atomic<uint64_t>, 2> fixups_needed {};
 	std::atomic<uint64_t>                image_outside {0};
 	std::atomic<uint64_t>                fixups_needed_total {0};
+	// KYTY_CP_PAR=1b3: run-ahead starts and ops, promotions by reason, merges and insertions with
+	// their fix-ups, op lock waits per thread, time both threads were busy (overlap).
+	std::atomic<uint64_t> runahead_starts {0};
+	std::atomic<uint64_t> runahead_ops {0};
+	std::atomic<uint64_t> runahead_ns {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Promotion::Count)> promotions {};
+	std::atomic<uint64_t> merges {0};
+	std::atomic<uint64_t> merge_fixups {0};
+	std::atomic<uint64_t> merge_impossible {0};
+	std::atomic<uint64_t> merge_images {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Insertion::Count)> insertions {};
+	std::atomic<uint64_t> insertion_fixups {0};
+	std::array<std::atomic<uint64_t>, 2> lock_wait_ns {};
+	std::array<std::atomic<uint64_t>, 2> lock_takes {};
+	std::atomic<uint64_t> overlap_ns {0};
 };
 
 Stats& GetStats() {
@@ -60,6 +75,7 @@ Stats& GetStats() {
 }
 
 thread_local bool t_resolver2 = false;
+thread_local bool t_busy      = false; // Astro Bot PC (KYTY_CP_PAR=1b3): NoteBusy's last state
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): image state bookkeeping (cpParallel.h). An image's state is a
 // hash of its tracked state (Image::CpParStateHash); per context segment, the state each image
@@ -216,6 +232,172 @@ private:
 
 std::unique_ptr<Resolver2> g_resolver2;
 
+// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the CP op lock. FIFO (tickets), so that two
+// contending threads alternate op by op; `last` is the previous holder.
+class OpLock {
+public:
+	bool Acquire(uint32_t who) {
+		std::unique_lock lock(m_mutex);
+		const auto ticket = m_next++;
+		if (m_serving != ticket) {
+			const auto start = NowNs();
+			m_waiters++;
+			HangWatchdog::Scope wait("cp-par-op-lock", reinterpret_cast<uint64_t>(this), who);
+			m_wake.wait(lock, [this, ticket] { return m_serving == ticket; });
+			m_waiters--;
+			GetStats().lock_wait_ns[who != 0 ? 1 : 0].fetch_add(NowNs() - start,
+			                                                    std::memory_order_relaxed);
+		}
+		EXIT_IF(m_holder != UINT32_MAX);
+		m_holder           = who;
+		const bool changed = m_last != UINT32_MAX && m_last != who;
+		m_last             = who;
+		GetStats().lock_takes[who != 0 ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+		return changed;
+	}
+	void Release(uint32_t who) {
+		uint32_t waiters = 0;
+		{
+			std::lock_guard lock(m_mutex);
+			EXIT_IF(m_holder != who);
+			m_holder = UINT32_MAX;
+			m_serving++;
+			waiters = m_waiters;
+		}
+		if (waiters != 0) {
+			m_wake.notify_all();
+		}
+	}
+
+private:
+	std::mutex              m_mutex;
+	std::condition_variable m_wake;
+	uint64_t                m_next    = 0;
+	uint64_t                m_serving = 0;
+	uint32_t                m_waiters = 0;
+	uint32_t                m_holder  = UINT32_MAX;
+	uint32_t                m_last    = UINT32_MAX;
+};
+
+OpLock& GetOpLock() {
+	static OpLock lock;
+	return lock;
+}
+
+std::atomic<bool> g_runahead_dirty {false};
+
+// Astro Bot PC (KYTY_CP_PAR=1b3): CP resolver #2 as the run-ahead thread. Thread_Gpu offers a
+// task; the thread runs it once; Stop cancels an offer not taken yet or waits for the task's end.
+class RunAheadThread {
+public:
+	RunAheadThread() {
+		m_thread = std::thread([this] { Run(); });
+	}
+	~RunAheadThread() {
+		{
+			std::lock_guard lock(m_mutex);
+			EXIT_IF(m_busy || m_offered);
+			m_quit = true;
+		}
+		m_wake.notify_all();
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+	RunAheadThread(const RunAheadThread&)            = delete;
+	RunAheadThread& operator=(const RunAheadThread&) = delete;
+
+	void Offer(void (*task)(void*), void* argument) {
+		{
+			std::lock_guard lock(m_mutex);
+			EXIT_IF(m_busy || m_offered);
+			m_task     = task;
+			m_argument = argument;
+			m_offered  = true;
+			m_stop.store(false, std::memory_order_release);
+		}
+		m_wake.notify_all();
+	}
+	// Thread_Gpu, holding the op lock.
+	bool Stop() {
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_offered) {
+				m_offered = false; // not taken yet
+				return false;
+			}
+			if (!m_busy) {
+				return false;
+			}
+			m_stop.store(true, std::memory_order_release);
+		}
+		// The task needs the op lock to reach its next op boundary.
+		OpLockRelease(0);
+		{
+			std::unique_lock    lock(m_mutex);
+			HangWatchdog::Scope wait("cp-par-runahead-stop", reinterpret_cast<uint64_t>(this));
+			m_idle.wait(lock, [this] { return !m_busy; });
+		}
+		return OpLockAcquire(0);
+	}
+	[[nodiscard]] bool StopRequested() const noexcept {
+		return m_stop.load(std::memory_order_acquire);
+	}
+
+private:
+	void Run() {
+		t_resolver2 = true;
+		KYTY_PROFILER_THREAD("CP resolver #2");
+		Common::RaiseCurrentThreadPriority();
+		std::unique_lock lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_offered || m_quit; });
+			if (m_quit) {
+				return;
+			}
+			m_offered           = false;
+			m_busy              = true;
+			const auto task     = m_task;
+			auto*      argument = m_argument;
+			lock.unlock();
+			task(argument);
+			lock.lock();
+			m_busy = false;
+			m_stop.store(false, std::memory_order_release);
+			m_idle.notify_all();
+		}
+	}
+
+	std::mutex              m_mutex;
+	std::condition_variable m_wake;
+	std::condition_variable m_idle;
+	bool                    m_offered  = false;
+	bool                    m_busy     = false;
+	bool                    m_quit     = false;
+	std::atomic<bool>       m_stop {false};
+	void (*m_task)(void*)              = nullptr;
+	void*                   m_argument = nullptr;
+	std::thread             m_thread;
+};
+
+std::unique_ptr<RunAheadThread> g_runahead;
+
+// Astro Bot PC (KYTY_CP_PAR=1b3): the quiet tails the sequencer published (PublishStreamEnd), a
+// few submissions deep (it may parse ahead of Thread_Gpu).
+struct TailSlot {
+	std::atomic<uint64_t> submission {0};
+	std::atomic<uint64_t> last_sync {0};
+};
+std::array<TailSlot, 16> g_tails;
+
+InsertHook g_insert_hook         = nullptr;
+void*      g_insert_hook_context = nullptr;
+
+// Overlap accounting (NoteBusy): which threads are busy, since when both are.
+std::mutex g_busy_mutex;
+uint32_t   g_busy_mask  = 0;
+uint64_t   g_both_since = 0;
+
 } // namespace
 
 Mode GetMode() {
@@ -238,10 +420,172 @@ Mode GetMode() {
 			            "command buffer wrapper and stream ring, executed in turn)\n");
 			return Mode::Serial1b2;
 		}
-		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2); off\n", value);
+		if (std::strcmp(value, "1b3") == 0) {
+			std::printf("Kyty CpPar: KYTY_CP_PAR=1b3 (as 1b2, and CP resolver #2 runs the next "
+			            "submission's leading draws ahead, op by op under the CP op lock)\n");
+			return Mode::Concurrent1b3;
+		}
+		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2, 1b3); off\n",
+		            value);
 		return Mode::Off;
 	}();
 	return mode;
+}
+
+bool VerifyEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_PAR_VERIFY");
+		const bool  on    = value != nullptr && std::strcmp(value, "1") == 0;
+		if (on && GetMode() == Mode::Concurrent1b3) {
+			std::printf("Kyty CpPar: KYTY_CP_PAR_VERIFY=1 (stop at the first insertion)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+// ---- Astro Bot PC (KYTY_CP_PAR=1b3) ----
+
+bool RunAheadDirty() noexcept {
+	return g_runahead_dirty.load(std::memory_order_acquire);
+}
+
+void SetRunAheadDirty(bool dirty) noexcept {
+	g_runahead_dirty.store(dirty, std::memory_order_release);
+}
+
+bool OpLockAcquire(uint32_t who) {
+	// A busy thread is idle while it waits for the lock (overlap statistics).
+	const bool busy = t_busy;
+	if (busy) {
+		NoteBusy(who, false);
+	}
+	const bool changed = GetOpLock().Acquire(who);
+	if (busy) {
+		NoteBusy(who, true);
+	}
+	return changed;
+}
+
+void OpLockRelease(uint32_t who) {
+	GetOpLock().Release(who);
+}
+
+void StartRunAheadThread() {
+	EXIT_IF(g_resolver2 != nullptr || g_runahead != nullptr);
+	g_runahead = std::make_unique<RunAheadThread>();
+	std::printf("Kyty CpPar: CP resolver #2 started (run-ahead)\n");
+}
+
+void OfferRunAhead(void (*task)(void*), void* argument) {
+	EXIT_IF(g_runahead == nullptr);
+	g_runahead->Offer(task, argument);
+}
+
+bool StopRunAhead() {
+	if (g_runahead != nullptr) {
+		return g_runahead->Stop();
+	}
+	return false;
+}
+
+bool RunAheadStopRequested() noexcept {
+	return g_runahead != nullptr && g_runahead->StopRequested();
+}
+
+void PublishStreamEnd(uint64_t submission, uint64_t last_sync) {
+	auto& slot = g_tails[submission % g_tails.size()];
+	slot.submission.store(0, std::memory_order_release);
+	slot.last_sync.store(last_sync, std::memory_order_release);
+	slot.submission.store(submission, std::memory_order_release);
+}
+
+bool TailQuiet(uint64_t submission, uint64_t next_op) noexcept {
+	auto& slot = g_tails[submission % g_tails.size()];
+	if (slot.submission.load(std::memory_order_acquire) != submission) {
+		return false;
+	}
+	const auto last_sync = slot.last_sync.load(std::memory_order_acquire);
+	// Re-checked: the slot was not reused for a later submission meanwhile.
+	return slot.submission.load(std::memory_order_acquire) == submission && next_op >= last_sync;
+}
+
+void SetInsertHook(InsertHook hook, void* context) {
+	g_insert_hook         = hook;
+	g_insert_hook_context = context;
+}
+
+void BeforeNativeSubmit() {
+	if (!RunAheadDirty() || g_insert_hook == nullptr) {
+		return;
+	}
+	g_insert_hook(g_insert_hook_context, static_cast<uint32_t>(OnResolver2()
+	                                                                ? Insertion::RunAheadSubmit
+	                                                                : Insertion::OldestSubmit));
+}
+
+void BeforeRecorderDrain() {
+	// Thread_Gpu's drains reach its marker (its ring is the one being replayed).
+	if (!OnResolver2() || !RunAheadDirty() || g_insert_hook == nullptr) {
+		return;
+	}
+	g_insert_hook(g_insert_hook_context, static_cast<uint32_t>(Insertion::RunAheadDrain));
+}
+
+void NotePromotion(Promotion reason) {
+	GetStats().promotions[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteRunAheadStart() {
+	GetStats().runahead_starts.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteRunAheadOp(uint64_t ns) {
+	GetStats().runahead_ns.fetch_add(ns, std::memory_order_relaxed);
+	GetStats().runahead_ops.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteMerge(uint64_t fixups, uint64_t impossible, uint64_t images) {
+	auto& stats = GetStats();
+	stats.merges.fetch_add(1, std::memory_order_relaxed);
+	stats.merge_fixups.fetch_add(fixups, std::memory_order_relaxed);
+	stats.merge_impossible.fetch_add(impossible, std::memory_order_relaxed);
+	stats.merge_images.fetch_add(images, std::memory_order_relaxed);
+}
+
+void NoteInsertion(Insertion trigger, uint64_t fixups, uint64_t impossible, uint64_t images) {
+	auto& stats = GetStats();
+	static constexpr const char* names[] = {"a native submit of the oldest context",
+	                                        "a native submit of the run-ahead",
+	                                        "a recorder drain of the run-ahead"};
+	const auto index = static_cast<size_t>(trigger);
+	if (VerifyEnabled()) {
+		EXIT("Kyty CpPar: KYTY_CP_PAR_VERIFY=1: insertion forced by %s (the run-ahead's ops so far "
+		     "are recorded before the oldest submission's remaining work)\n",
+		     names[index]);
+	}
+	if (stats.insertions[index].fetch_add(1, std::memory_order_relaxed) == 0) {
+		std::printf("Kyty CpPar: first insertion forced by %s (data order of the overlap "
+		            "inverted; counted in \"CpPar 10s: 1b3\")\n",
+		            names[index]);
+	}
+	stats.insertion_fixups.fetch_add(fixups, std::memory_order_relaxed);
+	stats.merge_impossible.fetch_add(impossible, std::memory_order_relaxed);
+	stats.merge_images.fetch_add(images, std::memory_order_relaxed);
+}
+
+void NoteBusy(uint32_t who, bool busy) {
+	t_busy              = busy;
+	const uint32_t  bit = who != 0 ? 2u : 1u;
+	std::lock_guard lock(g_busy_mutex);
+	const bool      both_before = g_busy_mask == 3u;
+	g_busy_mask                 = busy ? (g_busy_mask | bit) : (g_busy_mask & ~bit);
+	const bool both_after       = g_busy_mask == 3u;
+	if (!both_before && both_after) {
+		g_both_since = NowNs();
+	} else if (both_before && !both_after) {
+		GetStats().overlap_ns.fetch_add(NowNs() - g_both_since, std::memory_order_relaxed);
+	}
 }
 
 uint64_t NowNs() {
@@ -258,10 +602,11 @@ void Start(const Hooks& hooks) {
 
 void Stop() {
 	g_resolver2.reset();
+	g_runahead.reset(); // Astro Bot PC (KYTY_CP_PAR=1b3)
 }
 
 bool Started() {
-	return g_resolver2 != nullptr;
+	return g_resolver2 != nullptr || g_runahead != nullptr;
 }
 
 void RunSlice(Task task, void* argument) {
@@ -421,7 +766,46 @@ void MaybeReport() {
 		            values[0][0], values[0][1], values[0][2], values[0][3], values[1][0],
 		            values[1][1], values[1][2], values[1][3]);
 	}
-	if (StreamsActive()) {
+	if (Concurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3): the run-ahead over the last 10 s.
+		uint64_t p[static_cast<size_t>(Promotion::Count)] = {};
+		for (size_t i = 0; i < std::size(p); i++) {
+			p[i] = take(stats.promotions[i]);
+		}
+		uint64_t ins[static_cast<size_t>(Insertion::Count)] = {};
+		for (size_t i = 0; i < std::size(ins); i++) {
+			ins[i] = take(stats.insertions[i]);
+		}
+		const auto starts     = take(stats.runahead_starts);
+		const auto ops        = take(stats.runahead_ops);
+		const auto merges     = take(stats.merges);
+		const auto fixups     = take(stats.merge_fixups);
+		const auto impossible = take(stats.merge_impossible);
+		const auto images     = take(stats.merge_images);
+		const auto ins_fixups = take(stats.insertion_fixups);
+		const auto wait_a     = take(stats.lock_wait_ns[0]);
+		const auto wait_b     = take(stats.lock_wait_ns[1]);
+		const auto takes_a    = take(stats.lock_takes[0]);
+		const auto takes_b    = take(stats.lock_takes[1]);
+		const auto overlap    = take(stats.overlap_ns);
+		const auto ops_ns     = take(stats.runahead_ns);
+		std::printf("CpPar 10s: 1b3: run-ahead %" PRIu64 " starts, %" PRIu64 " ops (%.2f ms "
+		            "holding the op lock); overlap %.2f ms; "
+		            "promotions: stream-end %" PRIu64 ", lockstep %" PRIu64 ", write %" PRIu64
+		            ", flip %" PRIu64 ", indirect %" PRIu64 ", inherit %" PRIu64
+		            ", no-registers %" PRIu64 ", ring %" PRIu64 ", stop %" PRIu64 "; merges %" PRIu64
+		            " (%" PRIu64 " overlay images, fix-ups %" PRIu64 " + %" PRIu64
+		            " at insertions, impossible %" PRIu64 "); insertions: oldest submit %" PRIu64
+		            ", run-ahead submit %" PRIu64 ", run-ahead drain %" PRIu64
+		            "; op lock: Thread_Gpu %" PRIu64 " takes, %.2f ms waiting; resolver #2 %" PRIu64
+		            " takes, %.2f ms waiting\n",
+		            starts, ops, static_cast<double>(ops_ns) / 1e6, static_cast<double>(overlap) / 1e6,
+		            p[0], p[1], p[2], p[3], p[4], p[5],
+		            p[6], p[7], p[8], merges, images, fixups, ins_fixups, impossible, ins[0], ins[1],
+		            ins[2], takes_a, static_cast<double>(wait_a) / 1e6, takes_b,
+		            static_cast<double>(wait_b) / 1e6);
+	}
+	if (StreamsActive() && !Concurrent()) {
 		// Astro Bot PC (KYTY_CP_PAR=1b2): each context's recording target over the last 10 s.
 		uint64_t s[2][6] = {};
 		for (size_t c = 0; c < 2; c++) {

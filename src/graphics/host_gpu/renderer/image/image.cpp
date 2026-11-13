@@ -22,6 +22,7 @@
 #include <numeric>
 #include <set>
 #include <tuple>
+#include <unordered_map> // Astro Bot PC (KYTY_CP_PAR=1b3)
 #include <vector>
 #include <xxhash.h>
 
@@ -294,6 +295,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
+	CpParTouch(); // Astro Bot PC (KYTY_CP_PAR=1b3): the run-ahead's overlay state
 	// Astro Bot PC (KYTY_CP_PAR=1b2): the state this access found and the one it leaves, on every
 	// return (cpParallel.h, image state bookkeeping).
 	struct CpParNote {
@@ -305,7 +307,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			}
 		}
 	} cp_par_note;
-	if (CpPar::StreamsActive()) {
+	if (CpPar::HashBookActive()) {
 		cp_par_note.image  = this;
 		cp_par_note.before = CpParStateHash();
 	}
@@ -443,6 +445,7 @@ bool Image::TransitIsNoOp(vk::ImageLayout                             destinatio
 	// GetBarriers' conditions, in its order: per-subresource states or a partial range take its
 	// per-subresource path (which may create those states); otherwise it returns before changing
 	// anything exactly when the layout and access match and the access includes no write.
+	CpParTouch(); // Astro Bot PC (KYTY_CP_PAR=1b3)
 	if (!backing.subresource_states.empty()) {
 		return false;
 	}
@@ -469,7 +472,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	                                                      range);
 	if (predicted && skip.verify == 0) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageTransitSkips);
-		if (CpPar::StreamsActive()) {
+		if (CpPar::HashBookActive()) {
 			// Astro Bot PC (KYTY_CP_PAR=1b2): an access that found the state it needs.
 			const auto hash = CpParStateHash();
 			CpPar::NoteImageState(this, hash, hash);
@@ -1151,10 +1154,172 @@ uint64_t Image::HashGuestEdges() const {
 	return XXH3_64bits(bytes.data(), static_cast<size_t>(head_size + tail_size));
 }
 
+// ---- Astro Bot PC (KYTY_CP_PAR=1b3, image.h): the run-ahead's image state overlay ----
+namespace {
+
+struct CpParOverlayState {
+	VulkanImageState              state;
+	std::vector<VulkanImageState> subresources;
+};
+
+struct CpParOverlayEntry {
+	CpParOverlayState entry;   // the global state at the first touch (the entry requirement)
+	CpParOverlayState current; // the run-ahead's state between its ops
+	CpParOverlayState saved;   // the global state while the run-ahead's is swapped in
+	bool              swapped = false;
+};
+
+struct CpParOverlay {
+	std::mutex                                  mutex; // ~Image may run on another thread
+	std::unordered_map<Image*, CpParOverlayEntry> entries;
+	std::vector<Image*>                         swapped;
+	std::atomic<size_t>                         size {0};
+};
+
+CpParOverlay& GetCpParOverlay() {
+	static CpParOverlay overlay;
+	return overlay;
+}
+
+} // namespace
+
+void Image::CpParTouchSlow() {
+	auto&           overlay = GetCpParOverlay();
+	std::lock_guard lock(overlay.mutex);
+	auto [found, inserted] = overlay.entries.try_emplace(this);
+	auto& entry            = found->second;
+	if (inserted) {
+		// The entry requirement: what the run-ahead finds now (the global state, which the oldest
+		// context may still change before the merge).
+		entry.entry   = {backing.state, backing.subresource_states};
+		entry.current = entry.entry;
+		overlay.size.store(overlay.entries.size(), std::memory_order_relaxed);
+	}
+	if (entry.swapped) {
+		return;
+	}
+	entry.saved.state        = backing.state;
+	entry.saved.subresources = std::move(backing.subresource_states);
+	backing.state            = entry.current.state;
+	backing.subresource_states = entry.current.subresources;
+	entry.swapped            = true;
+	overlay.swapped.push_back(this);
+	if (!inserted) {
+		NoteImageStateChange(); // another context's view of the image (draw-run image checks)
+	}
+}
+
+void Image::CpParEndOp() {
+	auto& overlay = GetCpParOverlay();
+	if (overlay.size.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	std::lock_guard lock(overlay.mutex);
+	for (auto* image: overlay.swapped) {
+		const auto found = overlay.entries.find(image);
+		if (found == overlay.entries.end()) {
+			continue; // destroyed during the op
+		}
+		auto& entry                       = found->second;
+		entry.current.state               = image->backing.state;
+		entry.current.subresources        = std::move(image->backing.subresource_states);
+		image->backing.state              = entry.saved.state;
+		image->backing.subresource_states = std::move(entry.saved.subresources);
+		entry.saved.subresources.clear();
+		entry.swapped = false;
+	}
+	if (!overlay.swapped.empty()) {
+		NoteImageStateChange();
+	}
+	overlay.swapped.clear();
+}
+
+void Image::CpParFixUpBarriers(const VulkanImageState&              entry,
+                               const std::vector<VulkanImageState>& entry_subresources,
+                               Barriers& fixups, uint64_t& impossible) const {
+	const auto& state = backing.state;
+	const auto& subs  = backing.subresource_states;
+	const auto  differ = [](const VulkanImageState& a, const VulkanImageState& b) {
+		// The guest flag only decides later barriers (repeated guest writes): no barrier for it.
+		return a.layout != b.layout || a.access_mask != b.access_mask || a.pl_stage != b.pl_stage;
+	};
+	const auto barrier = [&](const VulkanImageState& from, const VulkanImageState& to,
+	                         uint32_t level, uint32_t level_count, uint32_t layer,
+	                         uint32_t layer_count) {
+		if (to.layout == vk::ImageLayout::eUndefined && from.layout != vk::ImageLayout::eUndefined) {
+			impossible++; // the run-ahead discards contents the oldest context gave the image
+			return;
+		}
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask                    = from.pl_stage;
+		b.srcAccessMask                   = from.access_mask;
+		b.dstStageMask                    = to.pl_stage;
+		b.dstAccessMask                   = to.access_mask;
+		b.oldLayout                       = from.layout;
+		b.newLayout                       = to.layout;
+		b.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		b.image                           = backing.image;
+		b.subresourceRange.aspectMask     = FullAspectMask(backing.format);
+		b.subresourceRange.baseMipLevel   = level;
+		b.subresourceRange.levelCount     = level_count;
+		b.subresourceRange.baseArrayLayer = layer;
+		b.subresourceRange.layerCount     = layer_count;
+		fixups.push_back(b);
+	};
+	if (backing.image == nullptr) {
+		return;
+	}
+	if (subs.empty() && entry_subresources.empty()) {
+		if (differ(state, entry)) {
+			barrier(state, entry, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS);
+		}
+		return;
+	}
+	const uint32_t layers = info.resources.layers;
+	const uint32_t count  = info.resources.levels * layers;
+	for (uint32_t index = 0; index < count; index++) {
+		const auto& from = subs.empty() ? state : (index < subs.size() ? subs[index] : state);
+		const auto& to   = entry_subresources.empty()
+		                       ? entry
+		                       : (index < entry_subresources.size() ? entry_subresources[index] : entry);
+		if (differ(from, to)) {
+			barrier(from, to, index / layers, 1, index % layers, 1);
+		}
+	}
+}
+
+void Image::CpParMergeOverlay(Barriers& fixups, uint64_t& images, uint64_t& impossible) {
+	auto&           overlay = GetCpParOverlay();
+	std::lock_guard lock(overlay.mutex);
+	EXIT_IF(!overlay.swapped.empty());
+	for (auto& [image, entry]: overlay.entries) {
+		EXIT_IF(entry.swapped);
+		images++;
+		image->CpParFixUpBarriers(entry.entry.state, entry.entry.subresources, fixups, impossible);
+		image->backing.state              = entry.current.state;
+		image->backing.subresource_states = std::move(entry.current.subresources);
+		NoteImageStateChange();
+	}
+	overlay.entries.clear();
+	overlay.size.store(0, std::memory_order_relaxed);
+}
+
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
-	if (CpPar::StreamsActive()) {
+	if (CpPar::HashBookActive()) {
 		CpPar::ForgetImage(this); // Astro Bot PC (KYTY_CP_PAR=1b2)
+	}
+	if (CpPar::Concurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3): out of the run-ahead's overlay.
+		auto& overlay = GetCpParOverlay();
+		if (overlay.size.load(std::memory_order_relaxed) != 0) {
+			std::lock_guard lock(overlay.mutex);
+			if (overlay.entries.erase(this) != 0) {
+				overlay.size.store(overlay.entries.size(), std::memory_order_relaxed);
+			}
+			std::erase(overlay.swapped, this);
+		}
 	}
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {

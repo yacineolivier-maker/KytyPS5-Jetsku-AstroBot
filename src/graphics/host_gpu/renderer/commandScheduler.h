@@ -121,6 +121,8 @@ public:
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
+	// Astro Bot PC (KYTY_CP_PAR=1b3): the calling thread's wrapper names a native buffer.
+	[[nodiscard]] bool CurrentValid() const noexcept { return !Cmd().IsInvalid(); }
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	// KYTY_EOP_TIMESTAMPS=gpu: the guest timestamp query ring; null in record mode.
 	[[nodiscard]] EopTimestampRing* GuestTimestamps() const noexcept { return m_eop_timestamps.get(); }

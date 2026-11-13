@@ -564,19 +564,43 @@ public:
 	// access pair of the old and new scopes can conflict (see KYTY_DEPTH_FEEDBACK_KEEP).
 	void AdoptState(vk::PipelineStageFlags2 stage, vk::AccessFlags2 access,
 	                vk::ImageLayout layout) noexcept {
-		const uint64_t before = CpPar::StreamsActive() ? CpParStateHash() : 0; // Astro Bot PC
+		CpParTouch(); // Astro Bot PC (KYTY_CP_PAR=1b3)
+		const uint64_t before = CpPar::HashBookActive() ? CpParStateHash() : 0; // Astro Bot PC
 		backing.state = {stage, access, layout};
 		NoteImageStateChange();
-		if (CpPar::StreamsActive()) {
+		if (CpPar::HashBookActive()) {
 			CpPar::NoteImageState(this, before, CpParStateHash()); // Astro Bot PC (KYTY_CP_PAR=1b2)
 		}
 	}
 	// Astro Bot PC (KYTY_CP_PAR=1b2, cpParallel.h): a hash of the tracked state (state and
 	// per-subresource states) that layout transitions read and change.
 	[[nodiscard]] uint64_t CpParStateHash() const noexcept;
+	// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the run-ahead's image state overlay. Every code
+	// that reads or changes backing.state / backing.subresource_states calls CpParTouch first: on
+	// a run-ahead op before its merge (CpPar::t_overlay), the image's first touch records its entry
+	// requirement (the global state then) and, at every op's first touch, the run-ahead's own state
+	// is swapped in (the global one saved). CpParEndOp (end of every run-ahead op, op lock held)
+	// swaps the global states back. CpParMergeOverlay (no run-ahead op in progress, op lock held):
+	// appends to `fixups` the barriers from each overlay image's global state (what the oldest
+	// context left) to its entry requirement, then makes the run-ahead's states the global ones and
+	// clears the overlay; counts the images, and the subresources whose entry requirement is
+	// "undefined" against defined contents (no barrier can express it: left out).
+	void CpParTouch() const noexcept {
+		if (CpPar::g_concurrent && CpPar::t_overlay) [[unlikely]] {
+			const_cast<Image*>(this)->CpParTouchSlow();
+		}
+	}
+	static void CpParEndOp();
+	static void CpParMergeOverlay(Barriers& fixups, uint64_t& images, uint64_t& impossible);
+	// Fix-up barriers of this image from its current state to `entry` (and `entry_subresources`).
+	void CpParFixUpBarriers(const VulkanImageState&              entry,
+	                        const std::vector<VulkanImageState>& entry_subresources,
+	                        Barriers& fixups, uint64_t& impossible) const;
 
 private:
 	friend struct ImageTestAccess;
+
+	void CpParTouchSlow(); // Astro Bot PC (KYTY_CP_PAR=1b3)
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	void                                      CopyImageRegions(Image& source);

@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR=1b3)
+
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
 #include "common/hangTrace.h"
@@ -740,6 +742,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	const CpGaps::Scope gap(CpGaps::Cat::Flush);
 	HangWatchdog::NoteSubmission();
+	if (m_dual && CpPar::Concurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3): the run-ahead's unmerged packets are merged first.
+		CpPar::BeforeNativeSubmit();
+	}
 	auto& command = Cmd(); // Astro Bot PC (KYTY_CP_PAR=1b2): the calling thread's context
 	EXIT_IF(command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||

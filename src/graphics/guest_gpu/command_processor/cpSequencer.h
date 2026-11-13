@@ -92,6 +92,9 @@ private:
 struct Intake {
 	uint64_t                  sequence    = 0; // GuestGpu admission sequence
 	uint64_t                  frame_fence = 0;
+	// Astro Bot PC (KYTY_CP_PAR=1b3) : premiere soumission admise avec cette meme barriere d'image. Ses
+	// soeurs peuvent etre lues des que celle-ci a demarre (la barriere porte sur l'image precedente).
+	uint64_t                  fence_first = 0;
 	std::span<const uint32_t> commands;
 	std::span<const uint32_t> constant_commands;
 	bool                      graphics        = true; // false: a CPU flip preparation
@@ -122,6 +125,9 @@ public:
 	// Every op before `next_op` has executed (and released its snapshot and window slot).
 	void NoteExecuted(uint64_t next_op);
 	void NoteHandoffDone(uint64_t submission);
+	// Astro Bot PC (KYTY_CP_PAR=1b3): a resolver freed window or snapshot slots without moving the
+	// executed-op counter (the run-ahead): a parked sequencer re-checks what it waits for.
+	void Poke() noexcept { Bump(); }
 	[[nodiscard]] SnapshotRing& Snapshots() noexcept { return m_snapshots; }
 	// Astro Bot PC (KYTY_CP_PAR=1b1, cpParallel.h): resolver context B's own snapshot ring, created
 	// before Start (CommandProcessor::AttachSequencer). Snapshots(1) is context B's ring when it

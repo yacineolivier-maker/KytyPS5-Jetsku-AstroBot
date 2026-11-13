@@ -993,6 +993,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                          "support; using the GENERAL layout\n");
 			}
 		}
+		image.CpParTouch(); // Astro Bot PC (KYTY_CP_PAR=1b3): the overlay state read below
 		auto layout = depth_attachment_layout(depth);
 		if (!sampled_aspects && DepthLayoutStableEnabled()) {
 			// Nothing in this draw samples the image, so its attachment layout is not observable:
@@ -2462,6 +2463,7 @@ RenderExecutor::DrawRunImage RenderExecutor::MakeDrawRunImage(ImageId id, bool t
 	if (image == nullptr) {
 		return mark;
 	}
+	image->CpParTouch(); // Astro Bot PC (KYTY_CP_PAR=1b3)
 	mark.image          = image->backing.image;
 	mark.stage          = image->backing.state.pl_stage;
 	mark.access         = image->backing.state.access_mask;
@@ -2525,6 +2527,9 @@ uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachme
 			continue;
 		}
 		const auto* image = images.try_get(mark.id);
+		if (image != nullptr) {
+			image->CpParTouch(); // Astro Bot PC (KYTY_CP_PAR=1b3)
+		}
 		uint32_t    field = 0;
 		if (image == nullptr) {
 			field = 1;
@@ -3199,6 +3204,9 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 			// can now adopt attachment_access | ShaderRead even for an unsampled attachment
 			// (AcquireRenderTargets). It must run normally to publish that union and its deferred
 			// ordering; this first draw cannot seed either a continuation or acquisition reuse.
+			if (depth != nullptr) {
+				depth->CpParTouch(); // Astro Bot PC (KYTY_CP_PAR=1b3)
+			}
 			if (depth != nullptr && depth->backing.state.access_mask == attachment_access &&
 			    depth->feedback_instance == run.rendering_serial &&
 			    depth->feedback_serial == depth->ContentSerial()) {

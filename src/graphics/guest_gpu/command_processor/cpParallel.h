@@ -2,7 +2,8 @@
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_CPPARALLEL_H_
 
 // Astro Bot PC (KYTY_CP_PAR), 13/11/2026: parallel translation of the command lists, stages 1a,
-// 1b-i, 1b-ii (docs\PLAN-PARALLELE.md). Plumbing only, no concurrency.
+// 1b-i, 1b-ii (docs\PLAN-PARALLELE.md), plumbing without concurrency; 1b-iii-a (1b3), op-level
+// concurrency under one lock.
 //
 // KYTY_CP_PAR unset or "0": off, the emulator behaves exactly as before (nothing here runs).
 // KYTY_CP_PAR=1a (requires KYTY_CP_SEQ=1): the queue-0 graphics submissions of a frame are
@@ -67,26 +68,78 @@
 // Fallbacks (the submission stays in context A, on Thread_Gpu) are counted by reason; a
 // "CpPar 10s: ..." console line reports them every 10 s with the submissions and resolving time
 // of each thread.
+//
+// KYTY_CP_PAR=1b3 (stage 1b-iii-a; needs what 1b2 needs, otherwise runs as 1b1): real concurrency
+// of the two resolver threads, op by op, under one "CP op lock" (OpLockAcquire below) that
+// serializes every op touching the renderer (the caches stay serialized, as with the renderer
+// lock). Design "run-ahead":
+//  - Thread_Gpu resolves every queue-0 submission in queue order, as without KYTY_CP_PAR (both
+//    contexts; a context = op ring, draw-prep window, snapshot ring, recorder stream and
+//    CommandBuffer wrapper of its submissions). It is always the OLDEST context and holds the op
+//    lock all the time, except at its interleave points (below) and while it waits for the
+//    run-ahead to stop.
+//  - CP resolver #2 is the RUN-AHEAD: while Thread_Gpu resolves submission N, it executes the
+//    leading ops of submission N + 1 when N + 1 is admitted and belongs to the other context
+//    (ranks alternate), each op under the op lock. It executes only "free" ops: StreamBegin,
+//    SkipSlots, direct draws and direct dispatches that carry their registers (snapshot or
+//    draw-prep slot) and do not inherit the instance count. At its first other op it stops (a
+//    "promotion": that op and the rest of N + 1 are executed by Thread_Gpu, after N has been
+//    merged, i.e. serially and in admission order). Thread_Gpu takes N + 1 over (hand-over) when it
+//    reaches it in the queue.
+//  - Thread_Gpu releases the op lock between two of its ops only while N's remaining ops are known
+//    (the sequencer emitted N's StreamEnd) and contain no op that may submit the native command
+//    buffer on purpose, wait, flip, write guest memory the run-ahead may read or need a service
+//    command (TailQuiet: only direct draws and dispatches, end-of-pipe / RELEASE_MEM / EVENT_WRITE
+//    but occlusion dumps). Meanwhile its optional submits (idle flushes, batched end-of-pipe
+//    flushes, eager readback flushes), slice yields and service commands are deferred. So A and B
+//    interleave op by op in N's "quiet tail".
+//  - Recording order = admission order: the run-ahead records into its own recorder ring, after
+//    that ring's last Switch; the replay reaches it only when N's segment ends (the merge at N's
+//    StreamEnd: Switch into the run-ahead's ring). Image layouts: while it runs ahead, every image
+//    the run-ahead touches gets a per-context overlay (Image::CpParTouch: its entry requirement,
+//    the global state at the first touch, and its own current state, swapped in for each of its
+//    ops); at the merge, a fix-up barrier from the state N left to each entry requirement (and one
+//    global memory barrier) is recorded at the end of N's segment, before the Switch, then the
+//    overlay's states become the global ones.
+//  - Ticks: the run-ahead's packets are replayed into the native buffer current at the merge,
+//    which is the one they were encoded for only if no native submit happened in between. A
+//    native submit while the run-ahead has unmerged packets (or a recorder drain by the run-ahead,
+//    which cannot reach its position otherwise) forces an "insertion": the run-ahead's packets so
+//    far are merged at that point (fix-ups, Switch to its ring, Switch back). Lifetimes and
+//    layouts stay exact; only the data order of N's remaining work and N + 1's ops so far is
+//    inverted. Insertions are counted; KYTY_CP_PAR_VERIFY=1 stops the emulator at the first one.
+//  - Not per context (serialized by the op lock instead): caches (buffer, texture, page),
+//    descriptor heap, occlusion counter, deferred operations, the RenderExecutor (its
+//    command-buffer shadows are forgotten whenever the op lock changes threads; draw-run
+//    continuations end then). Per context: the CP fields the resolver loop keeps across ops
+//    (swapped by the run-ahead around each of its ops). The sequencer's executed-op counter only
+//    follows Thread_Gpu; the run-ahead wakes the sequencer after each op (its window and snapshot
+//    slots) and the merge moves the counter past the run-ahead's ops. KYTY_STREAM_COPY_DEFER
+//    stays off (dual streams).
+// A "CpPar 10s: 1b3 ..." line reports the run-ahead (ops, overlap, promotions by reason, fix-ups,
+// insertions, op lock waits).
 
 #include <cstdint>
 
 namespace Libs::Graphics::CpPar {
 
-enum class Mode : uint8_t { Off, Serial1a, Serial1b1, Serial1b2 };
+enum class Mode : uint8_t { Off, Serial1a, Serial1b1, Serial1b2, Concurrent1b3 };
 
 // KYTY_CP_PAR, read once.
 [[nodiscard]] Mode GetMode();
 [[nodiscard]] inline bool Enabled() {
 	return GetMode() != Mode::Off;
 }
-// KYTY_CP_PAR=1b1 (and 1b2): context B has its own snapshot ring and draw-prep engine (see above).
+// KYTY_CP_PAR=1b1 (and 1b2, 1b3): context B has its own snapshot ring and draw-prep engine (see
+// above).
 [[nodiscard]] inline bool SeparateWindows() {
-	return GetMode() == Mode::Serial1b1 || GetMode() == Mode::Serial1b2;
+	return GetMode() == Mode::Serial1b1 || GetMode() == Mode::Serial1b2 ||
+	       GetMode() == Mode::Concurrent1b3;
 }
-// KYTY_CP_PAR=1b2 requested: context B records into its own target (see above). Whether it is
-// active (recorder requirements met) is StreamsActive().
+// KYTY_CP_PAR=1b2 (and 1b3) requested: context B records into its own target (see above).
+// Whether it is active (recorder requirements met) is StreamsActive().
 [[nodiscard]] inline bool SeparateStreams() {
-	return GetMode() == Mode::Serial1b2;
+	return GetMode() == Mode::Serial1b2 || GetMode() == Mode::Concurrent1b3;
 }
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): set once at start-up, before resolver #2 runs, when the two
@@ -95,6 +148,75 @@ inline bool g_streams_active = false;
 [[nodiscard]] inline bool StreamsActive() noexcept {
 	return g_streams_active;
 }
+// Astro Bot PC (KYTY_CP_PAR=1b2 only): the image state hash bookkeeping below runs (set with
+// g_streams_active; 1b3 tracks image states with its overlay instead).
+inline bool g_hash_book = false;
+[[nodiscard]] inline bool HashBookActive() noexcept {
+	return g_hash_book;
+}
+// Astro Bot PC (KYTY_CP_PAR=1b3): set once at start-up (two recording targets and the run-ahead
+// thread active), before Thread_Gpu starts.
+inline bool g_concurrent = false;
+[[nodiscard]] inline bool Concurrent() noexcept {
+	return g_concurrent;
+}
+// KYTY_CP_PAR_VERIFY=1 (1b3): stop at the first insertion (data-order inversion). Read once.
+[[nodiscard]] bool VerifyEnabled();
+// The calling thread executes a run-ahead op before its merge: image accesses use its overlay
+// (Image::CpParTouch).
+inline thread_local bool t_overlay = false;
+// The run-ahead has begun a recorder segment the replay has not reached ("dirty"): set and
+// cleared under the op lock; read by the native submit and drain hooks and by Thread_Gpu's
+// optional work (deferred while it is set).
+[[nodiscard]] bool RunAheadDirty() noexcept;
+void               SetRunAheadDirty(bool dirty) noexcept;
+
+// ---- KYTY_CP_PAR=1b3: the CP op lock (FIFO), the run-ahead thread and its statistics ----
+// who: 0 Thread_Gpu, 1 CP resolver #2. Returns true when the previous holder was the other one.
+bool OpLockAcquire(uint32_t who);
+void OpLockRelease(uint32_t who);
+// Thread_Gpu: CP resolver #2 runs `task(argument)` (the run-ahead) as soon as it is free.
+void OfferRunAhead(void (*task)(void*), void* argument);
+// Thread_Gpu, holding the op lock: the run-ahead stops at its next op boundary (or never starts);
+// returns once resolver #2 is idle, holding the op lock again.
+// Returns true when resolver #2 held the op lock meanwhile (as OpLockAcquire).
+bool StopRunAhead();
+// Resolver #2, inside the run-ahead task.
+[[nodiscard]] bool RunAheadStopRequested() noexcept;
+// Sequencer thread: submission `submission` is fully emitted; `last_sync` is the sequence + 1 of
+// its last op that is not quiet for the oldest context (0: none). Read by TailQuiet.
+void PublishStreamEnd(uint64_t submission, uint64_t last_sync);
+// Thread_Gpu: every op of `submission` from sequence `next_op` on is emitted and quiet.
+[[nodiscard]] bool TailQuiet(uint64_t submission, uint64_t next_op) noexcept;
+// Native submit (CommandScheduler::Submit) and recorder drain (CommandRecorder::Drain) hooks: an
+// insertion runs first when the run-ahead is dirty (see above).
+using InsertHook = void (*)(void* context, uint32_t trigger);
+void SetInsertHook(InsertHook hook, void* context);
+void BeforeNativeSubmit();
+void BeforeRecorderDrain();
+enum class Insertion : uint32_t { OldestSubmit, RunAheadSubmit, RunAheadDrain, Count };
+enum class Promotion : uint32_t {
+	StreamEnd,   // the submission's end (completion is Thread_Gpu's)
+	Lockstep,    // WAIT_REG_MEM, predication, COND_EXEC, branches, lockstep reads, flip waits
+	Write,       // labels, WRITE_DATA, DMA_DATA, clocks, LOD stats, constant RAM dumps
+	Flip,        // flips
+	Indirect,    // indirect draws and dispatches
+	Inherit,     // a draw inheriting the instance count (back state of earlier draws)
+	NoRegisters, // a draw or dispatch without its own registers (snapshot or prepared slot)
+	Ring,        // its recorder ring is half full (the replay cannot drain it before the merge)
+	Stop,        // hand-over, or the oldest submission ended first
+	Count,
+};
+void NotePromotion(Promotion reason);
+void NoteRunAheadStart();
+// A run-ahead op executed, holding the op lock for `ns`.
+void NoteRunAheadOp(uint64_t ns);
+// A merge (at the oldest's end) or an insertion: fix-up barriers recorded, fix-ups impossible
+// (entry requirement "undefined" against defined contents), overlay images.
+void NoteMerge(uint64_t fixups, uint64_t impossible, uint64_t images);
+void NoteInsertion(Insertion trigger, uint64_t fixups, uint64_t impossible, uint64_t images);
+// A thread starts (busy) or stops (idle) resolving: overlap accounting.
+void NoteBusy(uint32_t who, bool busy);
 // Image state bookkeeping (see above), any thread: `image` changed (or was found unchanged by
 // an access) from the state hashed as `before` to `after`. Attributed to the calling thread's
 // open segment (resolver #2: B; Thread_Gpu: A), else applied as an access outside segments.
@@ -125,6 +247,8 @@ using Task = void (*)(void* argument);
 
 // Starts "CP resolver #2" (GuestGpu, once, when 1a mode is active with the sequencer).
 void Start(const Hooks& hooks);
+// Astro Bot PC (KYTY_CP_PAR=1b3): starts CP resolver #2 as the run-ahead thread instead.
+void StartRunAheadThread();
 // Stops and joins it (GuestGpu::Shutdown, after Thread_Gpu returned).
 void Stop();
 [[nodiscard]] bool Started();

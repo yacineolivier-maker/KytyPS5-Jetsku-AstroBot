@@ -71,6 +71,13 @@ public:
 	[[nodiscard]] static uint32_t ThreadStream() noexcept;
 	// The calling thread's stream: ends its segment (the replay continues in the other ring).
 	void EndStreamSegment();
+	// Astro Bot PC (KYTY_CP_PAR=1b3): the calling thread's ring, bytes written but not released by
+	// the replay yet, and its capacity (its producer only).
+	[[nodiscard]] uint64_t StreamBacklog() noexcept {
+		auto& ring = ProducerRing();
+		return ring.WritePosition() - ring.Consumed();
+	}
+	[[nodiscard]] uint64_t StreamCapacity() noexcept { return ProducerRing().Capacity(); }
 	// Packets encoded so far by stream stream (its producer thread).
 	[[nodiscard]] uint64_t StreamPackets(uint32_t stream) const noexcept {
 		return stream != 0 && m_encoder_b != nullptr ? m_encoder_b->Packets() : m_encoder.Packets();

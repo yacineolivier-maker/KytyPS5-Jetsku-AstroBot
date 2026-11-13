@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR=1b3)
+
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
@@ -695,6 +697,11 @@ void CommandRecorder::Submit(const CommandStream::SubmitPacket& submit) {
 }
 
 void CommandRecorder::Drain(const void* site_key, bool is_site) {
+	if (m_encoder_b != nullptr && CpPar::Concurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3): a drain of the run-ahead cannot reach its unmerged
+		// position (cpParallel.h): an insertion merges it first.
+		CpPar::BeforeRecorderDrain();
+	}
 	const CpGaps::Scope gap(CpGaps::Cat::RecorderWait);
 	HangWatchdog::Scope wait("recorder-drain", reinterpret_cast<uint64_t>(this),
 	                         HangWatchdog::Enabled() ? m_ring.WritePosition() : 0,

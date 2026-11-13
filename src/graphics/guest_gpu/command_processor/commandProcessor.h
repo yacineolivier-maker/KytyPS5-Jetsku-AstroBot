@@ -261,6 +261,11 @@ public:
 	Pm4ProcessResult ResolveSubmission(Pm4Execution& execution, uint64_t submission,
 	                                   std::span<const uint32_t> commands, bool& handoff,
 	                                   uint32_t context = 0);
+	// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h), CP resolver #2: executes the leading free ops
+	// of `submission` (context `context`) ahead of Thread_Gpu, each under the CP op lock, until its
+	// first other op, a stop request or the oldest submission's end; returns why it stopped.
+	// Returns the reason as a CpPar::Promotion value.
+	uint32_t RunAheadSubmission(Pm4Execution& execution, uint64_t submission, uint32_t context);
 	// Astro Bot PC (KYTY_CP_PAR=1b1), statistics: the window totals (DrawPrep::Engine::WindowCounts)
 	// of resolver context `context`'s draw-prep engine; zeros without one.
 	void CpParWindowCounts(uint32_t context, uint64_t& published, uint64_t& retired) const;
@@ -599,6 +604,9 @@ private:
 	// parsing for (swapped with the two above when it switches context).
 	std::deque<uint64_t> m_published_ops_parked;
 	std::deque<uint64_t> m_snapshot_ops_parked;
+	// Astro Bot PC (KYTY_CP_PAR=1b3): sequencer, the sequence + 1 of the last op of the current
+	// submission that is not quiet for the oldest context (CpPar::PublishStreamEnd).
+	uint64_t m_cp_par_last_sync = 0;
 	// Resolver (GPU thread): the register files bound outside ops with a snapshot; the packet
 	// count of the last op (EOP flush batching); a suspended op that is retried (sequence + 1;
 	// the verifier compared it at its first execution).

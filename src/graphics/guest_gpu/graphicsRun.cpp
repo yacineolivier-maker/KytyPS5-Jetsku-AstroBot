@@ -39,6 +39,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/host_gpu/renderer/image/image.h" // Astro Bot PC (KYTY_CP_PAR=1b3)
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -87,6 +88,51 @@ static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 // KYTY_CP_SEQ=1: the sequencer thread (the graphics front); only it emits thread-mode ops.
 static thread_local bool g_sequencer_thread = false;
+
+// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the run-ahead's state. Every field is read and
+// written under the CP op lock, except the offer's constant fields (target*, submit_id: set by
+// Thread_Gpu before OfferRunAhead) and oldest_done (atomic: the run-ahead polls it unlocked).
+namespace {
+struct CpParRun {
+	// The ring the replay is in, which is Thread_Gpu's recording context, and the rings whose
+	// recorder segment is open (a ring that is not open has ended its segment with a Switch).
+	uint32_t            open  = 0;
+	std::array<bool, 2> begun = {true, false};
+	// The offer: Thread_Gpu resolves `oldest`, the run-ahead may run the leading ops of `target`.
+	bool              offered = false;
+	uint64_t          oldest  = 0;
+	std::atomic<bool> oldest_done {false};
+	std::atomic<bool> ended {false}; // the run-ahead task returned (Thread_Gpu stops interleaving)
+	uint64_t          target     = 0;
+	uint32_t          target_ctx = 0;
+	void*             target_sub = nullptr; // GuestGpu::Submission, in m_queues[0]
+	uint64_t          submit_id  = 0;       // the submit id Thread_Gpu will give the target
+	// The run-ahead's recorder segment is open and not reached by the replay (CpPar dirty).
+	bool     began   = false;
+	bool     started = false;
+	uint64_t next_op = 0; // sequence + 1 of its last executed op
+	// An insertion inside a run-ahead op: the replay returns to `back_ring` at the op's end.
+	bool     switch_back = false;
+	uint32_t back_ring   = 0;
+	// The CP fields its resolver loop keeps across ops, between its ops; Thread_Gpu adopts them
+	// when it continues the target (adopt_pending, set at the hand-over).
+	uint64_t resolver_packets = 0;
+	uint64_t retry_op         = 0;
+	bool     adopt_pending    = false;
+};
+CpParRun g_cp_par_run;
+// The resolver context of the calling thread's ops (CommandProcessor::ResolvePrep), 1b3 only.
+thread_local bool t_cp_par_resolve_b = false;
+} // namespace
+
+// Astro Bot PC (KYTY_CP_PAR=1b3): the op lock changed threads. The RenderExecutor's shadows of
+// the command buffer describe the other context's stream; a draw-run continuation must not cross.
+static void CpParNoteHolderChange(RenderContext& renderer) {
+	renderer.GetRenderExecutor().CpParForgetCommandShadows();
+	if (DrawRun::Enabled()) {
+		DrawRun::NoteForeignActivity("cp-par context switch");
+	}
+}
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -278,13 +324,35 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 				// Astro Bot PC (KYTY_CP_PAR=1b2, cpParallel.h): context B's own recording target.
 				if (m_renderer.GetCommandScheduler().EnableContextB()) {
 					CpPar::g_streams_active = true;
+					// Astro Bot PC (KYTY_CP_PAR=1b3): the run-ahead instead of the token; the image
+					// state hash bookkeeping is 1b2's only.
+					CpPar::g_concurrent = CpPar::GetMode() == CpPar::Mode::Concurrent1b3;
+					CpPar::g_hash_book  = !CpPar::g_concurrent;
 					std::printf("Kyty CpPar: context B records into its own command buffer wrapper "
-					            "and recorder ring (segments at every token hand-off)\n");
+					            "and recorder ring (%s)\n",
+					            CpPar::g_concurrent ? "segments per submission, replayed in admission order"
+					                                : "segments at every token hand-off");
 				} else {
-					std::printf("Kyty CpPar: KYTY_CP_PAR=1b2 needs KYTY_CP_RECORDER=1 without "
-					            "KYTY_CP_RECORDER_VERIFY; running as 1b1\n");
+					std::printf("Kyty CpPar: KYTY_CP_PAR=%s needs KYTY_CP_RECORDER=1 without "
+					            "KYTY_CP_RECORDER_VERIFY; running as 1b1\n",
+					            CpPar::GetMode() == CpPar::Mode::Concurrent1b3 ? "1b3" : "1b2");
 				}
 			}
+			if (CpPar::Concurrent()) {
+				// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h).
+				(void)CpPar::VerifyEnabled();
+				CpPar::SetInsertHook(
+				    [](void* context, uint32_t trigger) {
+					    static_cast<GuestGpu*>(context)->CpParInsert(trigger);
+				    },
+				    this);
+				CpPar::StartRunAheadThread();
+			}
+		}
+	}
+	if (CpPar::Enabled() && m_sequencer != nullptr && CpSeq::VerifyMode() == 0 &&
+	    !CpPar::Concurrent()) {
+		{
 			CpPar::Hooks hooks;
 			hooks.context = this;
 			hooks.take    = [](void* context) {
@@ -813,7 +881,8 @@ DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
 		m_draw_prep.reset(new DrawPrep::Engine(
 		    m_renderer,
 		    [] {
-			    if (g_gpu_state != nullptr) {
+			    // Astro Bot PC (KYTY_CP_PAR=1b3): not while the run-ahead is dirty (cpParallel.h).
+			    if (g_gpu_state != nullptr && !(CpPar::Concurrent() && CpPar::RunAheadDirty())) {
 				    g_gpu_state->ProcessCommands();
 			    }
 		    },
@@ -832,7 +901,9 @@ DrawPrep::Engine* CommandProcessor::EmitPrep() const {
 }
 
 DrawPrep::Engine* CommandProcessor::ResolvePrep() const {
-	return m_resolve_b && m_draw_prep_b != nullptr ? m_draw_prep_b.get() : m_draw_prep.get();
+	// Astro Bot PC (KYTY_CP_PAR=1b3): the calling thread's context (two resolvers at once).
+	const bool b = CpPar::Concurrent() ? t_cp_par_resolve_b : m_resolve_b;
+	return b && m_draw_prep_b != nullptr ? m_draw_prep_b.get() : m_draw_prep.get();
 }
 
 CpSeq::SnapshotRing& CommandProcessor::EmitSnapshots() const {
@@ -840,7 +911,8 @@ CpSeq::SnapshotRing& CommandProcessor::EmitSnapshots() const {
 }
 
 CpSeq::SnapshotRing& CommandProcessor::ResolveSnapshots() const {
-	return m_sequencer->Snapshots(m_resolve_b ? 1u : 0u);
+	const bool b = CpPar::Concurrent() ? t_cp_par_resolve_b : m_resolve_b; // Astro Bot PC (1b3)
+	return m_sequencer->Snapshots(b ? 1u : 0u);
 }
 
 void CommandProcessor::CpParWindowCounts(uint32_t context, uint64_t& published,
@@ -955,6 +1027,9 @@ static uint64_t SubmitMinIntervalNs() {
 static uint64_t g_last_submit_ns = 0;
 
 static bool OptionalSubmitAllowed() {
+	if (CpPar::Concurrent() && CpPar::RunAheadDirty()) {
+		return false; // Astro Bot PC (KYTY_CP_PAR=1b3): deferred while the run-ahead is dirty
+	}
 	const auto interval = SubmitMinIntervalNs();
 	if (interval == 0 || CpNowNs() - g_last_submit_ns >= interval) {
 		return true;
@@ -1037,6 +1112,11 @@ static uint32_t IdleFlushMinDraws() {
 }
 
 void CommandProcessor::MaybeFlushIdleGpu() {
+	if (CpPar::Concurrent() && (CpPar::OnResolver2() || CpPar::RunAheadDirty())) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3): no optional submit by the run-ahead, nor while it is
+		// dirty (cpParallel.h); the request stays pending.
+		return;
+	}
 	// A draw or dispatch just recorded writes a page the command processor reads back later (e.g.
 	// indirect arguments): submit it now, outside a rendering instance, so that read waits for
 	// this producer at most, not for everything recorded until then (KYTY_READBACK_EAGER).
@@ -1097,6 +1177,9 @@ static uint32_t GfxSliceDraws() {
 }
 
 void CommandProcessor::MaybeYieldSlice() {
+	if (CpPar::Concurrent() && CpPar::RunAheadDirty()) {
+		return; // Astro Bot PC (KYTY_CP_PAR=1b3): no slice end while the run-ahead is dirty
+	}
 	const auto limit = GfxSliceDraws();
 	if (limit == 0 || IsAsyncComputeQueue() || g_current_execution == nullptr ||
 	    g_gpu_state == nullptr || g_current_processor != this) {
@@ -1629,6 +1712,15 @@ void GuestGpu::Enqueue(Submission submission) {
 		CpSeq::Intake intake;
 		intake.sequence          = submission.sequence;
 		intake.frame_fence       = submission.frame_fence;
+		if (CpPar::Concurrent() && submission.frame_fence != 0) {
+			// Astro Bot PC (KYTY_CP_PAR=1b3) : sous m_queue_mutex, dans l'ordre d'admission.
+			static uint64_t last_fence = 0, first_seq = 0;
+			if (submission.frame_fence != last_fence) {
+				last_fence = submission.frame_fence;
+				first_seq  = submission.sequence;
+			}
+			intake.fence_first = first_seq;
+		}
 		intake.commands          = submission.commands;
 		intake.constant_commands = submission.constant_commands;
 		intake.graphics          = submission.type == SubmissionType::Graphics;
@@ -1675,6 +1767,11 @@ void GuestGpu::ThreadRun(void* data) {
 	(void)CpCommit::Parts();
 	// KYTY_RENDER_LOCK_ASYMMETRIC (RenderMutex): this thread is the renderer lock's owner.
 	gpu->m_renderer.GetMutex().BecomeOwner();
+	if (CpPar::Concurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): this thread holds the CP op lock except at
+		// its interleave points and while it waits for the run-ahead.
+		(void)CpPar::OpLockAcquire(0);
+	}
 
 	const bool wakeups       = CpWakeupsEnabled();
 	uint64_t   spin_deadline = 0; // 0: not spinning on blocked queues
@@ -1770,6 +1867,15 @@ void GuestGpu::ThreadRun(void* data) {
 					continue;
 				}
 				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
+				if (CpPar::Concurrent() && selected_queue == 0 && g_cp_par_run.offered &&
+				    g_cp_par_run.target == queue.front().sequence) {
+					// Astro Bot PC (KYTY_CP_PAR=1b3): the run-ahead's submission: it stops first
+					// (it may need the op lock to get there, never this mutex).
+					const auto front_sequence = queue.front().sequence;
+					gpu->m_queue_mutex.Unlock();
+					(void)gpu->CpParHandOver(front_sequence);
+					gpu->m_queue_mutex.Lock();
+				}
 				submission  = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
@@ -1779,6 +1885,13 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		if (should_stop) {
+			if (CpPar::Concurrent()) {
+				// Astro Bot PC (KYTY_CP_PAR=1b3): resolver #2 idle, the op lock released.
+				if (g_cp_par_run.offered) {
+					(void)gpu->CpParHandOver(g_cp_par_run.target);
+				}
+				CpPar::OpLockRelease(0);
+			}
 			gpu->m_gfx_cp->BufferWait();
 			// Deferred label writes still queued on the completion runner write the backing
 			// directly once commands are refused; finish them while this GuestGpu exists.
@@ -2065,6 +2178,15 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	if (!CpPar::Enabled()) {
 		result = cp.ResolveSubmission(submission.command_execution, submission.sequence,
 		                              submission.commands, handoff);
+	} else if (CpPar::Concurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): every submission on this thread (the
+		// oldest context), in its context's ring and recording target; the next one may run ahead.
+		CpParEnterSlice(submission);
+		CpParMaybeOffer(submission);
+		const auto start = CpPar::NowNs();
+		result = cp.ResolveSubmission(submission.command_execution, submission.sequence,
+		                              submission.commands, handoff, submission.cp_par_context);
+		CpPar::NoteResolveTime(0, CpPar::NowNs() - start); // Thread_Gpu's time
 	} else if (submission.cp_par_context == 0) {
 		// Astro Bot PC (KYTY_CP_PAR=1a): context A, on this thread, timed.
 		const auto start = CpPar::NowNs();
@@ -5046,7 +5168,7 @@ void CommandProcessor::AttachSequencer(CpSeq::Sequencer* sequencer) {
 			m_draw_prep_b.reset(new DrawPrep::Engine(
 			    m_renderer,
 			    [] {
-				    if (g_gpu_state != nullptr) {
+				    if (g_gpu_state != nullptr && !(CpPar::Concurrent() && CpPar::RunAheadDirty())) { // Astro Bot PC (1b3)
 					    g_gpu_state->ProcessCommands();
 				    }
 			    },
@@ -5217,6 +5339,37 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 		// P3c: speculative slots the real parse has not adopted by an ordering point are stale (a
 		// speculation stops at the first one); the resolver retires them before this op.
 		DropSpeculativeSlots();
+	}
+	if (CpPar::Concurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the quiet tail of this submission for the
+		// oldest context: after its last op that may submit on purpose, wait, flip, need a service
+		// command or write guest memory a later submission's draws may read at record time.
+		using CpSeq::OpKind;
+		bool quiet = false;
+		switch (kind) {
+			case OpKind::DrawIndex:
+			case OpKind::DrawAuto:
+			case OpKind::DispatchDirect:
+			case OpKind::EndOfPipe:
+			case OpKind::ReleaseMem:
+			case OpKind::StreamBegin:
+			case OpKind::StreamEnd:
+			case OpKind::ReadCheck: quiet = true; break;
+			case OpKind::EventWrite:
+				// Not an occlusion dump (queries, possible waits).
+				quiet = static_cast<const CpSeq::EventWriteOp*>(payload)->event_type != 0x39u;
+				break;
+			default: break;
+		}
+		if (kind == OpKind::StreamBegin) {
+			m_cp_par_last_sync = 0;
+		} else if (!quiet) {
+			m_cp_par_last_sync = sequence + 1u;
+		}
+		if (kind == OpKind::StreamEnd) {
+			CpPar::PublishStreamEnd(static_cast<const CpSeq::StreamEndOp*>(payload)->submission,
+			                        m_cp_par_last_sync);
+		}
 	}
 	(void)m_emit_ops->Emit(kind, payload, payload_size, data, data_size, // Astro Bot PC (KYTY_CP_PAR)
 	                  execution != nullptr ? execution->m_packets : 0,
@@ -5478,7 +5631,10 @@ bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
 	if (intake.graphics && intake.frame_fence != 0) {
 		// Ordering point (the frame fence): the command bytes of a fenced submission are read only
 		// once the resolver has started it, i.e. once the work the fence orders has completed.
-		if (!sequencer.Wait([&] { return sequencer.Started() >= intake.sequence; })) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3) : une soeur d'une soumission deja demarree avec la meme barriere peut
+		// etre lue tout de suite (sinon l'avance du second fil n'aurait jamais d'operations).
+		const uint64_t fence_wait = intake.fence_first != 0 ? intake.fence_first : intake.sequence;
+		if (!sequencer.Wait([&] { return sequencer.Started() >= fence_wait; })) {
 			return false;
 		}
 		m_pending_writes.clear();
@@ -5978,6 +6134,405 @@ static void RunOnGpuThreadScoped(Body& body) {
 	    &context);
 }
 
+// ---- Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the run-ahead ----------------------------
+
+// The fix-up barriers of the run-ahead's overlay (its states become the global ones) and one
+// global memory barrier, recorded in the calling thread's context (the end of the oldest
+// context's segment, before its Switch).
+static void CpParRecordFixUps(CommandScheduler& scheduler, uint64_t& fixups, uint64_t& images,
+                              uint64_t& impossible) {
+	Image::Barriers barriers;
+	Image::CpParMergeOverlay(barriers, images, impossible);
+	fixups = barriers.size();
+	if (!scheduler.Active() || !scheduler.CurrentValid()) {
+		// No native buffer to record into (never seen): counted as impossible fix-ups.
+		impossible += barriers.size();
+		fixups = 0;
+		return;
+	}
+	scheduler.EndRendering();
+	vk::MemoryBarrier2 memory {};
+	memory.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	memory.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	memory.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	memory.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount      = 1;
+	dependency.pMemoryBarriers         = &memory;
+	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
+	dependency.pImageMemoryBarriers    = barriers.data();
+	scheduler.Current().Sink().pipelineBarrier2(dependency);
+}
+
+void GuestGpu::CpParEnterSlice(const Submission& submission) {
+	auto&          run       = g_cp_par_run;
+	auto&          scheduler = m_renderer.GetCommandScheduler();
+	const uint32_t context   = submission.cp_par_context != 0 ? 1u : 0u;
+	// The run-ahead's submission is handed over before its first slice here.
+	EXIT_IF(run.offered && run.target == submission.sequence);
+	if (context != run.open) {
+		// The replay continues in this submission's ring: the open ring's segment ends (Switch).
+		EXIT_IF(run.begun[context] || run.began);
+		CommandRecorder::SetThreadStream(run.open);
+		(void)scheduler.EndContextSegment();
+		run.begun[run.open] = false;
+		run.open            = context;
+		CpParNoteHolderChange(m_renderer); // another wrapper from now on
+	}
+	CommandRecorder::SetThreadStream(context);
+	if (!run.begun[context]) {
+		scheduler.BeginContextSegment();
+		run.begun[context] = true;
+	}
+	t_cp_par_resolve_b = context != 0;
+}
+
+void GuestGpu::CpParMaybeOffer(const Submission& submission) {
+	auto& run = g_cp_par_run;
+	if (run.offered || submission.type != SubmissionType::Graphics || submission.handoff ||
+	    !submission.constant_commands.empty() || submission.queue_id != 0) {
+		return;
+	}
+	Submission* next = nullptr;
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		if (m_queues[0].empty()) {
+			return;
+		}
+		next = &m_queues[0].front();
+		// The next queue-0 submission, in the other context, not started, not fenced (its bytes are
+		// parsed only once it starts) and not a constant-engine one.
+		if (next->type != SubmissionType::Graphics || next->started || next->handoff ||
+		    !next->constant_commands.empty() ||
+		    (next->frame_fence != 0 && next->frame_fence != submission.frame_fence) || // meme image : lue deja
+		    (next->cp_par_context != 0) == (submission.cp_par_context != 0)) {
+			return;
+		}
+		// Admitted while this lock is held; its fields used below do not change until popped.
+		run.target     = next->sequence;
+		run.target_ctx = next->cp_par_context != 0 ? 1u : 0u;
+		run.target_sub = next;
+	}
+	run.offered = true;
+	run.oldest  = submission.sequence;
+	run.oldest_done.store(false, std::memory_order_relaxed);
+	run.ended.store(false, std::memory_order_relaxed);
+	run.submit_id        = m_submit_id + 1u;
+	run.began            = false;
+	run.started          = false;
+	run.next_op          = 0;
+	run.switch_back      = false;
+	run.resolver_packets = 0;
+	run.retry_op         = 0;
+	run.adopt_pending    = false;
+	CpPar::OfferRunAhead(&GuestGpu::CpParRunAheadTask, this);
+}
+
+bool GuestGpu::CpParHandOver(uint64_t front_sequence) {
+	auto& run = g_cp_par_run;
+	if (!run.offered || run.target != front_sequence) {
+		return false;
+	}
+	if (CpPar::StopRunAhead()) {
+		CpParNoteHolderChange(m_renderer);
+	}
+	// The oldest submission ended first (the queue front is the target): merged if it began.
+	EXIT_IF(run.began || run.switch_back);
+	run.offered       = false;
+	run.adopt_pending = run.started;
+	return true;
+}
+
+void GuestGpu::CpParMerge() {
+	auto& run = g_cp_par_run;
+	run.oldest_done.store(true, std::memory_order_release);
+	if (!run.began) {
+		return;
+	}
+	EXIT_IF(run.switch_back || run.target_ctx == run.open);
+	auto&    scheduler  = m_renderer.GetCommandScheduler();
+	uint64_t fixups     = 0;
+	uint64_t images     = 0;
+	uint64_t impossible = 0;
+	// The end of the oldest context's segment: fix-ups, then the Switch into the run-ahead's ring,
+	// which becomes this thread's recording context (both threads record there from now on).
+	CommandRecorder::SetThreadStream(run.open);
+	CpParRecordFixUps(scheduler, fixups, images, impossible);
+	(void)scheduler.EndContextSegment();
+	run.begun[run.open] = false;
+	run.open            = run.target_ctx;
+	CpParNoteHolderChange(m_renderer); // another wrapper from now on
+	CommandRecorder::SetThreadStream(run.open);
+	run.began = false;
+	CpPar::SetRunAheadDirty(false);
+	CpPar::NoteMerge(fixups, impossible, images);
+	// Every op before the run-ahead's next one has executed now.
+	if (run.next_op > m_sequencer->Executed()) {
+		m_sequencer->NoteExecuted(run.next_op);
+	}
+}
+
+void GuestGpu::CpParInsert(uint32_t trigger) {
+	auto& run = g_cp_par_run;
+	if (!run.began) {
+		return;
+	}
+	EXIT_IF(run.switch_back || run.target_ctx == run.open);
+	auto&      scheduler   = m_renderer.GetCommandScheduler();
+	const bool in_op       = CpPar::OnResolver2();
+	const auto stream      = CommandRecorder::ThreadStream();
+	const auto oldest_ring = run.open;
+	if (in_op) {
+		// Inside a run-ahead op (a drain or a submit): its overlay states become the global ones
+		// below; the rest of the op runs on them.
+		Image::CpParEndOp();
+		CpPar::t_overlay = false;
+	}
+	uint64_t fixups     = 0;
+	uint64_t images     = 0;
+	uint64_t impossible = 0;
+	CommandRecorder::SetThreadStream(oldest_ring);
+	CpParRecordFixUps(scheduler, fixups, images, impossible);
+	(void)scheduler.EndContextSegment();
+	run.begun[oldest_ring] = false;
+	if (in_op) {
+		// The replay continues in the run-ahead's ring until its op ends (RunAheadSubmission
+		// switches back then).
+		run.open        = run.target_ctx;
+		run.switch_back = true;
+		run.back_ring   = oldest_ring;
+		CommandRecorder::SetThreadStream(run.target_ctx);
+	} else {
+		// The run-ahead is between ops: its segment ends too, and the oldest context's begins
+		// again (the run-ahead's next op begins a new segment).
+		CommandRecorder::SetThreadStream(run.target_ctx);
+		(void)scheduler.EndContextSegment();
+		run.begun[run.target_ctx] = false;
+		CommandRecorder::SetThreadStream(oldest_ring);
+		scheduler.BeginContextSegment();
+		run.begun[oldest_ring] = true;
+		CommandRecorder::SetThreadStream(stream);
+		m_renderer.GetRenderExecutor().CpParForgetCommandShadows();
+	}
+	run.began = false;
+	CpPar::SetRunAheadDirty(false);
+	CpPar::NoteInsertion(static_cast<CpPar::Insertion>(trigger), fixups, impossible, images);
+}
+
+void GuestGpu::CpParRunAheadTask(void* argument) {
+	auto* gpu = static_cast<GuestGpu*>(argument);
+	auto& run = g_cp_par_run;
+	auto* sub = static_cast<Submission*>(run.target_sub);
+	// The GPU thread's identity (IsGpuThread paths), without its services (g_gpu_state: service
+	// commands, slice yields and deferred-label waits stay Thread_Gpu's).
+	g_gpu_thread       = true;
+	g_gpu_state        = nullptr;
+	t_cp_par_resolve_b = run.target_ctx != 0;
+	CommandRecorder::SetThreadStream(run.target_ctx);
+	const auto reason =
+	    gpu->m_gfx_cp->RunAheadSubmission(sub->command_execution, sub->sequence, run.target_ctx);
+	CpPar::NotePromotion(static_cast<CpPar::Promotion>(reason));
+	run.ended.store(true, std::memory_order_release); // no more interleave points for it
+	g_gpu_thread = false;
+}
+
+// The op the run-ahead cannot execute ahead of the oldest context, by kind (cpParallel.h), or
+// Promotion::Count for a free op.
+static CpPar::Promotion RunAheadBlocker(CpSeq::OpKind kind, const void* payload) {
+	using CpPar::Promotion;
+	using CpSeq::OpKind;
+	switch (kind) {
+		case OpKind::StreamBegin:
+		case OpKind::SkipSlots: return Promotion::Count;
+		case OpKind::DrawIndex:
+		case OpKind::DrawAuto: {
+			const auto flags = kind == OpKind::DrawIndex
+			                       ? static_cast<const CpSeq::DrawIndexOp*>(payload)->flags
+			                       : static_cast<const CpSeq::DrawAutoOp*>(payload)->flags;
+			if ((flags & CpSeq::DrawFlagInheritInstances) != 0) {
+				return Promotion::Inherit;
+			}
+			if ((flags & (CpSeq::DrawFlagPublished | CpSeq::DrawFlagSnapshot)) == 0) {
+				return Promotion::NoRegisters;
+			}
+			return Promotion::Count;
+		}
+		case OpKind::DispatchDirect:
+			return (static_cast<const CpSeq::DispatchDirectOp*>(payload)->flags &
+			        CpSeq::DispatchFlagSnapshot) != 0
+			           ? Promotion::Count
+			           : Promotion::NoRegisters;
+		case OpKind::DrawIndirect:
+		case OpKind::DrawIndirectMulti:
+		case OpKind::DispatchIndirect: return Promotion::Indirect;
+		case OpKind::StreamEnd:
+		case OpKind::Handoff: return Promotion::StreamEnd;
+		case OpKind::Flip: return Promotion::Flip;
+		case OpKind::WaitRegMem:
+		case OpKind::WaitFlipDone:
+		case OpKind::Predication:
+		case OpKind::CondExec:
+		case OpKind::Branch:
+		case OpKind::LockstepRead: return Promotion::Lockstep;
+		default: return Promotion::Write;
+	}
+}
+
+uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t submission,
+                                              uint32_t context) {
+	using CpPar::Promotion;
+	KYTY_PROFILER_BLOCK("CommandProcessor::RunAhead");
+	EXIT_IF(!CpPar::Concurrent() || !CpPar::OnResolver2() || m_ops_b == nullptr);
+	auto& run       = g_cp_par_run;
+	auto& ops       = context != 0 ? *m_ops_b : *m_ops;
+	auto& sequencer = *m_sequencer;
+	auto& scheduler = GetScheduler();
+	struct Scope {
+		Scope(CommandProcessor& processor, Pm4Execution& execution)
+		    : previous_processor(g_current_processor), previous_execution(g_current_execution) {
+			g_current_processor = &processor;
+			g_current_execution = &execution;
+		}
+		~Scope() {
+			g_current_processor = previous_processor;
+			g_current_execution = previous_execution;
+		}
+		Scope(const Scope&)            = delete;
+		Scope& operator=(const Scope&) = delete;
+		CommandProcessor* previous_processor;
+		Pm4Execution*     previous_execution;
+	} scope(*this, execution);
+	for (uint32_t idle = 0;;) {
+		if (CpPar::RunAheadStopRequested() || run.oldest_done.load(std::memory_order_acquire)) {
+			return static_cast<uint32_t>(Promotion::Stop);
+		}
+		CpSeq::OpView view;
+		if (!ops.Peek(view)) {
+			// The sequencer has not produced it yet (it may still parse the oldest submission).
+			if ((++idle & 63u) != 0u) {
+#if defined(_M_X64) || defined(__x86_64__)
+				_mm_pause();
+#endif
+			} else if (idle < 4096u) {
+				std::this_thread::yield();
+			} else {
+				std::this_thread::sleep_for(std::chrono::microseconds(50));
+			}
+			continue;
+		}
+		idle               = 0;
+		const auto kind    = view.Kind();
+		const auto blocker = RunAheadBlocker(kind, view.payload);
+		if (blocker != Promotion::Count) {
+			return static_cast<uint32_t>(blocker);
+		}
+		if (CpPar::OpLockAcquire(1)) {
+			CpParNoteHolderChange(m_renderer);
+		}
+		// Busy (overlap statistics) while it holds the lock.
+		const auto op_start = CpPar::NowNs();
+		CpPar::NoteBusy(1, true);
+		auto release = [] {
+			CpPar::NoteBusy(1, false);
+			CpPar::OpLockRelease(1);
+		};
+		if (CpPar::RunAheadStopRequested() || run.oldest_done.load(std::memory_order_acquire)) {
+			release();
+			return static_cast<uint32_t>(Promotion::Stop);
+		}
+		// Its recorder ring is replayed only after the merge: keep half of it free.
+		if (auto* recorder = scheduler.Recorder();
+		    recorder != nullptr && recorder->StreamBacklog() > recorder->StreamCapacity() / 2u) {
+			release();
+			return static_cast<uint32_t>(Promotion::Ring);
+		}
+		if (!run.began) {
+			EXIT_IF(run.begun[context] || run.open == context);
+			scheduler.BeginContextSegment();
+			run.begun[context] = true;
+			run.began          = true;
+			CpPar::SetRunAheadDirty(true);
+			if (!run.started) {
+				run.started = true;
+				CpPar::NoteRunAheadStart();
+			}
+		}
+		// This context's CP resolver fields (Thread_Gpu's are saved, it is between ops).
+		const auto saved_packets   = m_resolver_packets;
+		const auto saved_retry     = m_retry_op;
+		const auto saved_submit_id = m_submit_id;
+		m_resolver_packets         = run.resolver_packets;
+		m_retry_op                 = run.retry_op;
+		m_submit_id                = run.submit_id;
+		CpPar::t_overlay           = true;
+		const auto  sequence       = view.header->sequence;
+		const auto  packet         = view.header->packet;
+		const auto& header         = *view.header;
+		if ((header.flags & CpSeq::FlagAdvanceEpoch) != 0) {
+			SyncEpoch::Advance();
+		}
+		if (packet > m_resolver_packets) {
+			m_resolver_packets = packet; // no end-of-pipe flush here (Thread_Gpu's)
+		}
+		if (kind == CpSeq::OpKind::StreamBegin) {
+			const auto& begin = view.As<CpSeq::StreamBeginOp>();
+			EXIT_IF(begin.submission != submission || begin.state != 0);
+			ParCensus::NoteBegin(submission); // Astro Bot PC : KYTY_CP_PAR_CENSUS
+			m_resolver_packets = 0;
+			m_retry_op         = 0;
+			ops.Pop();
+		} else if (kind == CpSeq::OpKind::SkipSlots) {
+			EXIT_IF(ResolvePrep() == nullptr);
+			ResolvePrep()->SkipPublished(view.As<CpSeq::SkipSlotsOp>().count);
+			ops.Pop();
+		} else {
+			auto*                             snapshot = OpSnapshot(kind, view.payload);
+			CommandScheduler::RegisterBinding previous {};
+			if (snapshot != nullptr) {
+				previous = scheduler.BindRegisters(snapshot->context, snapshot->user_config,
+				                                   snapshot->shaders);
+			}
+			m_executing       = true;
+			const auto result = ExecuteOp(kind, view.payload, view.data);
+			m_executing       = false;
+			if (snapshot != nullptr) {
+				scheduler.RestoreRegisters(previous);
+			}
+			EXIT_IF(result.suspended); // draws and dispatches never suspend
+			ParCensus::NoteOp(kind, view.payload); // Astro Bot PC : KYTY_CP_PAR_CENSUS
+			if (snapshot != nullptr) {
+				ResolveSnapshots().Release();
+			}
+			ops.Pop();
+		}
+		CpPar::t_overlay = false;
+		Image::CpParEndOp();
+		if (run.switch_back) {
+			// An insertion inside this op (CpParInsert): back to the oldest context's ring.
+			(void)scheduler.EndContextSegment();
+			run.begun[context] = false;
+			CommandRecorder::SetThreadStream(run.back_ring);
+			scheduler.BeginContextSegment();
+			run.begun[run.back_ring] = true;
+			run.open                 = run.back_ring;
+			run.switch_back          = false;
+			CommandRecorder::SetThreadStream(context);
+			m_renderer.GetRenderExecutor().CpParForgetCommandShadows();
+		}
+		run.next_op          = sequence + 1u;
+		run.resolver_packets = m_resolver_packets;
+		run.retry_op         = m_retry_op;
+		run.submit_id        = m_submit_id;
+		m_resolver_packets   = saved_packets;
+		m_retry_op           = saved_retry;
+		m_submit_id          = saved_submit_id;
+		CpPar::NoteRunAheadOp(CpPar::NowNs() - op_start);
+		release();
+		// Its window and snapshot slots are free: a parked sequencer re-checks.
+		sequencer.Poke();
+	}
+}
+
 Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, uint64_t submission,
                                                      std::span<const uint32_t> commands,
                                                      bool& handoff, uint32_t context) {
@@ -6011,11 +6566,36 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		Pm4Execution*     previous_execution;
 	} scope(*this, execution);
 	auto& sequencer = *m_sequencer;
+	// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): Thread_Gpu is busy here (overlap statistics);
+	// a submission the run-ahead started continues from its resolver state.
+	const bool concurrent = CpPar::Concurrent();
+	struct BusyScope {
+		bool on;
+		explicit BusyScope(bool on_): on(on_) {
+			if (on) {
+				CpPar::NoteBusy(0, true);
+			}
+		}
+		~BusyScope() {
+			if (on) {
+				CpPar::NoteBusy(0, false);
+			}
+		}
+		BusyScope(const BusyScope&)            = delete;
+		BusyScope& operator=(const BusyScope&) = delete;
+	} busy_scope(concurrent);
+	if (concurrent && g_cp_par_run.adopt_pending && g_cp_par_run.target == submission) {
+		g_cp_par_run.adopt_pending = false;
+		m_resolver_packets         = g_cp_par_run.resolver_packets;
+		m_retry_op                 = g_cp_par_run.retry_op;
+	}
+	// Service commands and the interleave point wait while the run-ahead is dirty / may run.
+	auto service_allowed = [concurrent] { return !concurrent || !CpPar::RunAheadDirty(); };
 	for (;;) {
 		CommitStats::StepMark(CommitStats::Step::GapOpExit);
 		// Service commands run between ops: every op before this one has executed and no later
 		// one has, the serial point (P3-SEQUENCER.md 2.4).
-		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
+		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands() && service_allowed()) {
 			if (CpPar::OnResolver2()) {
 				// Astro Bot PC (KYTY_CP_PAR=1a): service commands stay on Thread_Gpu.
 				auto* gpu  = g_gpu_state;
@@ -6050,7 +6630,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				if (elapsed < CpSeq::ResolverSpinNs()) {
 					continue;
 				}
-				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
+				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands() && service_allowed()) {
 					break;
 				}
 				if (elapsed > 2'000'000u ||
@@ -6060,7 +6640,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				std::this_thread::yield();
 			}
 			if (!produced) {
-				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
+				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands() && service_allowed()) {
 					continue;
 				}
 				execution.m_yielded = true;
@@ -6071,6 +6651,17 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		const auto  sequence = view.header->sequence;
 		const auto  packet   = view.header->packet;
 		const auto& header   = *view.header;
+		if (concurrent && g_cp_par_run.offered && g_cp_par_run.oldest == submission &&
+		    !g_cp_par_run.oldest_done.load(std::memory_order_relaxed) &&
+		    !g_cp_par_run.ended.load(std::memory_order_acquire) &&
+		    CpPar::TailQuiet(submission, sequence)) {
+			// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the interleave point, in the quiet
+			// tail: the run-ahead may execute one op now (the lock is FIFO).
+			CpPar::OpLockRelease(0);
+			if (CpPar::OpLockAcquire(0)) {
+				CpParNoteHolderChange(m_renderer);
+			}
+		}
 		if (kind == CpSeq::OpKind::StreamBegin) {
 			const auto& begin = view.As<CpSeq::StreamBeginOp>();
 			EXIT_IF(begin.submission != submission);
@@ -6102,6 +6693,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			ops.Pop();
 			sequencer.NoteExecuted(sequence + 1u);
 			execution.m_made_progress = true;
+			if (concurrent && g_cp_par_run.offered && g_cp_par_run.oldest == submission) {
+				// Astro Bot PC (KYTY_CP_PAR=1b3): the merge point of the run-ahead (cpParallel.h).
+				EXIT_IF(g_gpu_state == nullptr);
+				g_gpu_state->CpParMerge();
+			}
 			return Pm4ProcessResult::Complete;
 		}
 		if (kind == CpSeq::OpKind::Handoff) {
