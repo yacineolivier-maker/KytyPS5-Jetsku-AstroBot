@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/command_processor/cpSequencer.h"
+#include "graphics/guest_gpu/command_processor/parCensus.h"
 #include "graphics/guest_gpu/command_processor/stateTrace.h"
 #include "graphics/guest_gpu/command_processor/cpVerify.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -1522,6 +1523,9 @@ void GuestGpu::Enqueue(Submission submission) {
 		intake.constant_commands = submission.constant_commands;
 		intake.graphics          = submission.type == SubmissionType::Graphics;
 		intake.reset_processor   = submission.reset_processor;
+		if (intake.graphics) {
+			ParCensus::NoteAdmit(intake.sequence, intake.reset_processor); // Astro Bot PC : KYTY_CP_PAR_CENSUS
+		}
 		m_sequencer->Admit(intake);
 	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -5817,6 +5821,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		if (kind == CpSeq::OpKind::StreamBegin) {
 			const auto& begin = view.As<CpSeq::StreamBeginOp>();
 			EXIT_IF(begin.submission != submission);
+			ParCensus::NoteBegin(submission); // Astro Bot PC : KYTY_CP_PAR_CENSUS
 			m_resolver_packets = 0;
 			m_retry_op         = 0;
 			if (begin.state != 0) {
@@ -5837,6 +5842,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		}
 		if (kind == CpSeq::OpKind::StreamEnd) {
 			EXIT_IF(view.As<CpSeq::StreamEndOp>().submission != submission);
+			ParCensus::NoteEnd(submission); // Astro Bot PC : KYTY_CP_PAR_CENSUS
 			if (m_verifier != nullptr && m_verifier->Follows(submission)) {
 				m_verifier->Finish();
 			}
@@ -5917,6 +5923,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			return Pm4ProcessResult::Blocked;
 		}
 		m_retry_op = 0;
+		ParCensus::NoteOp(kind, view.payload); // Astro Bot PC : KYTY_CP_PAR_CENSUS
 		if (following && m_verifier->Follows(submission)) {
 			m_verifier->After(view, result);
 		}
