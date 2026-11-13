@@ -35,6 +35,12 @@
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+// Astro Bot PC (KYTY_CP_PAR=1b5, commandScheduler.h): the calling thread's interrupt capture.
+static thread_local CommandScheduler::PriorityCapture t_priority_capture = nullptr;
+
+void CommandScheduler::SetThreadPriorityCapture(PriorityCapture capture) noexcept {
+	t_priority_capture = capture;
+}
 
 namespace {
 
@@ -407,6 +413,16 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
                                              PriorityOperationKind kind) {
 	CheckActive();
 	EXIT_IF(!operation);
+	if (kind == PriorityOperationKind::EopInterrupt && CpPar::Concurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b5, cpParallel.h): a run-ahead op's interrupt waits for the
+		// merge; one raised by CP resolver #2 outside the capture would reach the guest early.
+		if (t_priority_capture != nullptr && t_priority_capture(operation)) {
+			return;
+		}
+		if (CpPar::Deferred() && CpPar::OnResolver2()) {
+			CpPar::NoteStrayInterrupt();
+		}
+	}
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		if (m_graphics.submission_queue.Enabled()) {

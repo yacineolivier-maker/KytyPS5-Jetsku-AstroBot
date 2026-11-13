@@ -168,12 +168,55 @@
 // A "CpPar 10s: 1b4 ..." line (the 1b3 counters) and a "CpPar 10s: 1b4 window ..." line report
 // run-ahead ops by kind, the new promotions, local waits and writes, interleave points and cross
 // accesses.
+//
+// Astro Bot PC (KYTY_CP_PAR=1b5, 13/11/2026; needs what 1b4 needs, otherwise runs as 1b1): 1b4,
+// and the run-ahead no longer promotes at end-of-pipe interrupts and event-queue signals (EOP
+// INT_SEL 1/2, RELEASE_MEM INT_SEL 1/2/4: every path that ends in TriggerEopEventAtEndOfPipe):
+//  - While it executes an op, the run-ahead thread's EopInterrupt priority operations are captured
+//    (CommandScheduler::SetThreadPriorityCapture) into a per-run-ahead list instead of being
+//    queued on the completion runner, with the op's sequence. An interrupt op's label is written
+//    at record time when the book knows it as a CP-internal label (as 1b4's labels); otherwise
+//    (External in 1b4) its store is captured too, in the same list, before the interrupt: the
+//    guest does not see N + 1's signalled label before N's remaining work either.
+//  - Delivery (GuestGpu::CpParMerge -> CommandProcessor::CpParDeliverDeferred, Thread_Gpu, op
+//    lock held): at N's StreamEnd, right after N's last op and before any later op of N + 1 runs
+//    on Thread_Gpu, i.e. where serial execution would have reached them at the earliest. In list
+//    order: each captured store is written (memcpy, CP write notes, address book), then each
+//    interrupt is queued with DeferPriorityOperation (EopInterrupt) for the current tick, after
+//    every priority operation N queued (the runner is FIFO). So the label precedes its signal as
+//    in serial, the signal fires only once the tick holding the run-ahead's replayed packets
+//    completes, and the guest sees N's interrupts, then N + 1's, in sequence order. After an
+//    insertion the list stays queued until the merge (the signal is then later than serial, never
+//    earlier). A list still pending at a hand-over (shutdown) is delivered there, counted.
+//  - Still promoted: interrupts whose label TryDeferLabel would defer (LabelDefer: the deferred
+//    write raises the interrupt itself), GDS ones (Gds), clocks and the other 1b4 reasons.
+//  - KYTY_CP_PAR_VERIFY=1 also stops when: a queue-0 interrupt is queued with an op sequence not
+//    above the last one queued (deferred or serial: the guest would see them out of order); a
+//    run-ahead op raises an interrupt that escapes the capture; a deferred list is not empty at a
+//    new offer.
+// A "CpPar 10s: 1b5 ..." line adds: deferred interrupts and stores delivered; a histogram stop
+// reason -> op kind (the op it stopped at; "none": no op emitted yet); per run-ahead outcome
+// (measured when Thread_Gpu completes N + 1): its ops and draws executed ahead, those left to
+// Thread_Gpu, and a histogram of the fraction done ahead; and for the stop reason "stop", the
+// window (offer to merge), the time the run-ahead waited for the sequencer to emit N + 1, and
+// how many stops found no op of N + 1 emitted yet. The first 16 foreign-wait and external
+// promotions are logged ("Kyty CpPar 1b5: ...") with the address, the last CP writer (submission,
+// its rank among the queue-0 submissions of its frame fence, op kind) and whether memory still
+// holds that value (if not, it was written outside the CP since: guest CPU or GPU).
 
 #include <cstdint>
 
 namespace Libs::Graphics::CpPar {
 
-enum class Mode : uint8_t { Off, Serial1a, Serial1b1, Serial1b2, Concurrent1b3, Concurrent1b4 };
+enum class Mode : uint8_t {
+	Off,
+	Serial1a,
+	Serial1b1,
+	Serial1b2,
+	Concurrent1b3,
+	Concurrent1b4,
+	Concurrent1b5, // Astro Bot PC (KYTY_CP_PAR=1b5)
+};
 
 // KYTY_CP_PAR, read once.
 [[nodiscard]] Mode GetMode();
@@ -184,13 +227,15 @@ enum class Mode : uint8_t { Off, Serial1a, Serial1b1, Serial1b2, Concurrent1b3, 
 // above).
 [[nodiscard]] inline bool SeparateWindows() {
 	return GetMode() == Mode::Serial1b1 || GetMode() == Mode::Serial1b2 ||
-	       GetMode() == Mode::Concurrent1b3 || GetMode() == Mode::Concurrent1b4; // Astro Bot PC (1b4)
+	       GetMode() == Mode::Concurrent1b3 || GetMode() == Mode::Concurrent1b4 ||
+	       GetMode() == Mode::Concurrent1b5; // Astro Bot PC (KYTY_CP_PAR=1b4, 1b5)
 }
 // KYTY_CP_PAR=1b2 (and 1b3) requested: context B records into its own target (see above).
 // Whether it is active (recorder requirements met) is StreamsActive().
 [[nodiscard]] inline bool SeparateStreams() {
 	return GetMode() == Mode::Serial1b2 || GetMode() == Mode::Concurrent1b3 ||
-	       GetMode() == Mode::Concurrent1b4; // Astro Bot PC (KYTY_CP_PAR=1b4)
+	       GetMode() == Mode::Concurrent1b4 ||
+	       GetMode() == Mode::Concurrent1b5; // Astro Bot PC (KYTY_CP_PAR=1b4, 1b5)
 }
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): set once at start-up, before resolver #2 runs, when the two
@@ -215,6 +260,15 @@ inline bool g_concurrent = false;
 inline bool g_wide = false;
 [[nodiscard]] inline bool Wide() noexcept {
 	return g_wide;
+}
+// Astro Bot PC (KYTY_CP_PAR=1b5): set with g_wide when the mode is 1b5 (deferred interrupts).
+inline bool g_deferred = false;
+[[nodiscard]] inline bool Deferred() noexcept {
+	return g_deferred;
+}
+// "1b5", "1b4" or "1b3" (the concurrent mode's name in the console lines).
+[[nodiscard]] inline const char* ConcurrentName() noexcept {
+	return g_deferred ? "1b5" : (g_wide ? "1b4" : "1b3");
 }
 // KYTY_CP_PAR_WRITES=all (1b4): the run-ahead writes any address (not only learned CP-internal
 // labels). KYTY_CP_PAR_OLDEST_WRITES=hard (1b4): N's WRITE_DATA / DMA_DATA / clock writes are hard
@@ -302,6 +356,32 @@ void NoteInterleave(bool offered);
 // Counts it; with KYTY_CP_PAR_VERIFY=1, stops the emulator (address for the message).
 void NoteCross(Cross which, uint64_t address);
 void NoteBook(uint64_t written, uint64_t labels);
+// Astro Bot PC (KYTY_CP_PAR=1b5) statistics and checks (cpParallel.h, above):
+// the run-ahead stopped for `reason` at an op of kind `kind` (CpSeq::OpKind; OpKind::Count: no op
+// of N + 1 emitted yet);
+void NoteStopKind(Promotion reason, uint32_t kind);
+// Thread_Gpu completed a run-ahead target: its ops (non-transport) and draws (direct and indirect
+// draws and dispatches) executed ahead and by Thread_Gpu after the run-ahead stopped;
+void NoteOutcome(bool started, uint64_t ahead_ops, uint64_t ahead_draws, uint64_t rest_ops,
+                 uint64_t rest_draws);
+// at a merge: the offer-to-merge window; at a run-ahead's end: the time it waited for the
+// sequencer to emit N + 1's ops;
+void NoteWindow(uint64_t window_ns);
+void NoteStarved(uint64_t ns);
+// a deferred list delivered (interrupts, stores; `late`: at a hand-over, not at the merge);
+void NoteDeferredDelivery(uint64_t interrupts, uint64_t stores, bool late);
+// a run-ahead interrupt op whose label store was captured (External in 1b4) / written at record
+// time (learned CP-internal label);
+void NoteDeferredOp(bool store_captured);
+// a queue-0 interrupt queued for op `sequence` (Thread_Gpu: serial or delivered): with
+// KYTY_CP_PAR_VERIFY=1, stops when it is not above the last one (`deferred`: for the message);
+void NoteInterruptOrder(uint64_t sequence, bool deferred);
+// an interrupt raised on resolver #2 outside the capture (KYTY_CP_PAR_VERIFY=1: stops);
+void NoteStrayInterrupt();
+// a deferred list found non-empty where it must be empty (KYTY_CP_PAR_VERIFY=1: stops).
+void NoteDeferredLeft(uint64_t entries);
+// Rate limit of the "Kyty CpPar 1b5:" stop logs (true for the first 16 of `reason`).
+[[nodiscard]] bool TakeStopLog(Promotion reason);
 void NotePromotion(Promotion reason);
 void NoteRunAheadStart();
 // A run-ahead op executed, holding the op lock for `ns`.

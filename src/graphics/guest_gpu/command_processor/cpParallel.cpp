@@ -10,6 +10,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -80,6 +81,32 @@ struct Stats {
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Cross::Count)> cross {};
 	std::atomic<uint64_t> book_written {0};
 	std::atomic<uint64_t> book_labels {0};
+	// Astro Bot PC (KYTY_CP_PAR=1b5): stop reason -> op kind (OpKind::Count: none emitted yet);
+	// outcomes of the run-aheads (completed targets) and their fraction done ahead (0, <25 %,
+	// <50 %, <75 %, <100 %, 100 %); windows; deferred deliveries; order checks.
+	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(CpSeq::OpKind::Count) + 1>,
+	           static_cast<size_t>(Promotion::Count)>
+	    stop_kinds {};
+	std::atomic<uint64_t>                outcomes {0};
+	std::atomic<uint64_t>                outcomes_started {0};
+	std::atomic<uint64_t>                outcome_ahead_ops {0};
+	std::atomic<uint64_t>                outcome_ahead_draws {0};
+	std::atomic<uint64_t>                outcome_rest_ops {0};
+	std::atomic<uint64_t>                outcome_rest_draws {0};
+	std::atomic<uint64_t>                outcome_max_ops {0};
+	std::array<std::atomic<uint64_t>, 6> outcome_done {};
+	std::atomic<uint64_t>                windows {0};
+	std::atomic<uint64_t>                window_ns {0};
+	std::atomic<uint64_t>                starved_ns {0};
+	std::atomic<uint64_t>                deferred_interrupts {0};
+	std::atomic<uint64_t>                deferred_stores {0};
+	std::atomic<uint64_t>                deferred_late {0};
+	std::atomic<uint64_t>                deferred_ops_captured {0};
+	std::atomic<uint64_t>                deferred_ops_recorded {0};
+	std::atomic<uint64_t>                order_violations {0};
+	std::atomic<uint64_t>                stray_interrupts {0};
+	std::atomic<uint64_t>                deferred_left {0};
+	std::array<std::atomic<uint32_t>, static_cast<size_t>(Promotion::Count)> stop_logs {};
 };
 
 Stats& GetStats() {
@@ -445,7 +472,15 @@ Mode GetMode() {
 			            "oldest once no hard op remains in it)\n");
 			return Mode::Concurrent1b4;
 		}
-		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2, 1b3, 1b4); off\n",
+		if (std::strcmp(value, "1b5") == 0) {
+			// Astro Bot PC (KYTY_CP_PAR=1b5, cpParallel.h).
+			std::printf("Kyty CpPar: KYTY_CP_PAR=1b5 (as 1b4, and the run-ahead's end-of-pipe "
+			            "interrupts are captured and delivered in order at the merge, after the "
+			            "oldest submission's last op)\n");
+			return Mode::Concurrent1b5;
+		}
+		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2, 1b3, 1b4, 1b5); "
+		            "off\n",
 		            value);
 		return Mode::Off;
 	}();
@@ -464,6 +499,11 @@ bool VerifyEnabled() {
 			std::printf("Kyty CpPar: KYTY_CP_PAR_VERIFY=1 (stop at the first insertion, foreign wait "
 			            "value or cross access of the overlap)\n");
 		}
+		if (on && GetMode() == Mode::Concurrent1b5) {
+			// Astro Bot PC (KYTY_CP_PAR=1b5).
+			std::printf("Kyty CpPar: KYTY_CP_PAR_VERIFY=1 (stop at the first insertion, foreign wait "
+			            "value, cross access of the overlap, out-of-order or uncaptured interrupt)\n");
+		}
 		return on;
 	}();
 	return enabled;
@@ -474,7 +514,7 @@ bool WritesAll() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_CP_PAR_WRITES");
 		const bool  all   = value != nullptr && std::strcmp(value, "all") == 0;
-		if (GetMode() == Mode::Concurrent1b4) {
+		if (GetMode() == Mode::Concurrent1b4 || GetMode() == Mode::Concurrent1b5) {
 			std::printf("Kyty CpPar: 1b4 run-ahead writes: %s (KYTY_CP_PAR_WRITES)\n",
 			            all ? "any address (measurement only)" : "learned CP-internal labels only");
 		}
@@ -487,7 +527,7 @@ bool OldestWritesHard() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_CP_PAR_OLDEST_WRITES");
 		const bool  hard  = value != nullptr && std::strcmp(value, "hard") == 0;
-		if (hard && GetMode() == Mode::Concurrent1b4) {
+		if (hard && (GetMode() == Mode::Concurrent1b4 || GetMode() == Mode::Concurrent1b5)) {
 			std::printf("Kyty CpPar: 1b4: the oldest's WRITE_DATA / DMA_DATA / clock writes are hard "
 			            "(KYTY_CP_PAR_OLDEST_WRITES)\n");
 		}
@@ -500,7 +540,7 @@ bool InterleaveNext() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_CP_PAR_INTERLEAVE");
 		const bool  next  = value != nullptr && std::strcmp(value, "next") == 0;
-		if (GetMode() == Mode::Concurrent1b4) {
+		if (GetMode() == Mode::Concurrent1b4 || GetMode() == Mode::Concurrent1b5) {
 			std::printf("Kyty CpPar: 1b4 interleave points: %s (KYTY_CP_PAR_INTERLEAVE)\n",
 			            next ? "before every op of the oldest that is not hard (measurement)"
 			                 : "before every op of the oldest once no hard op remains in it");
@@ -541,14 +581,118 @@ void NoteCross(Cross which, uint64_t address) {
 	}
 	if (GetStats().cross[index].fetch_add(1, std::memory_order_relaxed) == 0) {
 		std::printf("Kyty CpPar: first cross access: %s (0x%016" PRIx64 "; counted in \"CpPar 10s: "
-		            "1b4 window\")\n",
-		            names[index], address);
+		            "%s window\")\n",
+		            names[index], address, ConcurrentName());
 	}
 }
 
 void NoteBook(uint64_t written, uint64_t labels) {
 	GetStats().book_written.store(written, std::memory_order_relaxed);
 	GetStats().book_labels.store(labels, std::memory_order_relaxed);
+}
+
+// ---- Astro Bot PC (KYTY_CP_PAR=1b5, cpParallel.h) ----
+
+void NoteStopKind(Promotion reason, uint32_t kind) {
+	const auto r = static_cast<size_t>(reason);
+	const auto k = std::min<size_t>(kind, static_cast<size_t>(CpSeq::OpKind::Count));
+	if (r < static_cast<size_t>(Promotion::Count)) {
+		GetStats().stop_kinds[r][k].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void NoteOutcome(bool started, uint64_t ahead_ops, uint64_t ahead_draws, uint64_t rest_ops,
+                 uint64_t rest_draws) {
+	auto& stats = GetStats();
+	stats.outcomes.fetch_add(1, std::memory_order_relaxed);
+	if (started) {
+		stats.outcomes_started.fetch_add(1, std::memory_order_relaxed);
+	}
+	stats.outcome_ahead_ops.fetch_add(ahead_ops, std::memory_order_relaxed);
+	stats.outcome_ahead_draws.fetch_add(ahead_draws, std::memory_order_relaxed);
+	stats.outcome_rest_ops.fetch_add(rest_ops, std::memory_order_relaxed);
+	stats.outcome_rest_draws.fetch_add(rest_draws, std::memory_order_relaxed);
+	const auto total = ahead_ops + rest_ops;
+	auto       max   = stats.outcome_max_ops.load(std::memory_order_relaxed);
+	while (total > max &&
+	       !stats.outcome_max_ops.compare_exchange_weak(max, total, std::memory_order_relaxed)) {
+	}
+	size_t bucket = 0;
+	if (ahead_ops == 0) {
+		bucket = 0;
+	} else if (rest_ops == 0) {
+		bucket = 5;
+	} else {
+		bucket = 1 + std::min<size_t>(3, static_cast<size_t>((ahead_ops * 4u) / total));
+	}
+	stats.outcome_done[bucket].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteWindow(uint64_t window_ns) {
+	auto& stats = GetStats();
+	stats.windows.fetch_add(1, std::memory_order_relaxed);
+	stats.window_ns.fetch_add(window_ns, std::memory_order_relaxed);
+}
+
+void NoteStarved(uint64_t ns) {
+	GetStats().starved_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void NoteDeferredDelivery(uint64_t interrupts, uint64_t stores, bool late) {
+	auto& stats = GetStats();
+	stats.deferred_interrupts.fetch_add(interrupts, std::memory_order_relaxed);
+	stats.deferred_stores.fetch_add(stores, std::memory_order_relaxed);
+	if (late && stats.deferred_late.fetch_add(1, std::memory_order_relaxed) == 0) {
+		std::printf("Kyty CpPar: 1b5: a deferred interrupt list was delivered at a hand-over, not at "
+		            "the merge (counted in \"CpPar 10s: 1b5\")\n");
+	}
+}
+
+void NoteDeferredOp(bool store_captured) {
+	(store_captured ? GetStats().deferred_ops_captured : GetStats().deferred_ops_recorded)
+	    .fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteInterruptOrder(uint64_t sequence, bool deferred) {
+	static uint64_t last = 0; // Thread_Gpu only (queue-0 ops and the merge run there)
+	if (sequence <= last && last != 0) {
+		if (VerifyEnabled()) {
+			EXIT("Kyty CpPar: KYTY_CP_PAR_VERIFY=1: %s interrupt of op %" PRIu64
+			     " queued after the interrupt of op %" PRIu64 " (out of order)\n",
+			     deferred ? "a deferred" : "a serial", sequence, last);
+		}
+		if (GetStats().order_violations.fetch_add(1, std::memory_order_relaxed) == 0) {
+			std::printf("Kyty CpPar: 1b5: first out-of-order interrupt: op %" PRIu64 " after op %" PRIu64
+			            " (%s)\n",
+			            sequence, last, deferred ? "deferred" : "serial");
+		}
+	}
+	last = std::max(last, sequence);
+}
+
+void NoteStrayInterrupt() {
+	if (VerifyEnabled()) {
+		EXIT("Kyty CpPar: KYTY_CP_PAR_VERIFY=1: CP resolver #2 raised an end-of-pipe interrupt "
+		     "outside the run-ahead's capture\n");
+	}
+	if (GetStats().stray_interrupts.fetch_add(1, std::memory_order_relaxed) == 0) {
+		std::printf("Kyty CpPar: 1b5: first interrupt raised by CP resolver #2 outside the capture\n");
+	}
+}
+
+void NoteDeferredLeft(uint64_t entries) {
+	if (VerifyEnabled()) {
+		EXIT("Kyty CpPar: KYTY_CP_PAR_VERIFY=1: %" PRIu64 " deferred interrupt entries left at a "
+		     "new offer\n",
+		     entries);
+	}
+	GetStats().deferred_left.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool TakeStopLog(Promotion reason) {
+	const auto r = static_cast<size_t>(reason);
+	return r < static_cast<size_t>(Promotion::Count) &&
+	       GetStats().stop_logs[r].fetch_add(1, std::memory_order_relaxed) < 16u;
 }
 
 // ---- Astro Bot PC (KYTY_CP_PAR=1b3) ----
@@ -674,7 +818,7 @@ void NoteInsertion(Insertion trigger, uint64_t fixups, uint64_t impossible, uint
 	if (stats.insertions[index].fetch_add(1, std::memory_order_relaxed) == 0) {
 		std::printf("Kyty CpPar: first insertion forced by %s (data order of the overlap "
 		            "inverted; counted in \"CpPar 10s: %s\")\n",
-		            names[index], Wide() ? "1b4" : "1b3");
+		            names[index], ConcurrentName());
 	}
 	stats.insertion_fixups.fetch_add(fixups, std::memory_order_relaxed);
 	stats.merge_impossible.fetch_add(impossible, std::memory_order_relaxed);
@@ -906,7 +1050,7 @@ void MaybeReport() {
 		            ", run-ahead submit %" PRIu64 ", run-ahead drain %" PRIu64
 		            "; op lock: Thread_Gpu %" PRIu64 " takes, %.2f ms waiting; resolver #2 %" PRIu64
 		            " takes, %.2f ms waiting\n",
-		            Wide() ? "1b4" : "1b3", starts, ops, static_cast<double>(ops_ns) / 1e6,
+		            ConcurrentName(), starts, ops, static_cast<double>(ops_ns) / 1e6,
 		            static_cast<double>(overlap) / 1e6,
 		            p[0], p[1], p[2], p[3], p[4], p[5],
 		            p[6], p[7], p[8], merges, images, fixups, ins_fixups, impossible, ins[0], ins[1],
@@ -928,7 +1072,7 @@ void MaybeReport() {
 				c[i] = take(stats.cross[i]);
 			}
 			const auto fixups_total = fixups + ins_fixups;
-			std::printf("CpPar 10s: 1b4 window: overlap %.2f ms; run-ahead ops by kind:%s; "
+			std::printf("CpPar 10s: %s window: overlap %.2f ms; run-ahead ops by kind:%s; "
 			            "promotions: interrupt %" PRIu64 ", label-defer %" PRIu64 ", clock %" PRIu64
 			            ", gds %" PRIu64 ", occlusion %" PRIu64 ", external %" PRIu64
 			            ", gpu-dirty %" PRIu64 ", foreign-wait %" PRIu64 " (and the 1b3 reasons "
@@ -937,7 +1081,8 @@ void MaybeReport() {
 			            ", refused (hard op ahead, or N not fully emitted) %" PRIu64 "; cross accesses: oldest read %" PRIu64
 			            ", oldest write %" PRIu64 ", run-ahead read %" PRIu64 ", foreign value %" PRIu64
 			            "; book %" PRIu64 " dwords, %" PRIu64 " learned labels\n",
-			            static_cast<double>(overlap) / 1e6, kinds.empty() ? " none" : kinds.c_str(),
+			            ConcurrentName(), static_cast<double>(overlap) / 1e6,
+			            kinds.empty() ? " none" : kinds.c_str(),
 			            p[static_cast<size_t>(Promotion::Interrupt)],
 			            p[static_cast<size_t>(Promotion::LabelDefer)],
 			            p[static_cast<size_t>(Promotion::Clock)], p[static_cast<size_t>(Promotion::Gds)],
@@ -949,6 +1094,73 @@ void MaybeReport() {
 			            take(stats.interleave_refused), c[0], c[1], c[2], c[3],
 			            stats.book_written.load(std::memory_order_relaxed),
 			            stats.book_labels.load(std::memory_order_relaxed));
+		}
+		if (Deferred()) {
+			// Astro Bot PC (KYTY_CP_PAR=1b5): deferred interrupts, stops by op kind, outcomes,
+			// windows (cpParallel.h).
+			static constexpr const char* reasons[] = {
+			    "stream-end", "lockstep", "write", "flip", "indirect", "inherit", "no-registers",
+			    "ring", "stop", "interrupt", "label-defer", "clock", "gds", "occlusion", "external",
+			    "gpu-dirty", "foreign-wait"};
+			static_assert(std::size(reasons) == static_cast<size_t>(Promotion::Count));
+			std::string histogram;
+			uint64_t    stop_none = 0;
+			uint64_t    stop_ops  = 0;
+			for (size_t r = 0; r < stats.stop_kinds.size(); r++) {
+				for (size_t k = 0; k < stats.stop_kinds[r].size(); k++) {
+					const auto n = take(stats.stop_kinds[r][k]);
+					if (n == 0) {
+						continue;
+					}
+					const bool none = k == static_cast<size_t>(CpSeq::OpKind::Count);
+					if (r == static_cast<size_t>(Promotion::Stop)) {
+						(none ? stop_none : stop_ops) += n;
+					}
+					char item[96];
+					std::snprintf(item, sizeof(item), " %s/%s=%" PRIu64, reasons[r],
+					              none ? "none" : CpSeq::OpKindName(static_cast<CpSeq::OpKind>(k)), n);
+					histogram += item;
+				}
+			}
+			const auto outcomes  = take(stats.outcomes);
+			const auto started   = take(stats.outcomes_started);
+			const auto a_ops     = take(stats.outcome_ahead_ops);
+			const auto a_draws   = take(stats.outcome_ahead_draws);
+			const auto r_ops     = take(stats.outcome_rest_ops);
+			const auto r_draws   = take(stats.outcome_rest_draws);
+			const auto max_ops   = take(stats.outcome_max_ops);
+			uint64_t   done[6]   = {};
+			for (size_t i = 0; i < std::size(done); i++) {
+				done[i] = take(stats.outcome_done[i]);
+			}
+			const auto windows   = take(stats.windows);
+			const auto window_ns = take(stats.window_ns);
+			const auto starved   = take(stats.starved_ns);
+			const auto per = [](uint64_t value, uint64_t count) {
+				return count == 0 ? 0.0 : static_cast<double>(value) / static_cast<double>(count);
+			};
+			std::printf(
+			    "CpPar 10s: 1b5: deferred interrupts delivered %" PRIu64 " (stores %" PRIu64
+			    ", late %" PRIu64 "; interrupt ops with label store captured %" PRIu64
+			    ", without a captured store (learned label, clock or no data) %" PRIu64
+			    "); order violations %" PRIu64
+			    ", stray interrupts %" PRIu64 ", lists left %" PRIu64 "; stops (reason/op kind):%s; "
+			    "targets completed %" PRIu64 " (%" PRIu64 " started): ops ahead %" PRIu64
+			    ", ops left to Thread_Gpu %" PRIu64 " (%.1f per target, largest target %" PRIu64
+			    " ops), draws ahead %" PRIu64 " of %" PRIu64 " (%.1f per target); done ahead 0%% %" PRIu64
+			    ", <25%% %" PRIu64 ", <50%% %" PRIu64 ", <75%% %" PRIu64 ", <100%% %" PRIu64
+			    ", 100%% %" PRIu64 "; stop: %" PRIu64 " with no op of N+1 emitted, %" PRIu64
+			    " with ops pending; windows %" PRIu64 " (offer to merge %.3f ms each, run-ahead "
+			    "waiting for the sequencer %.3f ms each)\n",
+			    take(stats.deferred_interrupts), take(stats.deferred_stores),
+			    take(stats.deferred_late), take(stats.deferred_ops_captured),
+			    take(stats.deferred_ops_recorded), take(stats.order_violations),
+			    take(stats.stray_interrupts), take(stats.deferred_left),
+			    histogram.empty() ? " none" : histogram.c_str(), outcomes, started, a_ops, r_ops,
+			    per(r_ops, outcomes), max_ops, a_draws, a_draws + r_draws,
+			    per(a_draws + r_draws, outcomes), done[0], done[1], done[2], done[3], done[4], done[5],
+			    stop_none, stop_ops, windows, per(window_ns, windows) / 1e6,
+			    per(starved, windows) / 1e6);
 		}
 	}
 	if (StreamsActive() && !Concurrent()) {

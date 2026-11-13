@@ -73,6 +73,12 @@ public:
 	    Common::UniqueFunction<void>&& operation,
 	    PriorityOperationKind kind = PriorityOperationKind::Generic);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Astro Bot PC (KYTY_CP_PAR=1b5, cpParallel.h): while set on the calling thread, its
+	// EopInterrupt priority operations are handed to `capture` first; when it returns true it kept
+	// the operation (the run-ahead queues it until its merge) and nothing is queued here. nullptr
+	// clears it.
+	using PriorityCapture = bool (*)(Common::UniqueFunction<void>& operation);
+	static void SetThreadPriorityCapture(PriorityCapture capture) noexcept;
 	// Called on the completion runner after every priority operation (e.g. to wake queues
 	// suspended on what it published). Clear it, then DrainPriorityOperations, before the
 	// context dies: the call happens while the operation is still marked active.
