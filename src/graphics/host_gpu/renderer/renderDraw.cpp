@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/passStats.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
@@ -3838,6 +3839,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                     bool primitive_restart_enable) {
 	KYTY_GPU_OP_SITE("draw.execute");
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	if (PassStats::Enabled()) {
+		// Astro Bot PC : cible de la passe (KYTY_PASS_STATS).
+		const auto& c0 = state.color_info[0];
+		const auto& z  = state.depth_info;
+		const bool  has_color = state.color_count != 0;
+		const auto& info = has_color ? c0.desc.info : z.desc.info;
+		PassStats::SetTarget(info.data.address, info.extent.width, info.extent.height,
+		                     static_cast<uint32_t>(info.guest_format), state.color_count, static_cast<bool>(z.image_id),
+		                     z.image_id ? z.desc.info.data.address : 0u);
+	}
 	auto& ucfg = buffer.GetUserConfig();
 	if (m_context.GetOcclusionCounter().DebugLogActive()) {
 		OcclusionCounter::DebugLog("e n=%u inst=%u vs=0x%" PRIx64 "\n", draw.index_count, draw.instance_count,
@@ -4777,6 +4788,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_GPU_OP_SITE("draw.index");
 	KYTY_PROFILER_FUNCTION();
+	const PassStats::Scope pass_stats(PassStats::Kind::Draw, PassStats::Enabled() ? m_context.GetTextureCache().Frame() : 0u);
 	Profiler::CountFrameWork(Profiler::FrameWork::DrawIndex);
 
 	EXIT_IF(buffer.IsInvalid());
@@ -4932,6 +4944,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_GPU_OP_SITE("draw.auto");
 	KYTY_PROFILER_FUNCTION();
+	const PassStats::Scope pass_stats(PassStats::Kind::Draw, PassStats::Enabled() ? m_context.GetTextureCache().Frame() : 0u);
 	Profiler::CountFrameWork(Profiler::FrameWork::DrawAuto);
 
 	EXIT_IF(buffer.IsInvalid());

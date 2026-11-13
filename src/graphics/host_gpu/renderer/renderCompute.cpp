@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/passStats.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
@@ -366,6 +367,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
 	KYTY_GPU_OP_SITE("dispatch");
+	const PassStats::Scope pass_stats(PassStats::Kind::Dispatch, PassStats::Enabled() ? m_context.GetTextureCache().Frame() : 0u);
 	// KYTY_CP_GAP_STATS: this scope's phases (drawPrep/cpGaps.h).
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
 	EXIT_IF(buffer.IsInvalid());
@@ -734,6 +736,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
 	KYTY_GPU_OP_SITE("dispatch.indirect");
+	const PassStats::Scope pass_stats(PassStats::Kind::Dispatch, PassStats::Enabled() ? m_context.GetTextureCache().Frame() : 0u);
 	g_overlap_indirect.fetch_add(1, std::memory_order_relaxed);
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
