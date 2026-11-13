@@ -31,6 +31,14 @@ struct Stats {
 	std::atomic<uint64_t> slices_b {0};        // RunSlice hand-offs
 	std::atomic<uint64_t> bounces_service {0}; // service commands run on Thread_Gpu for B
 	std::atomic<uint64_t> bounces_flip {0};    // Flip / WaitFlipDone ops run on Thread_Gpu for B
+	// KYTY_CP_PAR=1b1 (NotePrep): per context, committed / fallen-back draws since the last line,
+	// the window totals (published, retired) now, and at the last line (Thread_Gpu only).
+	std::array<std::atomic<uint64_t>, 2> prep_committed {};
+	std::array<std::atomic<uint64_t>, 2> prep_fell_back {};
+	std::array<std::atomic<uint64_t>, 2> window_published {};
+	std::array<std::atomic<uint64_t>, 2> window_retired {};
+	std::array<uint64_t, 2>              reported_published {};
+	std::array<uint64_t, 2>              reported_retired {};
 };
 
 Stats& GetStats() {
@@ -166,7 +174,12 @@ Mode GetMode() {
 			std::printf("Kyty CpPar: KYTY_CP_PAR=1a (two resolver contexts, executed in turn)\n");
 			return Mode::Serial1a;
 		}
-		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a); off\n", value);
+		if (std::strcmp(value, "1b1") == 0) {
+			std::printf("Kyty CpPar: KYTY_CP_PAR=1b1 (two resolver contexts, executed in turn, each "
+			            "with its own snapshot ring and draw-prep window)\n");
+			return Mode::Serial1b1;
+		}
+		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1); off\n", value);
 		return Mode::Off;
 	}();
 	return mode;
@@ -224,6 +237,16 @@ void NoteBounce(bool flip_op) {
 	    .fetch_add(1, std::memory_order_relaxed);
 }
 
+void NotePrep(uint32_t context, uint64_t committed, uint64_t fell_back, uint64_t published,
+              uint64_t retired) {
+	const size_t index = context != 0 ? 1 : 0;
+	auto&        stats = GetStats();
+	stats.prep_committed[index].fetch_add(committed, std::memory_order_relaxed);
+	stats.prep_fell_back[index].fetch_add(fell_back, std::memory_order_relaxed);
+	stats.window_published[index].store(published, std::memory_order_relaxed);
+	stats.window_retired[index].store(retired, std::memory_order_relaxed);
+}
+
 void MaybeReport() {
 	static uint64_t last_ns = 0; // Thread_Gpu only
 	const auto      now     = NowNs();
@@ -255,6 +278,25 @@ void MaybeReport() {
 	            ", verify %" PRIu64 "\n",
 	            a, static_cast<double>(a_ns) / 1e6, b, static_cast<double>(b_ns) / 1e6, slices, bs, bf,
 	            f_seq, f_ho, f_ver);
+	if (SeparateWindows()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b1): each context's draw-prep window over the last 10 s.
+		uint64_t values[2][4] = {};
+		for (size_t c = 0; c < 2; c++) {
+			const auto published = stats.window_published[c].load(std::memory_order_relaxed);
+			const auto retired   = stats.window_retired[c].load(std::memory_order_relaxed);
+			values[c][0]         = published - stats.reported_published[c];
+			values[c][1]         = retired - stats.reported_retired[c];
+			values[c][2]         = take(stats.prep_committed[c]);
+			values[c][3]         = take(stats.prep_fell_back[c]);
+			stats.reported_published[c] = published;
+			stats.reported_retired[c]   = retired;
+		}
+		std::printf("CpPar 10s: DrawPrep windows: A published %" PRIu64 ", retired %" PRIu64
+		            ", committed %" PRIu64 ", fell back %" PRIu64 "; B published %" PRIu64
+		            ", retired %" PRIu64 ", committed %" PRIu64 ", fell back %" PRIu64 "\n",
+		            values[0][0], values[0][1], values[0][2], values[0][3], values[1][0],
+		            values[1][1], values[1][2], values[1][3]);
+	}
 	std::fflush(stdout);
 }
 

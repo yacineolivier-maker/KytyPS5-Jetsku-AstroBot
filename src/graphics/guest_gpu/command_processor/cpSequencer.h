@@ -44,6 +44,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <thread>
@@ -122,6 +123,17 @@ public:
 	void NoteExecuted(uint64_t next_op);
 	void NoteHandoffDone(uint64_t submission);
 	[[nodiscard]] SnapshotRing& Snapshots() noexcept { return m_snapshots; }
+	// Astro Bot PC (KYTY_CP_PAR=1b1, cpParallel.h): resolver context B's own snapshot ring, created
+	// before Start (CommandProcessor::AttachSequencer). Snapshots(1) is context B's ring when it
+	// exists, otherwise the shared one.
+	void AddSnapshotRingB() {
+		if (m_snapshots_b == nullptr) {
+			m_snapshots_b = std::make_unique<SnapshotRing>(m_snapshots.Capacity());
+		}
+	}
+	[[nodiscard]] SnapshotRing& Snapshots(uint32_t context) noexcept {
+		return context != 0 && m_snapshots_b != nullptr ? *m_snapshots_b : m_snapshots;
+	}
 
 	// ---- Sequencer thread (the processor's front) ----
 	// Waits until `ready()` holds: spins, then parks on the resolver's progress. While parked,
@@ -176,6 +188,7 @@ private:
 
 	CommandProcessor& m_processor;
 	SnapshotRing      m_snapshots;
+	std::unique_ptr<SnapshotRing> m_snapshots_b; // Astro Bot PC (KYTY_CP_PAR=1b1)
 	uint64_t          m_spin_ns = 0;
 
 	std::mutex              m_intake_mutex;

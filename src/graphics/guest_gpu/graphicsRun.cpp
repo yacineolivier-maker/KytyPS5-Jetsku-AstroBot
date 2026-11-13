@@ -794,6 +794,35 @@ DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
 	return m_draw_prep.get();
 }
 
+// Astro Bot PC (KYTY_CP_PAR=1b1, cpParallel.h): each resolver context's draw-prep engine and
+// snapshot ring. m_emit_b / m_resolve_b are only ever set in 1b1 mode, and the B objects only
+// exist then: otherwise these are m_draw_prep and the sequencer's one snapshot ring.
+DrawPrep::Engine* CommandProcessor::EmitPrep() const {
+	return m_emit_b && m_draw_prep_b != nullptr ? m_draw_prep_b.get() : m_draw_prep.get();
+}
+
+DrawPrep::Engine* CommandProcessor::ResolvePrep() const {
+	return m_resolve_b && m_draw_prep_b != nullptr ? m_draw_prep_b.get() : m_draw_prep.get();
+}
+
+CpSeq::SnapshotRing& CommandProcessor::EmitSnapshots() const {
+	return m_sequencer->Snapshots(m_emit_b ? 1u : 0u);
+}
+
+CpSeq::SnapshotRing& CommandProcessor::ResolveSnapshots() const {
+	return m_sequencer->Snapshots(m_resolve_b ? 1u : 0u);
+}
+
+void CommandProcessor::CpParWindowCounts(uint32_t context, uint64_t& published,
+                                         uint64_t& retired) const {
+	const auto* engine = context != 0 ? m_draw_prep_b.get() : m_draw_prep.get();
+	published          = 0;
+	retired            = 0;
+	if (engine != nullptr) {
+		engine->WindowCounts(published, retired);
+	}
+}
+
 bool CommandProcessor::TrySubmitPreparedDraw(const DrawIndexArgs* index_args,
                                              const DrawAutoArgs*  auto_args) {
 	if (DrawPrep::GetMode() == DrawPrep::Mode::Off) {
@@ -1988,6 +2017,21 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	}
 	bool             handoff = false;
 	Pm4ProcessResult result  = Pm4ProcessResult::Complete;
+	// Astro Bot PC (KYTY_CP_PAR=1b1): the draw-prep decisions of this slice, for its context's
+	// line in "CpPar 10s" (the contexts run in turn: every decision meanwhile is this slice's).
+	const bool prep_stats      = CpPar::SeparateWindows();
+	uint64_t   prep_committed  = 0;
+	uint64_t   prep_fell_back  = 0;
+	auto       prep_decisions  = [](uint64_t& committed, uint64_t& fell_back) {
+		auto& totals = DrawPrep::GetTotals();
+		committed    = totals.committed.load(std::memory_order_relaxed) +
+		            totals.dispatch_committed.load(std::memory_order_relaxed);
+		fell_back = totals.fallbacks.load(std::memory_order_relaxed) +
+		            totals.dispatch_fallbacks.load(std::memory_order_relaxed);
+	};
+	if (prep_stats) {
+		prep_decisions(prep_committed, prep_fell_back);
+	}
 	if (!CpPar::Enabled()) {
 		result = cp.ResolveSubmission(submission.command_execution, submission.sequence,
 		                              submission.commands, handoff);
@@ -2022,6 +2066,17 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	if (CpPar::Enabled() && !handoff && result == Pm4ProcessResult::Complete &&
 	    submission.type == SubmissionType::Graphics) {
 		CpPar::NoteCompleted(submission.cp_par_context); // Astro Bot PC (KYTY_CP_PAR)
+	}
+	if (prep_stats) {
+		// Astro Bot PC (KYTY_CP_PAR=1b1).
+		uint64_t committed = 0;
+		uint64_t fell_back = 0;
+		prep_decisions(committed, fell_back);
+		uint64_t published = 0;
+		uint64_t retired   = 0;
+		cp.CpParWindowCounts(submission.cp_par_context, published, retired);
+		CpPar::NotePrep(submission.cp_par_context, committed - prep_committed,
+		                fell_back - prep_fell_back, published, retired);
 	}
 	if (handoff) {
 		// A constant-engine submission: parsed and executed here, in Direct mode, while the
@@ -2602,7 +2657,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		const auto draw_op = m_emit_ops->Emitted(); // Astro Bot PC (KYTY_CP_PAR)
 		if (!adopted) {
 			AttachDrawRegisters(
-			    op, DrawArgsOf(op), m_draw_prep.get(), m_ctx, m_ucfg, m_sh_ctx,
+			    op, DrawArgsOf(op), EmitPrep(), m_ctx, m_ucfg, m_sh_ctx,
 			    [this] { return WaitForWindowSpace(); }, [this] { return TakeSnapshot(); });
 		}
 		if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
@@ -2626,7 +2681,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 	}
 	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
 		// Thread mode: the sequencer published the draw; commit its prepared slot now, in order.
-		m_draw_prep->CommitPublished(
+		ResolvePrep()->CommitPublished(
 		    op.window, m_submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
 		MaybeYieldSlice();
@@ -2872,7 +2927,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset,
                                     [[maybe_unused]] IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
 	// KYTY_DRAW_PREP_INDIRECT (drawPrep.h): the draw's programs are prepared in a window slot.
-	auto*      engine  = m_draw_prep.get();
+	auto*      engine  = EmitPrep();
 	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
 	                     engine->Parallel() && DrawPrep::Engine::IndirectEnabled();
 	if (prepare && engine->SpeculativeSlots() != 0) {
@@ -2903,7 +2958,7 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 		// KYTY_DRAW_PREP_INDIRECT: the same execution, with the slot's preparation offered.
 		auto plain = op;
 		plain.flags &= ~CpSeq::IndirectFlagPrepared;
-		m_draw_prep->ExecuteIndirect(op.window, [this, &plain] { ExecDrawIndirect(plain); });
+		ResolvePrep()->ExecuteIndirect(op.window, [this, &plain] { ExecDrawIndirect(plain); });
 		return;
 	}
 	if ((op.flags & CpSeq::IndirectFlagSetInstances) != 0) {
@@ -3099,7 +3154,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	// The wave size is register state: the front sets it, the op's execution reads it.
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): the dispatch's program is prepared in a window slot.
-	auto*      engine  = m_draw_prep.get();
+	auto*      engine  = EmitPrep();
 	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
 	                     engine->Parallel() && DrawPrep::DispatchPrepEnabled();
 	if (prepare && engine->SpeculativeSlots() != 0) {
@@ -3136,7 +3191,7 @@ void CommandProcessor::ExecDispatchDirect(const CpSeq::DispatchDirectOp& op) {
 		// KYTY_DRAW_PREP_DISPATCH: the same execution, with the slot's preparation offered.
 		auto plain = op;
 		plain.flags &= ~CpSeq::DispatchFlagPrepared;
-		m_draw_prep->ExecuteDispatch(op.window, [this, &plain] { ExecDispatchDirect(plain); });
+		ResolvePrep()->ExecuteDispatch(op.window, [this, &plain] { ExecDispatchDirect(plain); });
 		return;
 	}
 	const auto thread_group_x = op.x;
@@ -3188,7 +3243,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	// KYTY_DRAW_PREP_DISPATCH: the program of a native indirect dispatch does not depend on its
 	// (GPU-written) arguments. One with thread dimensions reads them on the CPU and runs as a direct
 	// dispatch, unprepared.
-	auto*      engine  = m_draw_prep.get();
+	auto*      engine  = EmitPrep();
 	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
 	                     engine->Parallel() && DrawPrep::DispatchPrepEnabled() &&
 	                     (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0;
@@ -3222,7 +3277,7 @@ void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op)
 		// KYTY_DRAW_PREP_DISPATCH: the same execution, with the slot's preparation offered.
 		auto plain = op;
 		plain.flags &= ~CpSeq::DispatchFlagPrepared;
-		m_draw_prep->ExecuteDispatch(op.window, [this, &plain] { ExecDispatchIndirect(plain); });
+		ResolvePrep()->ExecuteDispatch(op.window, [this, &plain] { ExecDispatchIndirect(plain); });
 		return;
 	}
 	if ((op.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
@@ -3271,7 +3326,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		const auto draw_op = m_emit_ops->Emitted(); // Astro Bot PC (KYTY_CP_PAR)
 		if (!adopted) {
 			AttachDrawRegisters(
-			    op, DrawArgsOf(op), m_draw_prep.get(), m_ctx, m_ucfg, m_sh_ctx,
+			    op, DrawArgsOf(op), EmitPrep(), m_ctx, m_ucfg, m_sh_ctx,
 			    [this] { return WaitForWindowSpace(); }, [this] { return TakeSnapshot(); });
 		}
 		if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
@@ -3293,7 +3348,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 		args.instance_count = NumInstances();
 	}
 	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
-		m_draw_prep->CommitPublished(
+		ResolvePrep()->CommitPublished(
 		    op.window, m_submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
 		MaybeYieldSlice();
@@ -4953,6 +5008,25 @@ void CommandProcessor::AttachSequencer(CpSeq::Sequencer* sequencer) {
 	    DrawPrep::GetMode() != DrawPrep::Mode::Off) {
 		std::printf("Kyty CP sequencer: KYTY_DRAW_PREP=inline prepares on the resolver\n");
 	}
+	if (m_ops_b != nullptr && CpPar::SeparateWindows()) {
+		// Astro Bot PC (KYTY_CP_PAR=1b1): context B's own snapshot ring and, with parallel draw
+		// prep, its own engine (window and workers), created before either thread looks at them.
+		sequencer->AddSnapshotRingB();
+		if (m_draw_prep != nullptr && m_draw_prep->Parallel()) {
+			m_draw_prep_b.reset(new DrawPrep::Engine(
+			    m_renderer,
+			    [] {
+				    if (g_gpu_state != nullptr) {
+					    g_gpu_state->ProcessCommands();
+				    }
+			    },
+			    [this] { MaybeFlushIdleGpu(); }, true));
+		}
+		std::printf("Kyty CpPar: context B has its own snapshot ring (%u entries)%s\n",
+		            sequencer->Snapshots(1).Capacity(),
+		            m_draw_prep_b != nullptr ? " and draw-prep window/workers"
+		                                     : " (draw prep not parallel: no window)");
+	}
 }
 
 void CommandProcessor::DetachSequencer() {
@@ -5169,12 +5243,12 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 	const auto value = m_sequencer->AwaitAnswer(sequence);
 	m_pending_writes.clear();
 	m_barrier_epoch++;
-	if (m_draw_prep != nullptr) {
-		m_draw_prep->NoteStop(1);
+	if (EmitPrep() != nullptr) {
+		EmitPrep()->NoteStop(1);
 	}
 	// The real parse after the wait: its draws are matched with the speculative slots by the
 	// packets and bytes it consumes from here (the wait packet itself completes first).
-	m_adopt_tracking = prefetch && m_draw_prep != nullptr && m_draw_prep->SpeculativeSlots() != 0;
+	m_adopt_tracking = prefetch && EmitPrep() != nullptr && EmitPrep()->SpeculativeSlots() != 0;
 	m_adopt_skip_one = true;
 	m_adopt_packets  = 0;
 	m_adopt_inputs   = 0;
@@ -5200,8 +5274,8 @@ bool CommandProcessor::AwaitPendingWrites(uint64_t begin, uint64_t end) {
 	std::erase_if(m_pending_writes,
 	              [executed](const PendingWrite& write) { return write.op < executed; });
 	m_barrier_epoch++;
-	if (m_draw_prep != nullptr) {
-		m_draw_prep->NoteStop(2);
+	if (EmitPrep() != nullptr) {
+		EmitPrep()->NoteStop(2);
 	}
 	return true;
 }
@@ -5275,7 +5349,7 @@ bool CommandProcessor::CheckCommandBytes(Pm4Execution::BufferCursor& cursor) {
 }
 
 uint32_t CommandProcessor::TakeSnapshot() {
-	auto& ring = m_sequencer->Snapshots();
+	auto& ring = EmitSnapshots();
 	if (!ring.HasFree()) {
 		const auto wake_at = OldestPendingOp(m_snapshot_ops);
 		if (!m_sequencer->Wait([&ring] { return ring.HasFree(); }, wake_at, wake_at)) {
@@ -5331,7 +5405,7 @@ CpSeq::RegisterState* CommandProcessor::OpSnapshot(CpSeq::OpKind kind, const voi
 	if (index == UINT32_MAX || m_sequencer == nullptr) {
 		return nullptr;
 	}
-	return &m_sequencer->Snapshots().Entry(index);
+	return &ResolveSnapshots().Entry(index);
 }
 
 uint64_t CommandProcessor::OldestPendingOp(std::deque<uint64_t>& ops) const {
@@ -5343,7 +5417,7 @@ uint64_t CommandProcessor::OldestPendingOp(std::deque<uint64_t>& ops) const {
 }
 
 bool CommandProcessor::WaitForWindowSpace() {
-	auto*      engine  = m_draw_prep.get();
+	auto*      engine  = EmitPrep();
 	const auto wake_at = OldestPendingOp(m_published_ops);
 	return m_sequencer->Wait([engine] { return engine->WindowHasSpace(); }, wake_at, wake_at);
 }
@@ -5361,6 +5435,15 @@ bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
 	    ring != m_emit_ops) {
 		ring->SetNextSequence(m_emit_ops->Emitted());
 		m_emit_ops = ring;
+		if (CpPar::SeparateWindows()) {
+			// Astro Bot PC (KYTY_CP_PAR=1b1): the draws and snapshots of this submission go to its
+			// context's window and ring, with that context's pending-op lists (speculative slots
+			// never outlive their stream: none is pending here).
+			EXIT_IF(EmitPrep() != nullptr && EmitPrep()->SpeculativeSlots() != 0);
+			m_emit_b = ring == m_ops_b.get();
+			std::swap(m_published_ops, m_published_ops_parked);
+			std::swap(m_snapshot_ops, m_snapshot_ops_parked);
+		}
 	}
 	if (intake.graphics && intake.frame_fence != 0) {
 		// Ordering point (the frame fence): the command bytes of a fenced submission are read only
@@ -5373,8 +5456,8 @@ bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
 	}
 	// Diagnostics: a submission start is a stop of the sequencer when the resolver may have
 	// caught up meanwhile (the next draw starts a burst, FrameEvent DrawPrepCommitWaitsStart).
-	if (m_draw_prep != nullptr) {
-		m_draw_prep->NoteStop(2);
+	if (EmitPrep() != nullptr) {
+		EmitPrep()->NoteStop(2);
 	}
 	m_last_label_known = false;
 	// The front's part of GuestGpu::Process's first slice.
@@ -5610,17 +5693,17 @@ void CommandProcessor::EmitSkipSlots(uint64_t count) {
 
 void CommandProcessor::DropSpeculativeSlots() {
 	m_adopt_tracking = false;
-	if (m_draw_prep == nullptr || !m_draw_prep->Parallel()) {
+	if (EmitPrep() == nullptr || !EmitPrep()->Parallel()) {
 		return;
 	}
-	if (const auto dropped = m_draw_prep->DropSpeculative(); dropped != 0) {
+	if (const auto dropped = EmitPrep()->DropSpeculative(); dropped != 0) {
 		EmitSkipSlots(dropped);
 	}
 }
 
 template <typename Op>
 bool CommandProcessor::AdoptSpeculativeDraw(Op& op) {
-	auto* engine = m_draw_prep.get();
+	auto* engine = EmitPrep();
 	if (engine == nullptr || !engine->Parallel() || engine->SpeculativeSlots() == 0) {
 		m_adopt_tracking = false;
 		return false;
@@ -5724,7 +5807,7 @@ bool CommandProcessor::ReadGuestForPrefetch(uint64_t address, uint64_t size, voi
 template <typename Op>
 void CommandProcessor::PrefetchDraw(const Op& op) {
 	auto* owner  = m_prefetch_owner;
-	auto* engine = owner != nullptr ? owner->m_draw_prep.get() : nullptr;
+	auto* engine = owner != nullptr ? owner->EmitPrep() : nullptr;
 	EXIT_IF(engine == nullptr || !engine->Parallel());
 	if (m_prefetch_stop) {
 		return;
@@ -5777,7 +5860,7 @@ void CommandProcessor::PrefetchDraw(const Op& op) {
 }
 
 void CommandProcessor::RunPrefetch(uint64_t wait_op) {
-	auto*       engine    = m_draw_prep.get();
+	auto*       engine    = EmitPrep();
 	const auto* execution = g_current_execution;
 	if (engine == nullptr || !engine->Parallel() || execution == nullptr ||
 	    execution->m_buffer_stack.empty() || engine->SpeculativeSlots() != 0) {
@@ -5872,6 +5955,9 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 	// Astro Bot PC (KYTY_CP_PAR=1a): the resolver context's op ring (always m_ops when off).
 	EXIT_IF(context != 0 && m_ops_b == nullptr);
 	auto& ops = context != 0 ? *m_ops_b : *m_ops;
+	// Astro Bot PC (KYTY_CP_PAR=1b1): ResolvePrep / ResolveSnapshots follow this context (only
+	// read by the op executions below; the next ResolveSubmission sets it again).
+	m_resolve_b = context != 0 && CpPar::SeparateWindows();
 	const CpGaps::Scope gap(CpGaps::Cat::Resolver);
 	EXIT_IF(g_current_execution != nullptr || m_front_mode != FrontMode::Thread);
 	handoff                   = false;
@@ -5997,8 +6083,8 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		}
 		if (kind == CpSeq::OpKind::SkipSlots) {
 			// P3c: speculative slots the real parse did not adopt (no op draws them).
-			EXIT_IF(m_draw_prep == nullptr);
-			m_draw_prep->SkipPublished(view.As<CpSeq::SkipSlotsOp>().count);
+			EXIT_IF(ResolvePrep() == nullptr);
+			ResolvePrep()->SkipPublished(view.As<CpSeq::SkipSlotsOp>().count);
 			ops.Pop();
 			sequencer.NoteExecuted(sequence + 1u);
 			execution.m_made_progress = true;
@@ -6074,7 +6160,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			m_verifier->After(view, result);
 		}
 		if (snapshot != nullptr) {
-			sequencer.Snapshots().Release();
+			ResolveSnapshots().Release();
 		}
 		ops.Pop();
 		if (CpSeq::IsLockstep(kind)) {

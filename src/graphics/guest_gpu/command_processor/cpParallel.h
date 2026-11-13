@@ -32,6 +32,17 @@
 // waits on deferred labels) run on resolver #2 under the borrowed identity, Thread_Gpu being
 // parked meanwhile (still fully serialized).
 //
+// KYTY_CP_PAR=1b1 (stage 1b-i; same execution in turn as 1a): context B also gets its own register
+// snapshot ring (CpSeq::Sequencer::Snapshots(1)) and, with KYTY_DRAW_PREP=parallel, its own
+// draw-prep engine (CommandProcessor::m_draw_prep_b: its own window and its own worker set,
+// "DrawPrep B#k", KYTY_CP_PAR_B_WORKERS default 3, KYTY_CP_PAR_B_HOT default 1). The sequencer
+// publishes a submission's draws (and takes its snapshots) in its context's window (ring), with
+// its own pending-op lists; each context's resolver commits and retires only its own window, so a
+// context's in-order retire no longer depends on the other context's progress. The worker
+// threads are not shared between the two windows: a worker's loop, its parking gate and its wake
+// predicates follow one window (workerGate.h RunPreparationWorker), and making them serve two
+// would touch the default path.
+//
 // Fallbacks (the submission stays in context A, on Thread_Gpu) are counted by reason; a
 // "CpPar 10s: ..." console line reports them every 10 s with the submissions and resolving time
 // of each thread.
@@ -40,12 +51,16 @@
 
 namespace Libs::Graphics::CpPar {
 
-enum class Mode : uint8_t { Off, Serial1a };
+enum class Mode : uint8_t { Off, Serial1a, Serial1b1 };
 
 // KYTY_CP_PAR, read once.
 [[nodiscard]] Mode GetMode();
 [[nodiscard]] inline bool Enabled() {
 	return GetMode() != Mode::Off;
+}
+// KYTY_CP_PAR=1b1: context B has its own snapshot ring and draw-prep engine (see above).
+[[nodiscard]] inline bool SeparateWindows() {
+	return GetMode() == Mode::Serial1b1;
 }
 
 enum class Fallback : uint32_t {
@@ -86,6 +101,11 @@ void NoteCompleted(uint32_t context);
 void NoteResolveTime(uint32_t context, uint64_t ns);
 // Resolver #2 asked Thread_Gpu to run something: service commands, or a flip op.
 void NoteBounce(bool flip_op);
+// KYTY_CP_PAR=1b1, Thread_Gpu after a slice of `context`: draws committed (preparation accepted)
+// and fallen back (serial preparation) during it, and the totals of that context's draw-prep
+// window so far (positions published, retired).
+void NotePrep(uint32_t context, uint64_t committed, uint64_t fell_back, uint64_t published,
+              uint64_t retired);
 // Thread_Gpu: prints "CpPar 10s: ..." once 10 s have passed since the last line.
 void MaybeReport();
 

@@ -1144,9 +1144,10 @@ private:
 struct Engine::Workers {
 	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns,
 	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns, StealPolicy steal,
-	        bool cold_token)
+	        bool cold_token, const char* name_format = "DrawPrep#%u")
 	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns),
-	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token) {
+	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token),
+	      name_format(name_format) {
 		for (uint32_t index = 0; index < count; index++) {
 			threads.emplace_back([this, index] { Run(index); });
 		}
@@ -1196,7 +1197,7 @@ struct Engine::Workers {
 
 	void Run(uint32_t index) {
 		char name[32];
-		std::snprintf(name, sizeof(name), "DrawPrep#%u", index + 1u);
+		std::snprintf(name, sizeof(name), name_format, index + 1u); // Astro Bot PC (KYTY_CP_PAR)
 		Profiler::SetThreadName(name);
 		t_worker_thread = true;
 		uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 64th slot
@@ -1219,12 +1220,14 @@ struct Engine::Workers {
 	uint64_t                 cold_spin_ns = 0;
 	StealPolicy              steal; // KYTY_DRAW_PREP_STEAL, KYTY_DRAW_PREP_STEAL_AFTER_US
 	WorkerGate               gate;
+	// Astro Bot PC (KYTY_CP_PAR=1b1): the threads' name ("DrawPrep#%u", or "DrawPrep B#%u").
+	const char*              name_format;
 	std::atomic<bool>        stop {false};
 	std::vector<std::thread> threads;
 };
 
 Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
-               std::function<void()> after_commit)
+               std::function<void()> after_commit, bool context_b)
     : m_renderer(renderer), m_mode(GetMode()), m_service_commands(std::move(service_commands)),
       m_after_commit(std::move(after_commit)), m_inline_slot(std::make_unique<Slot>()) {
 	if (RepeatTrace::Enabled()) {
@@ -1232,14 +1235,18 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 	}
 	if (m_mode == Mode::Parallel) {
 		const auto window  = EnvUnsigned("KYTY_DRAW_PREP_WINDOW", 32, 2, 1024);
-		const auto workers = EnvUnsigned("KYTY_DRAW_PREP_WORKERS", 6, 1, 32);
+		// Astro Bot PC (KYTY_CP_PAR=1b1): resolver context B's engine has its own, smaller worker
+		// set (KYTY_CP_PAR_B_WORKERS, default 3) with KYTY_CP_PAR_B_HOT (default 1) hot workers.
+		const auto workers = context_b ? EnvUnsigned("KYTY_CP_PAR_B_WORKERS", 3, 1, 32)
+		                               : EnvUnsigned("KYTY_DRAW_PREP_WORKERS", 6, 1, 32);
 		const auto spin_us = EnvUnsigned("KYTY_DRAW_PREP_SPIN_US", 200, 0, 1000000);
 		// Workers that keep spinning; the rest park until the backlog needs them. A value of at
 		// least KYTY_DRAW_PREP_WORKERS keeps every worker hot (the behaviour before the gate).
 		// Wake a parked worker once 2 slots wait unclaimed (8 until U54: the CP then waited for
 		// heads 2.5x as long after short bursts, DEEP-TRACE-U54 3.1; draw_prep_tests
 		// --measure-worker-gate, heavy bursts: 270.4 -> 265.2 ms, no extra worker CPU).
-		const auto hot          = EnvUnsigned("KYTY_DRAW_PREP_HOT", 2, 1, 32);
+		const auto hot          = context_b ? EnvUnsigned("KYTY_CP_PAR_B_HOT", 1, 1, 32)
+		                                    : EnvUnsigned("KYTY_DRAW_PREP_HOT", 2, 1, 32);
 		const auto wake_backlog = EnvUnsigned("KYTY_DRAW_PREP_WAKE_BACKLOG", 2, 1, 1024);
 		const auto cold_spin_us = EnvUnsigned("KYTY_DRAW_PREP_COLD_SPIN_US", 50, 0, 1000000);
 		// Work stealing while a worker holds the head (Engine::CommitHead): the unclaimed backlog
@@ -1256,11 +1263,13 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		const bool cold_token = EnvUnsigned("KYTY_DRAW_PREP_COLD_TOKEN", 0, 0, 1) != 0;
 		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
 		                                      uint64_t {spin_us} * 1000u, hot, wake_backlog,
-		                                      uint64_t {cold_spin_us} * 1000u, steal, cold_token);
+		                                      uint64_t {cold_spin_us} * 1000u, steal, cold_token,
+		                                      context_b ? "DrawPrep B#%u" : "DrawPrep#%u");
 		m_workers->plan_context = MakeBindingPlanContext(m_renderer);
-		LOGF("DrawPrep: parallel mode, window=%u workers=%u spin=%uus hot=%u wake_backlog=%u "
+		LOGF("DrawPrep%s: parallel mode, window=%u workers=%u spin=%uus hot=%u wake_backlog=%u "
 		     "cold_spin=%uus cold_token=%d steal=%u steal_after=%uus cert=%s verify=%d\n",
-		     m_workers->window.Capacity(), workers, spin_us, m_workers->gate.HotCount(),
+		     context_b ? " (CpPar context B)" : "", m_workers->window.Capacity(), workers, spin_us,
+		     m_workers->gate.HotCount(),
 		     wake_backlog, cold_spin_us, cold_token ? 1 : 0, steal.min_unclaimed, steal_us,
 		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode());
 	}
@@ -1269,6 +1278,11 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 Engine::~Engine() {
 	// Pending draws at teardown are dropped with the stream (shutdown only).
 	m_workers.reset();
+}
+
+void Engine::WindowCounts(uint64_t& published, uint64_t& retired) const noexcept {
+	published = m_workers != nullptr ? m_workers->window.Tail() : 0u;
+	retired   = m_workers != nullptr ? m_workers->window.Head() : 0u;
 }
 
 bool Engine::Pending() const noexcept {

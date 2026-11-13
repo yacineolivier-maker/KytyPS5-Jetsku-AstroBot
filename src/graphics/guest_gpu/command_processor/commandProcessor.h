@@ -25,6 +25,7 @@ class Verifier;
 class Sequencer;
 struct Intake;
 struct RegisterState;
+class SnapshotRing; // Astro Bot PC (KYTY_CP_PAR)
 } // namespace CpSeq
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
@@ -260,6 +261,9 @@ public:
 	Pm4ProcessResult ResolveSubmission(Pm4Execution& execution, uint64_t submission,
 	                                   std::span<const uint32_t> commands, bool& handoff,
 	                                   uint32_t context = 0);
+	// Astro Bot PC (KYTY_CP_PAR=1b1), statistics: the window totals (DrawPrep::Engine::WindowCounts)
+	// of resolver context `context`'s draw-prep engine; zeros without one.
+	void CpParWindowCounts(uint32_t context, uint64_t& published, uint64_t& retired) const;
 	void             BeginHandoff();
 	void             EndHandoff(uint64_t submission);
 	// Tests: back to Direct once the sequencer is stopped and its ops are executed.
@@ -433,6 +437,14 @@ private:
 	// Draw-prep (drawPrep.h): the engine of the graphics processor, created on first use when
 	// KYTY_DRAW_PREP (or the S0 histogram) is enabled; null otherwise.
 	[[nodiscard]] DrawPrep::Engine* DrawPrepEngine();
+	// Astro Bot PC (KYTY_CP_PAR=1b1, cpParallel.h): the draw-prep engine and snapshot ring of the
+	// resolver context the sequencer is parsing for (Emit*: sequencer thread and its speculative
+	// front) or the resolver is executing (Resolve*: inside ResolveSubmission). Context A's (the
+	// only ones) unless KYTY_CP_PAR=1b1.
+	[[nodiscard]] DrawPrep::Engine*    EmitPrep() const;
+	[[nodiscard]] DrawPrep::Engine*    ResolvePrep() const;
+	[[nodiscard]] CpSeq::SnapshotRing& EmitSnapshots() const;
+	[[nodiscard]] CpSeq::SnapshotRing& ResolveSnapshots() const;
 	[[nodiscard]] bool TrySubmitPreparedDraw(const DrawIndexArgs* index_args,
 	                                         const DrawAutoArgs*  auto_args);
 	void               DrainPreparedDraws();
@@ -505,6 +517,13 @@ private:
 		void operator()(DrawPrep::Engine* engine) const noexcept;
 	};
 	std::unique_ptr<DrawPrep::Engine, DrawPrepDeleter> m_draw_prep;
+	// Astro Bot PC (KYTY_CP_PAR=1b1): resolver context B's draw-prep engine (parallel draw prep
+	// only; null otherwise). m_emit_b: the sequencer is parsing a context-B submission (sequencer
+	// thread). m_resolve_b: the resolver executes one (set by ResolveSubmission; the two
+	// resolvers run in turn, the token orders the accesses).
+	std::unique_ptr<DrawPrep::Engine, DrawPrepDeleter> m_draw_prep_b;
+	bool                                               m_emit_b    = false;
+	bool                                               m_resolve_b = false;
 	// Packets processed, for the CP's placement samples (common/cpuPlacement.h).
 	uint32_t m_placement_packets = 0;
 
@@ -576,6 +595,10 @@ private:
 	// op whose execution frees the next slot or snapshot (the sequencer's wake threshold).
 	std::deque<uint64_t> m_published_ops;
 	std::deque<uint64_t> m_snapshot_ops;
+	// Astro Bot PC (KYTY_CP_PAR=1b1): the same lists of the resolver context the sequencer is not
+	// parsing for (swapped with the two above when it switches context).
+	std::deque<uint64_t> m_published_ops_parked;
+	std::deque<uint64_t> m_snapshot_ops_parked;
 	// Resolver (GPU thread): the register files bound outside ops with a snapshot; the packet
 	// count of the last op (EOP flush batching); a suspended op that is retried (sequence + 1;
 	// the verifier compared it at its first execution).

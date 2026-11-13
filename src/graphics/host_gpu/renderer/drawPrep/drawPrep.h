@@ -263,8 +263,10 @@ public:
 	// idle-GPU early submit). Commits happen at packet boundaries (before a fence packet or a
 	// service command, at the end of a slice) or at the start of a draw packet, before the
 	// packet records anything, so a flush there splits no packet.
+	// Astro Bot PC (KYTY_CP_PAR=1b1): `context_b` makes the engine of resolver context B (its own
+	// window and worker set, "DrawPrep B#k", KYTY_CP_PAR_B_WORKERS / KYTY_CP_PAR_B_HOT).
 	Engine(RenderContext& renderer, std::function<void()> service_commands,
-	       std::function<void()> after_commit);
+	       std::function<void()> after_commit, bool context_b = false);
 	~Engine();
 	Engine(const Engine&)            = delete;
 	Engine& operator=(const Engine&) = delete;
@@ -277,6 +279,9 @@ public:
 	// Commits every pending draw in submission order.
 	void Drain();
 	[[nodiscard]] bool Pending() const noexcept;
+	// Astro Bot PC (KYTY_CP_PAR=1b1), statistics (any thread): window positions published so far
+	// (speculative ones included) and retired so far; 0 outside parallel mode.
+	void WindowCounts(uint64_t& published, uint64_t& retired) const noexcept;
 
 	// P3b (KYTY_CP_SEQ=1, cpSequencer.h): the sequencer thread publishes each direct draw (the
 	// window's producer) and the resolver commits it when it executes the draw's op, so the
