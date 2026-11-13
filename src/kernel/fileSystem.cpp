@@ -20,12 +20,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <climits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <optional>
 #include <random>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -360,6 +362,18 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		}
 
 		const auto native_rel_path = Common::PathFromUtf8(rel_path);
+		// Astro Bot PC : KYTY_APP0_OVERLAY=<dossier> remplace un fichier de /app0 par sa copie de ce dossier quand elle
+		// existe (par exemple args.txt pour choisir le niveau), sans toucher au dossier du jeu.
+		if (p.point == "/app0/" && !rel_path.empty()) {
+			static const char* overlay = std::getenv("KYTY_APP0_OVERLAY");
+			if (overlay != nullptr && overlay[0] != '\0') {
+				std::error_code ec;
+				auto candidate = Common::PathFromUtf8(overlay) / native_rel_path;
+				if (std::filesystem::is_regular_file(candidate, ec)) {
+					return candidate;
+				}
+			}
+		}
 		if (Common::IsArchivePath(p.dir)) {
 			return p.dir / native_rel_path;
 		}
@@ -623,6 +637,163 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 	}
 }
 
+// Astro Bot PC : KYTY_APP0_SUBST=<fichier de regles> remplace en memoire, a la lecture, des octets d'un fichier
+// de /app0 par d'autres de meme longueur (reglages d'un fichier texte du jeu, sans copier ni modifier le jeu).
+// Une regle par ligne, champs separes par une tabulation ; lignes vides et # ignorees :
+//   <chemin sous /app0>  <ancien texte>  <nouveau texte>     remplacement exact (meme longueur)
+//   <chemin sous /app0>  <balise>        max:<valeur>        plafond : le nombre qui suit la balise (jusqu'a '<')
+//                                                            est ramene a <valeur> s'il la depasse, ecrit sur la
+//                                                            meme largeur (ex. <DirShadowFar> max:20 : 35.0 -> 20.0)
+// Un chemin finissant par '*' vaut pour tous les fichiers de ce dossier (ex. data/prein/spx/*).
+// Les occurrences a cheval sur deux lectures ne sont pas traitees (fichiers lus d'un bloc).
+struct App0Subst {
+	std::string path;
+	bool        wildcard = false;
+	std::string from;
+	std::string to;
+	bool        is_max = false;
+	double      max    = 0.0;
+};
+
+static const std::vector<App0Subst>& App0Substs() {
+	static const std::vector<App0Subst> rules = [] {
+		std::vector<App0Subst> r;
+		const char*            env = std::getenv("KYTY_APP0_SUBST");
+		if (env == nullptr || env[0] == '\0') {
+			return r;
+		}
+		FILE* f = std::fopen(env, "rb");
+		if (f == nullptr) {
+			::printf("App0Subst: regles introuvables : %s\n", env);
+			return r;
+		}
+		char line[1024];
+		while (std::fgets(line, sizeof(line), f) != nullptr) {
+			std::string s(line);
+			while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
+				s.pop_back();
+			}
+			if (s.empty() || s[0] == '#') {
+				continue;
+			}
+			const auto a = s.find('\t');
+			const auto b = a == std::string::npos ? a : s.find('\t', a + 1);
+			if (b == std::string::npos) {
+				::printf("App0Subst: ligne ignoree (2 tabulations attendues) : %s\n", s.c_str());
+				continue;
+			}
+			App0Subst rule;
+			rule.path = "/" + s.substr(0, a);
+			rule.from = s.substr(a + 1, b - a - 1);
+			rule.to   = s.substr(b + 1);
+			if (!rule.path.empty() && rule.path.back() == '*') {
+				rule.wildcard = true;
+				rule.path.pop_back();
+			}
+			if (rule.to.rfind("max:", 0) == 0) {
+				rule.is_max = true;
+				rule.max    = std::strtod(rule.to.c_str() + 4, nullptr);
+			} else if (rule.from.empty() || rule.from.size() != rule.to.size()) {
+				::printf("App0Subst: ligne ignoree (longueurs differentes) : %s\n", s.c_str());
+				continue;
+			}
+			if (rule.from.empty()) {
+				continue;
+			}
+			::printf("App0Subst: %s%s : \"%s\" -> \"%s\"\n", rule.path.c_str(), rule.wildcard ? "*" : "",
+			         rule.from.c_str(), rule.to.c_str());
+			r.push_back(std::move(rule));
+		}
+		std::fclose(f);
+		return r;
+	}();
+	return rules;
+}
+
+static bool App0SubstPathMatches(const App0Subst& rule, const std::string& n) {
+	if (!rule.wildcard) {
+		return n.size() >= rule.path.size() &&
+		       n.compare(n.size() - rule.path.size(), rule.path.size(), rule.path) == 0;
+	}
+	const auto pos = n.rfind(rule.path);
+	return pos != std::string::npos && n.find('/', pos + rule.path.size()) == std::string::npos;
+}
+
+// Plafond : le nombre en p[0..width) (jusqu'a '<') ramene a max, ecrit sur la meme largeur. Faux si inchange.
+static bool App0SubstClamp(char* p, size_t width, double max) {
+	if (width == 0 || width > 31) {
+		return false;
+	}
+	char        old_text[32] {};
+	std::memcpy(old_text, p, width);
+	char*       end   = nullptr;
+	const double value = std::strtod(old_text, &end);
+	if (end == old_text || value <= max) {
+		return false;
+	}
+	// Plus grand nombre de decimales qui tient dans la largeur ; espaces a droite si la valeur est plus courte.
+	char text[64] {};
+	for (int decimals = 6; decimals >= 0; decimals--) {
+		const int len = std::snprintf(text, sizeof(text), "%.*f", decimals, max);
+		if (len > 0 && static_cast<size_t>(len) <= width) {
+			std::memset(p, ' ', width);
+			std::memcpy(p, text, static_cast<size_t>(len));
+			return true;
+		}
+	}
+	return false;
+}
+
+// Le chemin (invite /app0/... ou hote E:\...\data\...) doit finir par "/" + le chemin de la regle.
+void ApplyApp0Substs(const std::string& name, void* buf, uint64_t bytes) {
+	const auto& rules = App0Substs();
+	if (rules.empty() || bytes == 0) [[likely]] {
+		return;
+	}
+	std::string n = name;
+	std::replace(n.begin(), n.end(), '\\', '/');
+	auto* data = static_cast<char*>(buf);
+	char* stop = data + bytes;
+	for (const auto& rule: rules) {
+		if (!App0SubstPathMatches(rule, n)) {
+			continue;
+		}
+		uint32_t hits = 0;
+		for (char* p = data; p + rule.from.size() <= stop;) {
+			p = static_cast<char*>(std::memchr(p, rule.from[0], static_cast<size_t>(stop - p)));
+			if (p == nullptr || p + rule.from.size() > stop) {
+				break;
+			}
+			if (std::memcmp(p, rule.from.data(), rule.from.size()) != 0) {
+				p++;
+				continue;
+			}
+			if (rule.is_max) {
+				char* v = p + rule.from.size();
+				char* e = v;
+				while (e < stop && *e != '<' && *e != '\r' && *e != '\n') {
+					e++;
+				}
+				if (App0SubstClamp(v, static_cast<size_t>(e - v), rule.max)) {
+					hits++;
+				}
+				p = e;
+			} else {
+				std::memcpy(p, rule.to.data(), rule.to.size());
+				p += rule.to.size();
+				hits++;
+			}
+		}
+		if (hits != 0 || !rule.wildcard) {
+			::printf("App0Subst: %s : %u remplacement(s) de \"%s\"\n", n.c_str(), hits, rule.from.c_str());
+		}
+	}
+}
+
+static void ApplyApp0Substs(const File* file, void* buf, uint32_t bytes) {
+	ApplyApp0Substs(file->name, buf, bytes);
+}
+
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
 
@@ -678,6 +849,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
+	ApplyApp0Substs(file, buf, bytes_read);
 
 	file->mutex.Unlock();
 
@@ -868,6 +1040,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		Profiler::ScopedLoadingOperation native_read(Profiler::LoadingOperation::PreadNativeRead);
 		file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	}
+	ApplyApp0Substs(file, buf, bytes_read);
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadReadBytes, bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 	file->f.Seek(pos);

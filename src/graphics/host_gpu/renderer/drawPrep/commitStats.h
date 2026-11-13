@@ -248,6 +248,12 @@ struct DrawShape {
 	uint64_t struct_input     = 0; // cross-frame: structure only
 	bool     shader_writes    = false;
 	bool     run_continued    = false; // KYTY_DRAW_RUN continued the previous draw's run
+	// Porteur Astro Bot (diagnostic local) : la passe de rendu du dessin, pour la ligne « Passes ».
+	uint32_t pass_width       = 0;
+	uint32_t pass_height      = 0;
+	uint32_t pass_layers      = 0;
+	uint32_t pass_colors      = 0;
+	bool     pass_depth       = false;
 };
 
 // GPU thread (the command processor's resolver), around DrawPrep::Engine::Commit.

@@ -12,6 +12,8 @@
 #include <array>
 #include <bitset>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -902,10 +904,65 @@ void CollectRedZoneMemoryInstructions(const DecodedFunction&                   f
 	}
 }
 
+// Astro Bot PC : KYTY_AMD_RSQRT=exact (defaut, ci-dessous) | fast | native.
+// fast : 1/sqrt en simple precision (VSQRTPS puis VDIVPS), sans changer MXCSR ni passer en double ;
+//        ecart d'au plus quelques ulp avec exact (VRSQRTPS d'AMD n'a que ~12 bits justes). Les entrees
+//        denormales ne sont pas mises a zero (DAZ) : resultat fini au lieu de +inf.
+// native : VRSQRTPS n'est pas reecrit (approximation d'Intel, meme precision garantie que celle d'AMD).
+enum class AmdRsqrtMode { Exact, Fast, Native };
+static AmdRsqrtMode GetAmdRsqrtMode() {
+	static const AmdRsqrtMode mode = [] {
+		const char* v = std::getenv("KYTY_AMD_RSQRT");
+		AmdRsqrtMode m = AmdRsqrtMode::Exact;
+		if (v != nullptr && std::strcmp(v, "fast") == 0) {
+			m = AmdRsqrtMode::Fast;
+		} else if (v != nullptr && std::strcmp(v, "native") == 0) {
+			m = AmdRsqrtMode::Native;
+		}
+		::printf("AMD instruction patch: VRSQRTPS mode %s (KYTY_AMD_RSQRT)\n",
+		         m == AmdRsqrtMode::Fast ? "fast" : m == AmdRsqrtMode::Native ? "native" : "exact");
+		return m;
+	}();
+	return mode;
+}
+
+// fast : meme contrat de registres que la version exacte (scratch sauvegarde, RFLAGS intacts).
+static void GenerateReciprocalSquareRootFast(const DecodedCodeInstruction& decoded,
+                                             Xbyak::CodeGenerator&         generator) {
+	const int destination   = decoded.operands[0].reg.value - ZYDIS_REGISTER_XMM0;
+	const int source        = decoded.operands[1].reg.value - ZYDIS_REGISTER_XMM0;
+	int       scratch_index = 0;
+	while (scratch_index == destination || scratch_index == source) {
+		++scratch_index;
+	}
+	const Xbyak::Ymm scratch(scratch_index);
+	Xbyak::Label     one;
+	Xbyak::Label     done;
+	constexpr size_t SpillSize = 32;
+	generator.lea(rsp, ptr[rsp - GuestRedZoneSize - SpillSize]);
+	generator.vmovdqu(ptr[rsp], scratch);
+	generator.vsqrtps(Xbyak::Xmm(scratch_index), Xbyak::Xmm(source));
+	generator.vbroadcastss(Xbyak::Xmm(destination), ptr[rip + one]);
+	generator.vdivps(Xbyak::Xmm(destination), Xbyak::Xmm(destination), Xbyak::Xmm(scratch_index)); // VEX.128 : haut YMM a zero.
+	generator.vmovdqu(scratch, ptr[rsp]);
+	generator.lea(rsp, ptr[rsp + GuestRedZoneSize + SpillSize]);
+	generator.jmp(done);
+	if (Xbyak::GetError() != 0) {
+		return;
+	}
+	generator.L(one);
+	generator.dd(0x3f800000u);
+	generator.L(done);
+}
+
 // Compute 1/sqrt in double precision, rounded to float, with denormals treated as
 // signed zero. Preserve guest MXCSR, RFLAGS and the scratch register's full YMM.
 void GenerateReciprocalSquareRoot(const DecodedCodeInstruction& decoded,
                                   Xbyak::CodeGenerator&         generator) {
+	if (GetAmdRsqrtMode() == AmdRsqrtMode::Fast) {
+		GenerateReciprocalSquareRootFast(decoded, generator);
+		return;
+	}
 	const int destination   = decoded.operands[0].reg.value - ZYDIS_REGISTER_XMM0;
 	const int source        = decoded.operands[1].reg.value - ZYDIS_REGISTER_XMM0;
 	int       scratch_index = 0;
@@ -1017,7 +1074,7 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 	for (const auto& [address, decoded]: function.instructions) {
 		const auto&            instruction = decoded.instruction;
 		InstructionReplacement replacement {};
-		if (instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
+		if (instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS && GetAmdRsqrtMode() != AmdRsqrtMode::Native &&
 		    instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
 		    instruction.raw.vex.offset == 0 && decoded.operands[0].size == 128 &&
 		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {

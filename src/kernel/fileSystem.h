@@ -56,6 +56,8 @@ void                  Mount(const std::filesystem::path& folder, const std::stri
 void                  Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
+// Astro Bot PC (KYTY_APP0_SUBST) : remplacements de meme longueur dans des octets lus d'un fichier du jeu.
+void ApplyApp0Substs(const std::string& name, void* buf, uint64_t bytes);
 // Returns whether d is an open file, directory or device descriptor.
 bool                  IsOpenDescriptor(int d);
 

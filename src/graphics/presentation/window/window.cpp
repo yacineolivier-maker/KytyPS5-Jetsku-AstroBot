@@ -193,6 +193,13 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 					ToggleDesktopFullscreen();
 				}
 				break;
+			case SDLK_ESCAPE:
+				// Astro Bot PC : Echap ramene la fenetre du plein ecran au mode fenetre (Alt+Entree l'y met).
+				if (!key.repeat && g_window != nullptr && g_window->window != nullptr &&
+				    (static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window)) & SDL_WINDOW_FULLSCREEN) != 0u) {
+					ToggleDesktopFullscreen();
+				}
+				break;
 			case SDLK_RETURN:
 			case SDLK_KP_ENTER:
 				if (!key.repeat && (key.mod & SDL_KMOD_ALT) != 0) {
