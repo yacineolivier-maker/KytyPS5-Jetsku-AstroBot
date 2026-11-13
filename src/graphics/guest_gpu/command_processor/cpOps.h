@@ -172,6 +172,9 @@ inline constexpr uint32_t DrawFlagInheritInstances = 1u << 0u; // instance count
 // the register snapshot `snapshot` (cpSequencer.h). Transport fields: the verifier ignores them.
 inline constexpr uint32_t DrawFlagPublished = 1u << 1u;
 inline constexpr uint32_t DrawFlagSnapshot  = 1u << 2u;
+// Astro Bot PC (KYTY_NATIVE_MODE=n2): bits 8..13 carry a spliced native draw's tag
+// (loader/gameCapture.h kNativeOpFlag, slot, segment start); only the resolver's timing reads it.
+inline constexpr uint32_t DrawFlagNativeMask = 0x3fu << 8u;
 
 // A draw packet (DRAW_INDEX_2, DRAW_INDEX_OFFSET_2, DRAW_INDEX_AUTO): the DrawIndexArgs /
 // DrawAutoArgs the direct path would pass on, with the index type of the packet's front state.

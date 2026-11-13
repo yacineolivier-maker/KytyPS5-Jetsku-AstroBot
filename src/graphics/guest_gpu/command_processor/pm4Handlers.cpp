@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -802,9 +803,8 @@ KYTY_HW_CTX_PARSER(HwCtxSetModeControl) {
 	return 1;
 }
 
-static void HwCtxSetPolyOffsetRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
-	HW::PolyOffset offset = cp.GetCtx().GetPolyOffset();
-
+// One PA_SU_POLY_OFFSET_* register applied to `offset` (also the KYTY_NATIVE n2 record decoder).
+static void ApplyPolyOffsetRegister(HW::PolyOffset& offset, uint32_t cmd_offset, uint32_t value) {
 	switch (cmd_offset) {
 		case Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL: {
 			const auto neg_bits =
@@ -831,7 +831,11 @@ static void HwCtxSetPolyOffsetRegister(CommandProcessor& cp, uint32_t cmd_offset
 			EXIT("unknown polygon offset context register 0x%03" PRIx32 " = 0x%08" PRIx32 "\n",
 			     cmd_offset, value);
 	}
+}
 
+static void HwCtxSetPolyOffsetRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	HW::PolyOffset offset = cp.GetCtx().GetPolyOffset();
+	ApplyPolyOffsetRegister(offset, cmd_offset, value);
 	cp.GetCtx().SetPolyOffset(offset);
 }
 
@@ -2326,6 +2330,129 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 //   window and op emission, speculative prefetch slot, reference capture). Only the real parse
 //   consumes the record. A record miss is counted and the draw skipped (KYTY_NATIVE_VERIFY=1:
 //   exit).
+// KYTY_NATIVE_MODE=n2 with KYTY_NATIVE_VERIFY=1: the game thread's record of a native draw,
+// decoded with the command processor's own register decoders, against the CP's registers at the
+// marker (the state the spliced draw is recorded with). Registers the game did not re-emit on its
+// context since the list began are skipped ("unknown"). Real parse only.
+static void NativeVerifyRecord(CommandProcessor& cp, const Loader::GameCapture::NativeDraw& n,
+                               const uint32_t* marker) {
+	namespace GC = Loader::GameCapture;
+	const auto& ctx      = cp.GetCtx();
+	const auto& sh       = cp.GetShCtx();
+	uint32_t    mismatch = 0;
+	uint32_t    unknown  = 0;
+	std::string detail;
+	static std::atomic<uint32_t> detail_budget {8};
+	const bool  want_detail = detail_budget.load(std::memory_order_relaxed) != 0;
+	const auto  check = [&](uint32_t field, bool known, bool equal, const auto& describe) {
+		if (!known) {
+			unknown |= 1u << field;
+			return;
+		}
+		if (!equal) {
+			mismatch |= 1u << field;
+			if (want_detail) {
+				detail += describe();
+			}
+		}
+	};
+	const auto same = [](const auto& a, const auto& b) { return std::memcmp(&a, &b, sizeof(a)) == 0; };
+	const auto hex  = [](const char* name, uint64_t game, uint64_t cpv) {
+		char text[96];
+		std::snprintf(text, sizeof(text), " %s game 0x%" PRIx64 " cp 0x%" PRIx64, name, game, cpv);
+		return std::string(text);
+	};
+	// Programs.
+	check(GC::kNvPgmEs, (n.known & GC::kNkPgmEs) != 0, n.pgm_es == sh.GetVs().es_regs.data_addr,
+	      [&] { return hex("es", n.pgm_es, sh.GetVs().es_regs.data_addr); });
+	check(GC::kNvPgmGs, (n.known & GC::kNkPgmGs) != 0, n.pgm_gs == sh.GetVs().gs_regs.data_addr,
+	      [&] { return hex("gs", n.pgm_gs, sh.GetVs().gs_regs.data_addr); });
+	check(GC::kNvPgmPs, (n.known & GC::kNkPgmPs) != 0, n.pgm_ps == sh.GetPs().ps_regs.data_addr,
+	      [&] { return hex("ps", n.pgm_ps, sh.GetPs().ps_regs.data_addr); });
+	// User data (SGPRs).
+	uint32_t bad_gs = 0;
+	uint32_t bad_ps = 0;
+	for (uint32_t i = 0; i < 32; i++) {
+		if ((n.user_gs_known & (1u << i)) != 0 && n.user_gs[i] != sh.GetVs().gs_user_sgpr.value[i]) bad_gs |= 1u << i;
+		if ((n.user_ps_known & (1u << i)) != 0 && n.user_ps[i] != sh.GetPs().ps_user_sgpr.value[i]) bad_ps |= 1u << i;
+	}
+	check(GC::kNvUserGs, n.user_gs_known != 0, bad_gs == 0, [&] { return hex("user-gs-bad-mask", bad_gs, n.user_gs_known); });
+	check(GC::kNvUserPs, n.user_ps_known != 0, bad_ps == 0, [&] { return hex("user-ps-bad-mask", bad_ps, n.user_ps_known); });
+	// Fixed function, decoded with the CP's decoders.
+	check(GC::kNvRenderCtl, (n.known & GC::kNkRenderCtl) != 0,
+	      same(DecodeRenderControl(n.db_render_control), ctx.GetRenderControl()),
+	      [&] { return hex("db-render-control", n.db_render_control, 0); });
+	check(GC::kNvDepthCtl, (n.known & GC::kNkDepthCtl) != 0,
+	      same(DecodeDepthControl(n.db_depth_control), ctx.GetDepthControl()),
+	      [&] { return hex("db-depth-control", n.db_depth_control, 0); });
+	check(GC::kNvStencilCtl, (n.known & GC::kNkStencilCtl) != 0,
+	      same(DecodeStencilControl(n.db_stencil_control), ctx.GetStencilControl()),
+	      [&] { return hex("db-stencil-control", n.db_stencil_control, 0); });
+	check(GC::kNvModeCtl, (n.known & GC::kNkModeCtl) != 0,
+	      same(DecodeModeControl(n.pa_su_sc_mode_cntl), ctx.GetModeControl()),
+	      [&] { return hex("pa-su-sc-mode-cntl", n.pa_su_sc_mode_cntl, 0); });
+	check(GC::kNvClipCtl, (n.known & GC::kNkClipCtl) != 0,
+	      same(DecodeClipControl(n.pa_cl_clip_cntl), ctx.GetClipControl()),
+	      [&] { return hex("pa-cl-clip-cntl", n.pa_cl_clip_cntl, 0); });
+	check(GC::kNvColorCtl, (n.known & GC::kNkColorCtl) != 0,
+	      same(DecodeColorControl(n.cb_color_control), ctx.GetColorControl()),
+	      [&] { return hex("cb-color-control", n.cb_color_control, 0); });
+	check(GC::kNvTargetMask, (n.known & GC::kNkTargetMask) != 0, n.cb_target_mask == ctx.GetRenderTargetMask(),
+	      [&] { return hex("cb-target-mask", n.cb_target_mask, ctx.GetRenderTargetMask()); });
+	bool     blend_known = false;
+	uint32_t bad_blend   = 0;
+	for (uint32_t k = 0; k < 8; k++) {
+		if ((n.known & (GC::kNkBlend0 << k)) == 0) continue;
+		blend_known = true;
+		if (!same(DecodeBlendControl(n.cb_blend[k]), ctx.GetBlendControl(k))) bad_blend |= 1u << k;
+	}
+	check(GC::kNvBlend, blend_known, bad_blend == 0, [&] { return hex("blend-bad-slots", bad_blend, 0); });
+	// Depth bias: the six registers applied in order to the reset value, as the CP applies them.
+	HW::PolyOffset offset {};
+	for (uint32_t k = 0; k < 6; k++) {
+		ApplyPolyOffsetRegister(offset, Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL + k, n.poly_offset[k]);
+	}
+	const auto& cp_offset = ctx.GetPolyOffset();
+	const auto  bits      = [](float v) { return std::bit_cast<uint32_t>(v); };
+	check(GC::kNvPolyOffset, (n.known & GC::kNkPolyOffset) != 0,
+	      offset.neg_num_db_bits == cp_offset.neg_num_db_bits && offset.db_is_float_fmt == cp_offset.db_is_float_fmt &&
+	          bits(offset.clamp) == bits(cp_offset.clamp) && bits(offset.front_scale) == bits(cp_offset.front_scale) &&
+	          bits(offset.front_offset) == bits(cp_offset.front_offset) &&
+	          bits(offset.back_scale) == bits(cp_offset.back_scale) && bits(offset.back_offset) == bits(cp_offset.back_offset),
+	      [&] {
+		      return hex("poly-scale", n.poly_offset[2], bits(cp_offset.front_scale)) +
+		             hex("poly-offset", n.poly_offset[3], bits(cp_offset.front_offset));
+	      });
+	// Viewport 0 and its scissor.
+	const auto& vp          = ctx.GetScreenViewport().viewports[0];
+	const float cp_vport[6] = {vp.xscale, vp.xoffset, vp.yscale, vp.yoffset, vp.zscale, vp.zoffset};
+	bool        vport_equal = true;
+	for (uint32_t k = 0; k < 6; k++) {
+		vport_equal = vport_equal && n.vport[k] == bits(cp_vport[k]);
+	}
+	check(GC::kNvViewport, (n.known & GC::kNkViewport) != 0, vport_equal,
+	      [&] { return hex("vport-xscale", n.vport[0], bits(vp.xscale)) + hex("vport-zoffset", n.vport[5], bits(vp.zoffset)); });
+	const uint32_t tl = n.vport_scissor[0];
+	const uint32_t br = n.vport_scissor[1];
+	check(GC::kNvScissor, (n.known & GC::kNkScissor) != 0,
+	      ParseScissorCoord15(tl) == vp.viewport_scissor_left && ParseScissorCoord15(tl >> 16u) == vp.viewport_scissor_top &&
+	          ((tl & 0x80000000u) == 0) == vp.viewport_scissor_window_offset_enable &&
+	          ParseScissorCoord15(br) == vp.viewport_scissor_right && ParseScissorCoord15(br >> 16u) == vp.viewport_scissor_bottom,
+	      [&] { return hex("scissor-tl", tl, 0) + hex("scissor-br", br, 0); });
+	// Index buffer of an indexed draw.
+	const bool indexed = n.kind == 0 || n.kind == 1;
+	check(GC::kNvIndexBase, indexed && n.ib_addr != 0, n.ib_addr == cp.NativeIndexBase(),
+	      [&] { return hex("index-base", n.ib_addr, cp.NativeIndexBase()); });
+	check(GC::kNvIndexType, indexed, (n.ib_32 != 0 ? 1u : 0u) == cp.NativeIndexType(),
+	      [&] { return hex("index-type", n.ib_32, cp.NativeIndexType()); });
+	if (mismatch != 0 && want_detail) {
+		uint32_t budget = detail_budget.load(std::memory_order_relaxed);
+		while (budget != 0 && !detail_budget.compare_exchange_weak(budget, budget - 1u, std::memory_order_relaxed)) {
+		}
+	}
+	Loader::GameCapture::NoteNativeVerify(marker, mismatch, unknown, detail.empty() ? nullptr : detail.c_str());
+}
+
 KYTY_CP_OP_PARSER(CpOpNativeDraw) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
@@ -2335,8 +2462,21 @@ KYTY_CP_OP_PARSER(CpOpNativeDraw) {
 	if (real) {
 		Loader::GameCapture::NoteNativeMarker(buffer, body_dw);
 	}
-	if (Loader::GameCapture::GetNativeMode() != Loader::GameCapture::NativeMode::Splice) {
+	if (!Loader::GameCapture::NativeSplices()) {
 		return body_dw;
+	}
+	// N2: the record (verified against the registers here, on the real parse) and the op tag the
+	// resolver times. The tag comes from the marker alone, so every front emits the same op.
+	uint32_t tag = 0;
+	if (Loader::GameCapture::GetNativeMode() == Loader::GameCapture::NativeMode::N2) {
+		tag = Loader::GameCapture::NativeOpTag(buffer);
+		if (real) {
+			Loader::GameCapture::NativeDraw record;
+			if (Loader::GameCapture::LookupNativeRecord(buffer, body_dw + 1u, real, record) &&
+			    Loader::GameCapture::NativeVerifyEnabled()) {
+				NativeVerifyRecord(cp, record, buffer);
+			}
+		}
 	}
 	Loader::GameCapture::NativeDrawPacket packet;
 	if (!Loader::GameCapture::LookupNativeDraw(buffer, body_dw + 1u, real, packet)) {
@@ -2345,12 +2485,14 @@ KYTY_CP_OP_PARSER(CpOpNativeDraw) {
 	const uint32_t header = packet.words[0];
 	const uint32_t* body  = packet.words + 1;
 	uint32_t        taken = 0;
+	cp.SetNativeOpTag(tag);
 	switch ((header >> 8u) & 0xffu) {
 		case Pm4::IT_DRAW_INDEX_2: taken = CpOpDrawIndex(cp, header, body, dw, num_dw); break;
 		case Pm4::IT_DRAW_INDEX_OFFSET_2: taken = CpOpDrawIndexOffset(cp, header, body, dw, num_dw); break;
 		case Pm4::IT_DRAW_INDEX_AUTO: taken = CpOpDrawIndexAuto(cp, header, body, dw, num_dw); break;
 		default: EXIT("R_NATIVE_DRAW: record opcode 0x%02" PRIx32 "\n", (header >> 8u) & 0xffu);
 	}
+	cp.SetNativeOpTag(0);
 	EXIT_NOT_IMPLEMENTED(taken != body_dw);
 	if (real) {
 		Loader::GameCapture::NoteNativeSpliced(buffer);

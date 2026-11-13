@@ -151,6 +151,12 @@ public:
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
+	// Astro Bot PC (KYTY_NATIVE_MODE=n2, loader/gameCapture.h): CpOpNativeDraw sets the op flag
+	// bits (NativeOpTag) of the draw op its spliced packet emits, and clears them after it; the
+	// resolver times the op (NoteNativeResolved). Index state for the record comparison.
+	void SetNativeOpTag(uint32_t tag) noexcept { m_native_op_tag = tag; }
+	[[nodiscard]] uint64_t NativeIndexBase() const noexcept { return m_index_base_addr; }
+	[[nodiscard]] uint32_t NativeIndexType() const noexcept { return m_index_type_and_size; }
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);
@@ -352,6 +358,8 @@ private:
 	CpSeq::Result ExecuteOp(CpSeq::OpKind kind, const void* payload, const void* data);
 	void          ExecDrawIndex(const CpSeq::DrawIndexOp& op);
 	void          ExecDrawAuto(const CpSeq::DrawAutoOp& op);
+	// Astro Bot PC (KYTY_NATIVE_MODE=n2): a native draw op ended (resolver timing).
+	void          NoteNativeResolvedOp(uint32_t flags, uint64_t start);
 	void          ExecDrawIndirect(const CpSeq::DrawIndirectOp& op);
 	void          ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op);
 	void          ExecDispatchDirect(const CpSeq::DispatchDirectOp& op);
@@ -465,6 +473,7 @@ private:
 	HW::Shader       m_sh_ctx;
 	HW::UserSgprType m_user_data_marker                 = HW::UserSgprType::Unknown;
 	uint32_t         m_index_type_and_size              = 0;
+	uint32_t         m_native_op_tag                    = 0; // KYTY_NATIVE n2 (SetNativeOpTag)
 	uint32_t         m_index_buffer_size                = 0;
 	uint64_t         m_index_base_addr                  = 0;
 	uint64_t         m_draw_indirect_args_base_addr     = 0;

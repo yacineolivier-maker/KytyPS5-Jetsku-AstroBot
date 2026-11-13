@@ -3243,6 +3243,7 @@ static void AttachDrawRegisters(Op& op, Args args, DrawPrep::Engine* engine,
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	CpSeq::DrawIndexOp op;
+	op.flags                      = m_native_op_tag; // Astro Bot PC (KYTY_NATIVE n2), 0 otherwise
 	op.index_addr                 = reinterpret_cast<uint64_t>(args.index_addr);
 	op.index_count                = args.index_count;
 	op.instance_count             = args.instance_count;
@@ -3281,7 +3282,43 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	(void)Submit(op);
 }
 
+// Astro Bot PC (KYTY_NATIVE_MODE=n2): a spliced native draw's op is timed on the resolver, with
+// how the emulator's draw run treated it (read from the executor after the commit).
+template <typename F>
+struct NativeResolveTimer {
+	uint32_t flags = 0;
+	uint64_t start = 0;
+	F        done;
+	NativeResolveTimer(uint32_t op_flags, F f): flags(op_flags & CpSeq::DrawFlagNativeMask), done(f) {
+		if (flags != 0) [[unlikely]] {
+			start = __rdtsc();
+		}
+	}
+	~NativeResolveTimer() {
+		if (flags != 0) [[unlikely]] {
+			done(flags, start);
+		}
+	}
+	NativeResolveTimer(const NativeResolveTimer&)            = delete;
+	NativeResolveTimer& operator=(const NativeResolveTimer&) = delete;
+};
+
+void CommandProcessor::NoteNativeResolvedOp(uint32_t flags, uint64_t start) {
+	const uint64_t end = __rdtsc();
+	const auto&    ex  = m_renderer.GetRenderExecutor();
+	namespace GC       = Loader::GameCapture;
+	const uint32_t run = ex.m_run_active ? (ex.m_run_recall     ? GC::kNrRecalled
+	                                        : ex.m_run_pipeswap ? GC::kNrSwapped
+	                                                            : GC::kNrContinued)
+	                     : ex.m_run_targets_kept ? GC::kNrTargets
+	                                             : GC::kNrStarted;
+	GC::NoteNativeResolved(flags, start, end, run);
+}
+
 void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
+	const NativeResolveTimer native_timer(op.flags, [this](uint32_t flags, uint64_t start) {
+		NoteNativeResolvedOp(flags, start);
+	});
 	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
@@ -3914,6 +3951,7 @@ void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint3
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	CpSeq::DrawAutoOp op;
+	op.flags                      = m_native_op_tag; // Astro Bot PC (KYTY_NATIVE n2), 0 otherwise
 	op.vertex_count               = args.vertex_count;
 	op.instance_count             = args.instance_count;
 	op.first_vertex               = args.first_vertex;
@@ -3951,6 +3989,9 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 }
 
 void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
+	const NativeResolveTimer native_timer(op.flags, [this](uint32_t flags, uint64_t start) {
+		NoteNativeResolvedOp(flags, start);
+	});
 	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
