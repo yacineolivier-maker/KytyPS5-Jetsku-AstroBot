@@ -125,6 +125,9 @@ private:
 		// KYTY_CP_SEQ=1: the resolver parses and executes this (constant-engine) submission
 		// itself, in Direct mode, instead of executing the sequencer's ops.
 		bool handoff = false;
+		// Astro Bot PC (KYTY_CP_PAR=1a, cpParallel.h): resolver context (0: A, Thread_Gpu; 1: B,
+		// CP resolver #2), decided at admission. Always 0 when KYTY_CP_PAR is off.
+		uint32_t cp_par_context = 0;
 	};
 
 	void              Enqueue(Submission submission);
@@ -182,6 +185,9 @@ private:
 	std::unique_ptr<CpSeq::Sequencer, SequencerDeleter> m_sequencer;
 
 	uint64_t        m_submit_id = 0;
+	// Astro Bot PC (KYTY_CP_PAR=1a): rank of the last admitted queue-0 graphics submission since
+	// the last reset_processor one (m_queue_mutex).
+	uint32_t        m_cp_par_rank = 0;
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
 

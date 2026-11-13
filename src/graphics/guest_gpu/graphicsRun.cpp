@@ -15,6 +15,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR)
 #include "graphics/guest_gpu/command_processor/cpSequencer.h"
 #include "graphics/guest_gpu/command_processor/parCensus.h"
 #include "graphics/guest_gpu/command_processor/stateTrace.h"
@@ -261,6 +262,37 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 			            CpSeq::VerifyMode(), CpSeq::SnapshotCount(), sizeof(CpSeq::RegisterState));
 		}
 	}
+	// Astro Bot PC (KYTY_CP_PAR=1a, cpParallel.h): CP resolver #2, which resolves context B's
+	// submissions in turn with Thread_Gpu. The token's holder is the GPU thread: it owns the
+	// renderer lock (RenderMutex, KYTY_RENDER_LOCK_ASYMMETRIC), and resolver #2 borrows
+	// g_gpu_thread (GuestGpu::IsGpuThread) and g_gpu_state while it holds the token.
+	if (CpPar::Enabled()) {
+		if (m_sequencer == nullptr) {
+			std::printf("Kyty CpPar: needs KYTY_CP_SEQ=1; every submission stays on Thread_Gpu\n");
+		} else if (CpSeq::VerifyMode() != 0) {
+			std::printf("Kyty CpPar: KYTY_CP_SEQ_VERIFY is on; every submission stays on Thread_Gpu\n");
+		} else {
+			CpPar::Hooks hooks;
+			hooks.context = this;
+			hooks.take    = [](void* context) {
+				auto* gpu = static_cast<GuestGpu*>(context);
+				if (CpPar::OnResolver2()) {
+					g_gpu_thread = true;
+					g_gpu_state  = gpu;
+				}
+				gpu->m_renderer.GetMutex().BecomeOwner();
+			};
+			hooks.give = [](void* context) {
+				auto* gpu = static_cast<GuestGpu*>(context);
+				gpu->m_renderer.GetMutex().ResignOwner();
+				if (CpPar::OnResolver2()) {
+					g_gpu_thread = false;
+					g_gpu_state  = nullptr;
+				}
+			};
+			CpPar::Start(hooks);
+		}
+	}
 	if (CpWakeupsEnabled()) {
 		m_renderer.GetCommandScheduler().SetProgressHook(
 		    [](void* context) { static_cast<GuestGpu*>(context)->NotifyProgress(); }, this);
@@ -286,6 +318,8 @@ void GuestGpu::Shutdown() {
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
+	// Astro Bot PC (KYTY_CP_PAR): Thread_Gpu returned, resolver #2 is idle.
+	CpPar::Stop();
 	if (m_sequencer != nullptr) {
 		// The GPU thread executed every admitted submission's ops; the sequencer is idle.
 		m_sequencer->Stop();
@@ -1514,6 +1548,23 @@ void GuestGpu::Enqueue(Submission submission) {
 		HangTrace::RecordCp(event);
 	}
 	m_in_flight.insert(submission.sequence);
+	// Astro Bot PC (KYTY_CP_PAR=1a): queue-0 graphics submissions of even rank in the frame (rank 1:
+	// the reset_processor one) go to resolver context B, unless 1a mode cannot run them there.
+	if (CpPar::Enabled() && submission.queue_id == 0 &&
+	    submission.type == SubmissionType::Graphics) {
+		m_cp_par_rank = submission.reset_processor ? 1u : m_cp_par_rank + 1u;
+		if ((m_cp_par_rank % 2u) == 0u) {
+			if (m_sequencer == nullptr) {
+				CpPar::NoteFallback(CpPar::Fallback::NoSequencer);
+			} else if (CpSeq::VerifyMode() != 0 || !CpPar::Started()) {
+				CpPar::NoteFallback(CpPar::Fallback::Verify);
+			} else if (!submission.constant_commands.empty()) {
+				CpPar::NoteFallback(CpPar::Fallback::Handoff);
+			} else {
+				submission.cp_par_context = 1;
+			}
+		}
+	}
 	if (m_sequencer != nullptr && submission.queue_id == 0) {
 		// Admission order is the sequencer's parse order (and the resolver's queue-0 order).
 		CpSeq::Intake intake;
@@ -1523,6 +1574,7 @@ void GuestGpu::Enqueue(Submission submission) {
 		intake.constant_commands = submission.constant_commands;
 		intake.graphics          = submission.type == SubmissionType::Graphics;
 		intake.reset_processor   = submission.reset_processor;
+		intake.context           = submission.cp_par_context; // Astro Bot PC (KYTY_CP_PAR)
 		if (intake.graphics) {
 			ParCensus::NoteAdmit(intake.sequence, intake.reset_processor); // Astro Bot PC : KYTY_CP_PAR_CENSUS
 		}
@@ -1770,6 +1822,9 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	if (CpPar::Enabled()) {
+		CpPar::MaybeReport(); // Astro Bot PC (KYTY_CP_PAR): "CpPar 10s: ..."
+	}
 	if (m_sequencer != nullptr && submission.queue_id == 0) {
 		return ProcessSequenced(submission);
 	}
@@ -1931,9 +1986,43 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		}
 		return complete;
 	}
-	bool       handoff = false;
-	const auto result  = cp.ResolveSubmission(submission.command_execution, submission.sequence,
-	                                          submission.commands, handoff);
+	bool             handoff = false;
+	Pm4ProcessResult result  = Pm4ProcessResult::Complete;
+	if (!CpPar::Enabled()) {
+		result = cp.ResolveSubmission(submission.command_execution, submission.sequence,
+		                              submission.commands, handoff);
+	} else if (submission.cp_par_context == 0) {
+		// Astro Bot PC (KYTY_CP_PAR=1a): context A, on this thread, timed.
+		const auto start = CpPar::NowNs();
+		result = cp.ResolveSubmission(submission.command_execution, submission.sequence,
+		                              submission.commands, handoff, 0);
+		CpPar::NoteResolveTime(0, CpPar::NowNs() - start);
+	} else {
+		// Astro Bot PC (KYTY_CP_PAR=1a): context B: this slice runs on CP resolver #2 with the
+		// same code, while this thread waits (serving its requests: service commands, flips).
+		struct Slice {
+			CommandProcessor* cp;
+			Submission*       submission;
+			bool              handoff;
+			Pm4ProcessResult  result;
+		} slice {&cp, &submission, false, Pm4ProcessResult::Complete};
+		CpPar::RunSlice(
+		    [](void* argument) {
+			    auto&      s     = *static_cast<Slice*>(argument);
+			    const auto start = CpPar::NowNs();
+			    s.result = s.cp->ResolveSubmission(s.submission->command_execution,
+			                                       s.submission->sequence, s.submission->commands,
+			                                       s.handoff, 1);
+			    CpPar::NoteResolveTime(1, CpPar::NowNs() - start);
+		    },
+		    &slice);
+		result  = slice.result;
+		handoff = slice.handoff;
+	}
+	if (CpPar::Enabled() && !handoff && result == Pm4ProcessResult::Complete &&
+	    submission.type == SubmissionType::Graphics) {
+		CpPar::NoteCompleted(submission.cp_par_context); // Astro Bot PC (KYTY_CP_PAR)
+	}
 	if (handoff) {
 		// A constant-engine submission: parsed and executed here, in Direct mode, while the
 		// sequencer waits (it applied the front setup already).
@@ -2510,7 +2599,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (m_front_mode == FrontMode::Thread) {
 		// P3c: the next speculative slot, or its drop (a SkipSlots op) before this draw's op.
 		const bool adopted = AdoptSpeculativeDraw(op);
-		const auto draw_op = m_ops->Emitted();
+		const auto draw_op = m_emit_ops->Emitted(); // Astro Bot PC (KYTY_CP_PAR)
 		if (!adopted) {
 			AttachDrawRegisters(
 			    op, DrawArgsOf(op), m_draw_prep.get(), m_ctx, m_ucfg, m_sh_ctx,
@@ -2797,7 +2886,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset,
 		if (position != UINT64_MAX) {
 			op.flags |= CpSeq::IndirectFlagPrepared;
 			op.window = position;
-			m_published_ops.push_back(m_ops->Emitted());
+			m_published_ops.push_back(m_emit_ops->Emitted()); // Astro Bot PC (KYTY_CP_PAR)
 			if (m_published_ops.size() > 256u) {
 				(void)OldestPendingOp(m_published_ops);
 			}
@@ -3033,7 +3122,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		if (position != UINT64_MAX) {
 			op.flags |= CpSeq::DispatchFlagPrepared;
 			op.window = position;
-			m_published_ops.push_back(m_ops->Emitted());
+			m_published_ops.push_back(m_emit_ops->Emitted()); // Astro Bot PC (KYTY_CP_PAR)
 			if (m_published_ops.size() > 256u) {
 				(void)OldestPendingOp(m_published_ops);
 			}
@@ -3119,7 +3208,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		if (position != UINT64_MAX) {
 			op.flags |= CpSeq::DispatchFlagPrepared;
 			op.window = position;
-			m_published_ops.push_back(m_ops->Emitted());
+			m_published_ops.push_back(m_emit_ops->Emitted()); // Astro Bot PC (KYTY_CP_PAR)
 			if (m_published_ops.size() > 256u) {
 				(void)OldestPendingOp(m_published_ops);
 			}
@@ -3179,7 +3268,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (m_front_mode == FrontMode::Thread) {
 		// P3c: see DrawIndex.
 		const bool adopted = AdoptSpeculativeDraw(op);
-		const auto draw_op = m_ops->Emitted();
+		const auto draw_op = m_emit_ops->Emitted(); // Astro Bot PC (KYTY_CP_PAR)
 		if (!adopted) {
 			AttachDrawRegisters(
 			    op, DrawArgsOf(op), m_draw_prep.get(), m_ctx, m_ucfg, m_sh_ctx,
@@ -4851,6 +4940,12 @@ void CommandProcessor::AttachSequencer(CpSeq::Sequencer* sequencer) {
 	m_front_mode = FrontMode::Thread;
 	m_ops.reset(new CpSeq::OpStream(OpRingBytes()));
 	m_ops->SetSpinNs(CpSeq::SequencerSpinNs());
+	m_emit_ops = m_ops.get(); // Astro Bot PC (KYTY_CP_PAR): context A's ring, as before
+	if (CpPar::Enabled() && CpSeq::VerifyMode() == 0) {
+		// Astro Bot PC (KYTY_CP_PAR=1a): resolver context B's ring (cpParallel.h).
+		m_ops_b.reset(new CpSeq::OpStream(OpRingBytes()));
+		m_ops_b->SetSpinNs(CpSeq::SequencerSpinNs());
+	}
 	// The draw-prep engine's producer is the sequencer from now on: create it before either
 	// thread can look at it.
 	(void)DrawPrepEngine();
@@ -4864,6 +4959,7 @@ void CommandProcessor::DetachSequencer() {
 	EXIT_IF(m_front_mode != FrontMode::Thread || m_sequencer == nullptr);
 	CpSeq::OpView view;
 	EXIT_IF(m_ops->Peek(view)); // every op executed
+	EXIT_IF(m_ops_b != nullptr && m_ops_b->Peek(view)); // Astro Bot PC (KYTY_CP_PAR)
 	m_front_mode = FrontMode::Direct;
 	m_sequencer  = nullptr;
 	m_pending_writes.clear();
@@ -4975,7 +5071,7 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 	// Only the sequencer emits; an op's execution on the resolver never emits another op.
 	EXIT_IF(!g_sequencer_thread || m_sequencer == nullptr);
 	auto*      execution = g_current_execution;
-	const auto sequence  = m_ops->Emitted();
+	const auto sequence  = m_emit_ops->Emitted(); // Astro Bot PC (KYTY_CP_PAR)
 	uint16_t   flags     = 0;
 	if (m_epoch_pending) {
 		flags |= CpSeq::FlagAdvanceEpoch;
@@ -5018,7 +5114,7 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 		// speculation stops at the first one); the resolver retires them before this op.
 		DropSpeculativeSlots();
 	}
-	(void)m_ops->Emit(kind, payload, payload_size, data, data_size,
+	(void)m_emit_ops->Emit(kind, payload, payload_size, data, data_size, // Astro Bot PC (KYTY_CP_PAR)
 	                  execution != nullptr ? execution->m_packets : 0,
 	                  execution != nullptr ? execution->m_packets_hash : 0,
 	                  CpSeq::VerifyMode() != 0, flags);
@@ -5187,7 +5283,7 @@ uint32_t CommandProcessor::TakeSnapshot() {
 		}
 	}
 	// The op this snapshot is for is the next one emitted.
-	m_snapshot_ops.push_back(m_ops->Emitted());
+	m_snapshot_ops.push_back(m_emit_ops->Emitted()); // Astro Bot PC (KYTY_CP_PAR)
 	if (m_snapshot_ops.size() > 2u * ring.Capacity()) {
 		(void)OldestPendingOp(m_snapshot_ops);
 	}
@@ -5259,6 +5355,13 @@ bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
 	// CommandScheduler::CheckActive stops the emulator if a front path does.
 	DrawPrep::t_worker_thread = true;
 	auto& sequencer = *m_sequencer;
+	// Astro Bot PC (KYTY_CP_PAR=1a): this submission's ops go to its resolver context's ring,
+	// numbered after the ops of the other ring (one global op order). Off: always m_ops.
+	if (auto* ring = intake.context != 0 && m_ops_b != nullptr ? m_ops_b.get() : m_ops.get();
+	    ring != m_emit_ops) {
+		ring->SetNextSequence(m_emit_ops->Emitted());
+		m_emit_ops = ring;
+	}
 	if (intake.graphics && intake.frame_fence != 0) {
 		// Ordering point (the frame fence): the command bytes of a fenced submission are read only
 		// once the resolver has started it, i.e. once the work the fence orders has completed.
@@ -5484,11 +5587,11 @@ uint64_t CommandProcessor::CurrentPacketKey() const {
 
 void CommandProcessor::EmitSkipSlots(uint64_t count) {
 	const auto*  execution = g_current_execution;
-	const auto   sequence  = m_ops->Emitted();
+	const auto   sequence  = m_emit_ops->Emitted(); // Astro Bot PC (KYTY_CP_PAR)
 	CpSeq::SkipSlotsOp op;
 	op.count = static_cast<uint32_t>(count);
 	// Transport: no sync-epoch flag (it travels with the next real op) and no verify hash.
-	(void)m_ops->Emit(CpSeq::OpKind::SkipSlots, &op, sizeof(op), nullptr, 0,
+	(void)m_emit_ops->Emit(CpSeq::OpKind::SkipSlots, &op, sizeof(op), nullptr, 0, // Astro Bot PC (KYTY_CP_PAR)
 	                  execution != nullptr ? execution->m_packets : 0,
 	                  execution != nullptr ? execution->m_packets_hash : 0, false, 0);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqOps);
@@ -5739,10 +5842,36 @@ void CommandProcessor::RunPrefetch(uint64_t wait_op) {
 	}
 }
 
+// Astro Bot PC (KYTY_CP_PAR=1a): on CP resolver #2, runs `body` on Thread_Gpu (which holds the
+// token meanwhile, cpParallel.h) with this thread's processor and execution scope.
+template <typename Body>
+static void RunOnGpuThreadScoped(Body& body) {
+	struct Context {
+		Body*             body;
+		CommandProcessor* processor;
+		Pm4Execution*     execution;
+	} context {&body, g_current_processor, g_current_execution};
+	CpPar::RunOnGpuThread(
+	    [](void* argument) {
+		    auto&      c                  = *static_cast<Context*>(argument);
+		    auto*      previous_processor = g_current_processor;
+		    auto*      previous_execution = g_current_execution;
+		    g_current_processor           = c.processor;
+		    g_current_execution           = c.execution;
+		    (*c.body)();
+		    g_current_processor = previous_processor;
+		    g_current_execution = previous_execution;
+	    },
+	    &context);
+}
+
 Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, uint64_t submission,
                                                      std::span<const uint32_t> commands,
-                                                     bool&                     handoff) {
+                                                     bool& handoff, uint32_t context) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Resolve");
+	// Astro Bot PC (KYTY_CP_PAR=1a): the resolver context's op ring (always m_ops when off).
+	EXIT_IF(context != 0 && m_ops_b == nullptr);
+	auto& ops = context != 0 ? *m_ops_b : *m_ops;
 	const CpGaps::Scope gap(CpGaps::Cat::Resolver);
 	EXIT_IF(g_current_execution != nullptr || m_front_mode != FrontMode::Thread);
 	handoff                   = false;
@@ -5771,10 +5900,18 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		// Service commands run between ops: every op before this one has executed and no later
 		// one has, the serial point (P3-SEQUENCER.md 2.4).
 		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
-			g_gpu_state->ProcessCommands();
+			if (CpPar::OnResolver2()) {
+				// Astro Bot PC (KYTY_CP_PAR=1a): service commands stay on Thread_Gpu.
+				auto* gpu  = g_gpu_state;
+				auto  body = [gpu] { gpu->ProcessCommands(); };
+				RunOnGpuThreadScoped(body);
+				CpPar::NoteBounce(false);
+			} else {
+				g_gpu_state->ProcessCommands();
+			}
 		}
 		CpSeq::OpView view;
-		if (!m_ops->Peek(view)) {
+		if (!ops.Peek(view)) {
 			// The sequencer has not produced the next op yet: spin briefly, then let other queues
 			// and services run while it parses.
 			Profiler::ScopedFrameWait starved(Profiler::FrameWait::CpSeqResolverStarved);
@@ -5783,7 +5920,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			const auto start    = CpNowNs();
 			bool       produced = false;
 			for (uint32_t spins = 0;; spins++) {
-				if (m_ops->Peek(view)) {
+				if (ops.Peek(view)) {
 					produced = true;
 					break;
 				}
@@ -5836,7 +5973,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			} else if (m_verifier != nullptr) {
 				m_verifier->Detach();
 			}
-			m_ops->Pop();
+			ops.Pop();
 			sequencer.NoteExecuted(sequence + 1u);
 			continue;
 		}
@@ -5846,14 +5983,14 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			if (m_verifier != nullptr && m_verifier->Follows(submission)) {
 				m_verifier->Finish();
 			}
-			m_ops->Pop();
+			ops.Pop();
 			sequencer.NoteExecuted(sequence + 1u);
 			execution.m_made_progress = true;
 			return Pm4ProcessResult::Complete;
 		}
 		if (kind == CpSeq::OpKind::Handoff) {
 			EXIT_IF(view.As<CpSeq::HandoffOp>().submission != submission);
-			m_ops->Pop();
+			ops.Pop();
 			sequencer.NoteExecuted(sequence + 1u);
 			handoff = true;
 			return Pm4ProcessResult::Complete;
@@ -5862,7 +5999,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			// P3c: speculative slots the real parse did not adopt (no op draws them).
 			EXIT_IF(m_draw_prep == nullptr);
 			m_draw_prep->SkipPublished(view.As<CpSeq::SkipSlotsOp>().count);
-			m_ops->Pop();
+			ops.Pop();
 			sequencer.NoteExecuted(sequence + 1u);
 			execution.m_made_progress = true;
 			continue;
@@ -5909,8 +6046,17 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			                         diagnostic_args[3], CpSeq::OpKindName(kind));
 		}
 		CommitStats::StepMark(CommitStats::Step::GapLoop);
-		const auto result = ExecuteOp(kind, view.payload, view.data);
-		m_executing       = false;
+		CpSeq::Result result;
+		if (CpPar::OnResolver2() &&
+		    (kind == CpSeq::OpKind::Flip || kind == CpSeq::OpKind::WaitFlipDone)) {
+			// Astro Bot PC (KYTY_CP_PAR=1a): flips stay on Thread_Gpu (presentation, live switches).
+			auto body = [&] { result = ExecuteOp(kind, view.payload, view.data); };
+			RunOnGpuThreadScoped(body);
+			CpPar::NoteBounce(true);
+		} else {
+			result = ExecuteOp(kind, view.payload, view.data);
+		}
+		m_executing = false;
 		if (snapshot != nullptr) {
 			GetScheduler().RestoreRegisters(previous);
 		}
@@ -5930,7 +6076,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		if (snapshot != nullptr) {
 			sequencer.Snapshots().Release();
 		}
-		m_ops->Pop();
+		ops.Pop();
 		if (CpSeq::IsLockstep(kind)) {
 			sequencer.Answer(sequence, result.value);
 		}

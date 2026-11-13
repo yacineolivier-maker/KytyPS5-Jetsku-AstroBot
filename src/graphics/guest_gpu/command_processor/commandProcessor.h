@@ -255,8 +255,11 @@ public:
 	// (Blocked; `execution` tells yielded from suspended). `handoff`: the submission is to be
 	// parsed and executed by this thread itself (constant engine): run it with Process() in
 	// Direct mode, then EndHandoff().
+	// Astro Bot PC (KYTY_CP_PAR): `context` is the resolver context whose op ring holds the
+	// submission's ops (0: m_ops, 1: m_ops_b); 0 unless KYTY_CP_PAR=1a.
 	Pm4ProcessResult ResolveSubmission(Pm4Execution& execution, uint64_t submission,
-	                                   std::span<const uint32_t> commands, bool& handoff);
+	                                   std::span<const uint32_t> commands, bool& handoff,
+	                                   uint32_t context = 0);
 	void             BeginHandoff();
 	void             EndHandoff(uint64_t submission);
 	// Tests: back to Direct once the sequencer is stopped and its ops are executed.
@@ -519,6 +522,11 @@ private:
 	};
 	// Inline: the op ring (created on the first op).
 	std::unique_ptr<CpSeq::OpStream, OpStreamDeleter> m_ops;
+	// Astro Bot PC (KYTY_CP_PAR=1a, cpParallel.h): resolver context B's op ring (null otherwise),
+	// and the ring the sequencer emits into (thread mode: m_ops, or m_ops_b while it parses a
+	// context-B submission). Sequencer thread only.
+	std::unique_ptr<CpSeq::OpStream, OpStreamDeleter> m_ops_b;
+	CpSeq::OpStream*                                  m_emit_ops = nullptr;
 	// KYTY_CP_SEQ_VERIFY: the reference front following this processor's streams.
 	std::unique_ptr<CpSeq::Verifier, VerifierDeleter> m_verifier;
 	// Reference front: the verifier its ops are captured by.

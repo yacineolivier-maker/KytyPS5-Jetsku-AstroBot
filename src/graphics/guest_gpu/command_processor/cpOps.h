@@ -522,6 +522,13 @@ public:
 	void Pop();
 
 	[[nodiscard]] uint64_t Emitted() const noexcept { return m_next_sequence; }
+	// Astro Bot PC (KYTY_CP_PAR): producer, before emitting into this ring after another one:
+	// the two resolver contexts' rings share one op numbering (sequence only moves forward).
+	void SetNextSequence(uint64_t sequence) noexcept {
+		if (sequence > m_next_sequence) {
+			m_next_sequence = sequence;
+		}
+	}
 	[[nodiscard]] uint64_t Bytes() const noexcept { return m_bytes; }
 	[[nodiscard]] uint32_t MaxRecord() const noexcept { return m_ring.MaxPacket(); }
 	// Producer: waits for ring space so far (thread mode: the resolver consumes).

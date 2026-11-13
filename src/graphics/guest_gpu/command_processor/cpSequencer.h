@@ -95,6 +95,9 @@ struct Intake {
 	std::span<const uint32_t> constant_commands;
 	bool                      graphics        = true; // false: a CPU flip preparation
 	bool                      reset_processor = false;
+	// Astro Bot PC (KYTY_CP_PAR): the resolver context whose op ring receives this submission's
+	// ops (0: A, CommandProcessor::m_ops; 1: B, m_ops_b). Always 0 when KYTY_CP_PAR is off.
+	uint32_t context = 0;
 };
 
 class Sequencer {
