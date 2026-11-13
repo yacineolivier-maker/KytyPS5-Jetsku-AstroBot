@@ -3869,6 +3869,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		OcclusionCounter::DebugLog("e n=%u inst=%u vs=0x%" PRIx64 "\n", draw.index_count, draw.instance_count,
 		                           buffer.GetShaders().GetVs().es_regs.data_addr);
 	}
+	// Astro Bot PC (KYTY_PASS_SKIP, diagnostic) : dessin non traduit selon sa cible ; image volontairement fausse.
+	if (PassStats::SkipDraw(state.color_count, state.color_count != 0 ? state.color_info[0].desc.info.extent.width
+	                                                              : state.depth_info.desc.info.extent.width,
+	                        static_cast<bool>(state.depth_info.image_id))) {
+		m_run_active = false;
+		return;
+	}
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		m_run_active = false; // the copy is not a draw of the run
 		return;

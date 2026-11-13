@@ -31,6 +31,8 @@ VkResult GetSwapchainImages(VkDevice device, VkSwapchainKHR swapchain, uint32_t*
 VkResult AcquireNextImage(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore,
                           VkFence fence, uint32_t* index);
 VkResult QueuePresent(VkQueue queue, const VkPresentInfoKHR* info);
+// Images affichees par seconde (reelles + generees), mesurees chaque seconde ; 0 si inactif.
+[[nodiscard]] double DisplayedFps();
 
 // Image du jeu prete a etre presentee : configure la generation et enregistre sa preparation dans `command`
 // (le tampon de commandes de la presentation, avant la presentation).

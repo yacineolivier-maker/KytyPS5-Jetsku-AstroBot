@@ -367,6 +367,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
 	KYTY_GPU_OP_SITE("dispatch");
+	if (PassStats::SkipDispatch()) {
+		return; // Astro Bot PC (KYTY_PASS_SKIP=dispatch, diagnostic)
+	}
 	const PassStats::Scope pass_stats(PassStats::Kind::Dispatch, PassStats::Enabled() ? m_context.GetTextureCache().Frame() : 0u);
 	// KYTY_CP_GAP_STATS: this scope's phases (drawPrep/cpGaps.h).
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
@@ -736,6 +739,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
 	KYTY_GPU_OP_SITE("dispatch.indirect");
+	if (PassStats::SkipDispatch()) {
+		return; // Astro Bot PC (KYTY_PASS_SKIP=dispatch, diagnostic)
+	}
 	const PassStats::Scope pass_stats(PassStats::Kind::Dispatch, PassStats::Enabled() ? m_context.GetTextureCache().Frame() : 0u);
 	g_overlap_indirect.fetch_add(1, std::memory_order_relaxed);
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);

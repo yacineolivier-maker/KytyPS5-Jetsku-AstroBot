@@ -56,6 +56,9 @@ private:
 		int    need_count = 0;
 		Result result     = Result::TimedOut;
 		bool   ready      = false;
+		// Astro Bot PC (13/11) : chaque fil en attente a sa variable de condition ; un signal ne reveille que les
+		// fils servis (avant : SignalAll a chaque Signal, tous les fils reveilles se disputaient le verrou).
+		Common::CondVar cond;
 	};
 
 	void AddWaiter(WaitingThread* waiter);
@@ -88,10 +91,9 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 		if (!waiter->ready) {
 			waiter->result = Result::Deleted;
 			waiter->ready  = true;
+			waiter->cond.Signal();
 		}
 	}
-
-	m_cond_var.SignalAll();
 
 	while (!m_waiting_threads.empty()) {
 		m_mutex.Unlock();
@@ -123,10 +125,9 @@ KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_wait
 		if (!waiter->ready) {
 			waiter->result = Result::Canceled;
 			waiter->ready  = true;
+			waiter->cond.Signal();
 		}
 	}
-
-	m_cond_var.SignalAll();
 
 	return Result::Ok;
 }
@@ -144,9 +145,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 
 	m_count += signal_count;
 
-	WakeWaiters();
-
-	m_cond_var.SignalAll();
+	WakeWaiters(); // reveille seulement les fils servis
 
 	return Result::Ok;
 }
@@ -177,6 +176,7 @@ void KernelSemaPrivate::WakeWaiters() {
 			m_count -= waiter->need_count;
 			waiter->result = Result::Ok;
 			waiter->ready  = true;
+			waiter->cond.Signal();
 		}
 	}
 }
@@ -233,9 +233,9 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 		}
 
 		if (infinitely) {
-			m_cond_var.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
+			waiter.cond.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
 		} else {
-			m_cond_var.WaitFor(&m_mutex, micros - elapsed);
+			waiter.cond.WaitFor(&m_mutex, micros - elapsed);
 		}
 
 		m_mutex.Unlock();

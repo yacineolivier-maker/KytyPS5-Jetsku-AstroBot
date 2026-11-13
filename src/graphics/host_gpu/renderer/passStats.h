@@ -23,6 +23,12 @@ void SetTarget(uint64_t address, uint32_t width, uint32_t height, uint32_t forma
 void NoteColors(const uint64_t* address, const uint32_t* format, const uint32_t* width, const uint32_t* height,
                 uint32_t count);
 
+// KYTY_PASS_SKIP=<liste> (diagnostic, image fausse) : dessins non traduits du tout, selon leur cible :
+// shadow (profondeur seule 2048 et plus), prepass (autre profondeur seule), main (5 cibles couleur),
+// other (autres dessins avec couleur), draws (tous les dessins), dispatch (tous les calculs).
+[[nodiscard]] bool SkipDraw(uint32_t colors, uint32_t width, bool depth);
+[[nodiscard]] bool SkipDispatch();
+
 class Scope {
 public:
 	explicit Scope(Kind kind, uint64_t frame);

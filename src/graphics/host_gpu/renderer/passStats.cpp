@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -227,6 +228,48 @@ Scope::~Scope() {
 	if (TicksToUs(now - s.window_start) >= 10e6) {
 		Report(s, now);
 	}
+}
+
+namespace {
+uint32_t SkipMask() {
+	static const uint32_t mask = [] {
+		const char* v = std::getenv("KYTY_PASS_SKIP");
+		if (v == nullptr) {
+			return 0u;
+		}
+		const std::string s(v);
+		uint32_t          m = 0;
+		const auto        has = [&](const char* w) { return s.find(w) != std::string::npos; };
+		m |= has("shadow") ? 1u : 0u;
+		m |= has("prepass") ? 2u : 0u;
+		m |= has("main") ? 4u : 0u;
+		m |= has("other") ? 8u : 0u;
+		m |= has("draws") ? 15u : 0u;
+		m |= has("dispatch") ? 16u : 0u;
+		std::printf("PassSkip: KYTY_PASS_SKIP=%s (masque 0x%x) : ces operations ne sont pas traduites, image fausse\n", v, m);
+		std::fflush(stdout);
+		return m;
+	}();
+	return mask;
+}
+} // namespace
+
+bool SkipDraw(uint32_t colors, uint32_t width, bool depth) {
+	const auto m = SkipMask();
+	if (m == 0) {
+		return false;
+	}
+	uint32_t cls = 0;
+	if (colors == 0) {
+		cls = depth && width >= 2048 ? 1u : 2u;
+	} else {
+		cls = colors >= 5 ? 4u : 8u;
+	}
+	return (m & cls) != 0;
+}
+
+bool SkipDispatch() {
+	return (SkipMask() & 16u) != 0;
 }
 
 void NoteColors(const uint64_t* address, const uint32_t* format, const uint32_t* width, const uint32_t* height,

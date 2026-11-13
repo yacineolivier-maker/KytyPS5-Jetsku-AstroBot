@@ -13,6 +13,7 @@
 #include "3rdparty_local/ffx_api/ffx_framegeneration.h"
 #include "3rdparty_local/ffx_api/vk/ffx_api_vk.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -342,6 +343,13 @@ VkResult AcquireNextImage(VkDevice device, VkSwapchainKHR swapchain, uint64_t ti
 	return S().repl.pOutAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, index);
 }
 
+static std::atomic<double> g_displayed {0.0};
+static std::atomic<double> g_game {0.0};
+
+double DisplayedFps() {
+	return g_displayed.load(std::memory_order_relaxed);
+}
+
 VkResult QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
 	auto&      s      = S();
 	const auto result = s.repl.pOutQueuePresentKHR(queue, info);
@@ -350,11 +358,15 @@ VkResult QueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
 	static uint64_t presents0 = 0, frames0 = 0;
 	const auto      now = std::chrono::steady_clock::now();
 	const double    sec = std::chrono::duration<double>(now - window_start).count();
-	if (sec >= 5.0 && s.repl.pOutGetLastPresentCountFFXAPI != nullptr) {
+	if (sec >= 1.0 && s.repl.pOutGetLastPresentCountFFXAPI != nullptr) {
 		const uint64_t presents = s.repl.pOutGetLastPresentCountFFXAPI(s.swapchain);
-		std::printf("FSR 3 : %.1f images affichees/s, %.1f images du jeu/s\n",
-		            static_cast<double>(presents - presents0) / sec, static_cast<double>(s.frame_id - frames0) / sec);
-		std::fflush(stdout);
+		g_displayed = static_cast<double>(presents - presents0) / sec;
+		g_game      = static_cast<double>(s.frame_id - frames0) / sec;
+		static int ticks = 0;
+		if (++ticks % 5 == 0) {
+			std::printf("FSR 3 : %.1f images affichees/s, %.1f images du jeu/s\n", g_displayed.load(), g_game.load());
+			std::fflush(stdout);
+		}
 		presents0    = presents;
 		frames0      = s.frame_id;
 		window_start = now;

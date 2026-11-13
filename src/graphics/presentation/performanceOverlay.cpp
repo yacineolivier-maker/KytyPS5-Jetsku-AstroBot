@@ -1,3 +1,4 @@
+#include "graphics/presentation/window/fsr3FrameGen.h"
 #include "graphics/presentation/performanceOverlay.h"
 
 #include "common/debugCounters.h"
@@ -712,6 +713,11 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 		if (shown.fps > 0.0) {
 			ImGui::TextColored(Color(FrameTimeColor(shown.frame_ms)), "%.1f FPS   %.1f ms",
 			                   shown.fps, shown.frame_ms);
+			if (Fsr3::Active()) {
+				// Astro Bot PC : images reellement affichees avec la generation d'images FSR 3.
+				ImGui::TextColored(Color(FrameTimeColor(1000.0 / std::max(Fsr3::DisplayedFps(), 1.0))),
+				                   "FSR 3 : %.0f images affichees/s", Fsr3::DisplayedFps());
+			}
 		} else if (shown.stalled_s >= 1.0) {
 			ImGui::TextColored(Color(BAD), "No frames for %.0f s", shown.stalled_s);
 		} else {
