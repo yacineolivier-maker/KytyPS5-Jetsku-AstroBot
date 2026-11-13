@@ -2448,6 +2448,89 @@ void RenderExecutor::BeginDrawRun() {
 	}
 }
 
+// ---- Astro Bot PC: KYTY_NATIVE_MODE=n3b, lean native continuations (loader/gameCapture.h "n3b") ----
+//
+// A native draw op committed from its own published slot (CommandProcessor::NativeLeanScope sets
+// m_native_op) may take the lean path when it continues the run record that the previous native
+// draw of its engine thread slot made or continued (m_native_record; the same segment: not a
+// segment start), with KYTY_DRAW_RUN=1. The lean path skips:
+//  - the target operations (metadata colour operation, depth/stencil copy, colour resolve, depth to
+//    colour copy): MayRunTargetOperation is false, under which each of them returns false at once;
+//  - the hardware register checks (RunDrawChecks: validation only, same registers as the record;
+//    run late when the draw turns out not to be a lean continuation);
+//  - the barrier-safety evaluation (DrawIsBarrierSafe): the record's value, its inputs unchanged;
+//  - the run-record eligibility (the record's, see ExecutePreparedDraw).
+// Everything per draw runs as on the normal path, in the same order, so the commands recorded are
+// the normal path's: certificate check and preparation, the run certificate (DrawRunCandidate)
+// and its late image check, shader data, buffer bindings (BufferCache::ObtainBuffer), vertex and
+// index buffers, pipeline selection, descriptors and push constants, rendering begin, pipeline
+// bind, the draw, the run record update.
+// KYTY_NATIVE_VERIFY=1: one would-be lean draw in 64 takes the normal path instead and every lean
+// prediction is compared with what it computed (no target operation, the barrier safety, an
+// eligible record without writes); a difference is logged and stops the emulator.
+bool RenderExecutor::NativeLeanPrecheck(const CommandBuffer& buffer) {
+	namespace GC   = Loader::GameCapture;
+	const auto op  = m_native_op;
+	const auto slot = static_cast<int32_t>((op >> GC::kNativeOpSlotShift) & GC::kNativeSlotMask);
+	auto       why = GC::kNlLean;
+	if ((op & GC::kNativeOpSegStart) != 0) {
+		why = GC::kNlSegStart;
+	} else if (!m_run_prev_valid || m_native_record.slot != slot || m_native_record.key != m_run.key ||
+	           m_native_record.activity != m_run.activity ||
+	           m_native_record.rendering_serial != m_run.rendering_serial ||
+	           m_native_record.push_epoch != m_run.push_epoch) {
+		why = GC::kNlChain;
+	} else if (!m_in_engine_commit || DrawRun::GetMode() != DrawRun::Mode::On) {
+		why = GC::kNlOff;
+	} else if (graphics_debug_dump_enabled() || m_mrt_filter != ~0u ||
+	           MayRunTargetOperation(buffer.GetRegisters())) {
+		why = GC::kNlRegs;
+	} else if (GC::NativeVerifyEnabled() && (++m_native_samples & 63u) == 0) {
+		m_native_lean_sample = true;
+		m_native_lean_reason = GC::kNlSample;
+		return false;
+	}
+	m_native_lean_reason = why;
+	m_native_lean_pre    = why == GC::kNlLean;
+	return m_native_lean_pre;
+}
+
+void RenderExecutor::NativeLeanDecide() {
+	namespace GC = Loader::GameCapture;
+	if (!m_native_lean_pre && !m_native_lean_sample) {
+		return;
+	}
+	const auto why = !m_run_active   ? GC::kNlNotCont
+	                 : m_run_recall   ? GC::kNlRecall
+	                 : m_run_pipeswap ? GC::kNlSwap
+	                 : m_run.writes   ? GC::kNlWrites
+	                                  : GC::kNlLean;
+	if (why != GC::kNlLean) {
+		NativeLeanDrop(why);
+		return;
+	}
+	m_native_lean = m_native_lean_pre;
+}
+
+void RenderExecutor::NativeLeanDrop(uint32_t reason) {
+	if (m_native_lean || m_native_lean_sample) {
+		m_native_lean_reason = reason;
+	}
+	m_native_lean        = false;
+	m_native_lean_sample = false;
+}
+
+void RenderExecutor::NativeLeanMismatch(const char* what, uint64_t detail) {
+	m_native_lean_mismatch = true;
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+		std::printf("NativeLeanVerify: mismatch '%s' (detail 0x%" PRIx64 ", native op 0x%x)\n", what, detail,
+		            m_native_op);
+		std::fflush(stdout);
+	}
+	EXIT("NativeLeanVerify: a lean prediction differs from the normal path (%s)\n", what);
+}
+
 bool RenderExecutor::DrawRunCommandUnchanged(const CommandBuffer& buffer) const {
 	return buffer.Identity() == m_run.command &&
 	       m_context.GetCommandScheduler().CurrentTick() == m_run.tick &&
@@ -4168,6 +4251,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_run_verify = false;
 		DrawRunRecallFallback();
 	}
+	// N3b: a continuation that fell back late is not lean; an indirect or mesh draw never is.
+	if ((m_native_lean || m_native_lean_sample) && (!m_run_active || indirect != nullptr || mesh_active)) {
+		NativeLeanDrop(!m_run_active ? Loader::GameCapture::kNlLate : Loader::GameCapture::kNlShape);
+	}
 	CommitStats::StepMark(CommitStats::Step::LateCheck);
 
 	// KYTY_LOD_STATS_PLAIN_VARIANT: without a mip-statistics counter on any image the pixel
@@ -4340,11 +4427,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool* programs_safe = plan_statics && plan->plain_pixel == plain_pixel
 	                                ? &plan->programs_barrier_safe
 	                                : nullptr;
+	// N3b: a lean continuation's barrier safety is its record's: the same programs (so the same
+	// GDS bindings and program verdicts), textures and attachments, no feedback (a continuation
+	// acquires nothing), not indirect, and the same plain-pixel choice and barrier-sink switch.
+	const bool lean_barrier = (m_native_lean || m_native_lean_sample) && !feedback_aspects &&
+	                          plain_pixel == m_native_record.plain_pixel &&
+	                          BarrierSinkEnabled() == m_native_record.sink;
+	if ((m_native_lean || m_native_lean_sample) && !lean_barrier) {
+		NativeLeanDrop(Loader::GameCapture::kNlShape);
+	}
 	const bool barrier_safe =
-	    DrawIsBarrierSafe(stages, state.color_info, state.color_count, state.depth_info,
-	                      feedback_aspects, indirect != nullptr, plain_pixel,
-	                      plan_verify ? nullptr : programs_safe);
-	if (plan_verify && programs_safe != nullptr) {
+	    m_native_lean ? m_native_record.barrier_safe
+	                  : DrawIsBarrierSafe(stages, state.color_info, state.color_count, state.depth_info,
+	                                      feedback_aspects, indirect != nullptr, plain_pixel,
+	                                      plan_verify ? nullptr : programs_safe);
+	if (m_native_lean_sample) {
+		m_native_lean_checked = true;
+		if (barrier_safe != m_native_record.barrier_safe) {
+			NativeLeanMismatch("barrier safety", barrier_safe ? 1u : 0u);
+		}
+	}
+	if (!m_native_lean && plan_verify && programs_safe != nullptr) {
 		DrawPrep::CountBindingVerifyCheck();
 		if (DrawIsBarrierSafe(stages, state.color_info, state.color_count, state.depth_info,
 		                      feedback_aspects, indirect != nullptr, plain_pixel,
@@ -4654,7 +4757,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	CommitStats::StepMark(CommitStats::Step::Occlusion);
 	// KYTY_DRAW_RUN: whether the next draw may continue this one (drawPrep/drawRun.h), and in verify
 	// mode what this draw's normal path computed against what a continuation would have reused.
-	if (DrawRun::Enabled()) {
+	// N3b: a lean continuation is eligible as its record was (DrawRun's own
+	// KYTY_DRAW_RUN_CONT_ELIGIBLE argument for the per-stage part: the same programs, textures and
+	// attachments) once the per-draw conditions hold: no shader writes, a rendering instance, the
+	// fast state reset, no debug dump, no key diagnostic; the record's rendering state has no clear
+	// (it was eligible) and a continuation's feedback is none. Only the continuation's record update
+	// runs.
+	if (m_native_lean && (!DrawRun::Enabled() || m_run_verify || shader_write_stages ||
+	                      buffer.ActiveRenderingSerial() == 0 ||
+	                      !RenderStateFastEnabled(RenderStatePart::Reset) ||
+	                      graphics_debug_dump_enabled() || DrawRun::KeyDiagEnabled() ||
+	                      DrawRun::ContEligibleMode() >= 2 || m_run.record_writes_ok != DrawRun::WritesEnabled())) {
+		NativeLeanDrop(Loader::GameCapture::kNlShape);
+	}
+	if (m_native_lean) {
+		const CommitStats::SubScope record_scope(CommitStats::Sub::RunRecord);
+		OwnedCounters::Add(DrawRun::GetTotals().eligible, 1);
+		DrawRunRecordDraw(buffer, state, m_run_slice_offset, rendering, stages,
+		                  bounded ? &written : nullptr, pipeline);
+		m_run.writes = false;
+		m_native_lean_done   = true;
+		m_native_lean_reason = Loader::GameCapture::kNlLean;
+	} else if (DrawRun::Enabled()) {
 		const CommitStats::SubScope record_scope(CommitStats::Sub::RunRecord);
 		if (m_run_verify) {
 			DrawRunVerify(state, rendering, feedback_aspects, stages);
@@ -4771,6 +4895,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 			m_key_diag.reason = reason;
 		}
+		if (m_native_lean_sample) {
+			// N3b verify: the lean path records the continuation as eligible, without writes.
+			m_native_lean_checked = true;
+			if (!eligible || stages_write()) {
+				NativeLeanMismatch(!eligible ? "record eligibility" : "record writes", 0);
+			}
+		}
 		if (eligible) {
 			OwnedCounters::Add(DrawRun::GetTotals().eligible, 1);
 			const bool program_writes =
@@ -4791,6 +4922,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			DrawRunKeyDiagResolved(buffer, stages, pipeline, rendering, eligible && m_run.valid);
 		}
 	}
+	// N3b: what a lean continuation of the record now in m_run reuses (every draw that reaches this
+	// point sets it; a draw that returned earlier left m_run invalid, which ends the chain).
+	m_native_record.slot = m_run.valid && m_native_op != 0 && indirect == nullptr && !mesh_active
+	                           ? static_cast<int32_t>((m_native_op >> Loader::GameCapture::kNativeOpSlotShift) &
+	                                                  Loader::GameCapture::kNativeSlotMask)
+	                           : -1;
+	m_native_record.barrier_safe = barrier_safe;
+	m_native_record.plain_pixel  = plain_pixel;
+	m_native_record.sink         = BarrierSinkEnabled();
+	m_native_record.key              = m_run.key;
+	m_native_record.activity         = m_run.activity;
+	m_native_record.rendering_serial = m_run.rendering_serial;
+	m_native_record.push_epoch       = m_run.push_epoch;
 	CommitStats::StepMark(CommitStats::Step::RunRecord);
 	if (CommitStats::Enabled()) [[unlikely]] {
 		CommitStats::Mark(CommitStats::Phase::Emit);
@@ -4844,13 +4988,21 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	// KYTY_DRAW_RUN: only a draw that records through the eligible path seeds the next continuation.
 	BeginDrawRun();
 	CommitStats::StepMark(CommitStats::Step::BeginRun);
+	// KYTY_NATIVE_MODE=n3b: the per-draw lean state (reset now and at every return).
+	const NativeLeanDrawGuard native_lean(*this);
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
-	    DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	// N3b: with the register test that decides them false, the target operations are not tried.
+	const bool lean_pre = m_native_op != 0 && NativeLeanPrecheck(buffer);
+	if (!lean_pre &&
+	    (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	     DepthStencilCopy(buffer) ||
+	     ResolveColorTargets(buffer, args.render_target_slice_offset))) {
+		if (m_native_lean_sample) {
+			NativeLeanMismatch("target operation ran", 0);
+		}
 		ResetBindings();
 		return;
 	}
@@ -4878,7 +5030,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	CommitStats::StepMark(CommitStats::Step::VsCheck);
-	RunDrawChecks(buffer, ucfg, m_binding_plan);
+	// N3b: the register checks passed for the previous draw, whose registers a lean continuation
+	// has (its structure key covers every context and user-config register but the index offset
+	// and object id); a draw that turns out not to be one runs them after its program refresh.
+	if (!lean_pre) {
+		RunDrawChecks(buffer, ucfg, m_binding_plan);
+	}
 	CommitStats::StepMark(CommitStats::Step::DrawChecks);
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
@@ -4915,9 +5072,18 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const bool prepared = PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
 	m_mrt_split_allowed = false;
 	if (!prepared) {
+		if (lean_pre) {
+			RunDrawChecks(buffer, ucfg, m_binding_plan); // N3b: not a continuation after all
+		}
 		m_mrt_split_slots = 0;
 		ResetBindings();
 		return;
+	}
+	NativeLeanDecide();
+	if (lean_pre && !m_native_lean) {
+		// N3b: not a lean continuation: the checks it skipped run now (they only read the same
+		// registers and record nothing).
+		RunDrawChecks(buffer, ucfg, m_binding_plan);
 	}
 
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source,
@@ -4998,13 +5164,21 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	// KYTY_DRAW_RUN: only a draw that records through the eligible path seeds the next continuation.
 	BeginDrawRun();
 	CommitStats::StepMark(CommitStats::Step::BeginRun);
+	// KYTY_NATIVE_MODE=n3b: the per-draw lean state (reset now and at every return).
+	const NativeLeanDrawGuard native_lean(*this);
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
-	    DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	// N3b: with the register test that decides them false, the target operations are not tried.
+	const bool lean_pre = m_native_op != 0 && NativeLeanPrecheck(buffer);
+	if (!lean_pre &&
+	    (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	     DepthStencilCopy(buffer) ||
+	     ResolveColorTargets(buffer, args.render_target_slice_offset))) {
+		if (m_native_lean_sample) {
+			NativeLeanMismatch("target operation ran", 0);
+		}
 		ResetBindings();
 		return;
 	}
@@ -5028,7 +5202,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 
 	CommitStats::StepMark(CommitStats::Step::VsCheck);
-	RunDrawChecks(buffer, ucfg, m_binding_plan);
+	// N3b: the register checks passed for the previous draw, whose registers a lean continuation
+	// has (its structure key covers every context and user-config register but the index offset
+	// and object id); a draw that turns out not to be one runs them after its program refresh.
+	if (!lean_pre) {
+		RunDrawChecks(buffer, ucfg, m_binding_plan);
+	}
 	CommitStats::StepMark(CommitStats::Step::DrawChecks);
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
@@ -5049,9 +5228,18 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	const bool prepared = PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
 	m_mrt_split_allowed = false;
 	if (!prepared) {
+		if (lean_pre) {
+			RunDrawChecks(buffer, ucfg, m_binding_plan); // N3b: not a continuation after all
+		}
 		m_mrt_split_slots = 0;
 		ResetBindings();
 		return;
+	}
+	NativeLeanDecide();
+	if (lean_pre && !m_native_lean) {
+		// N3b: not a lean continuation: the checks it skipped run now (they only read the same
+		// registers and record nothing).
+		RunDrawChecks(buffer, ucfg, m_binding_plan);
 	}
 
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());

@@ -479,6 +479,9 @@ private:
 	// (graphicsRun.cpp NativeTierScope), reported with its timing.
 	Loader::GameCapture::NativeN3Draw m_native_tier_draw {};
 	bool                              m_native_tier_valid = false;
+	// Astro Bot PC (KYTY_NATIVE_MODE=n3b): the native draw op was committed from its published slot
+	// with the lean decision enabled (RenderExecutor::m_native_op); its reason is reported.
+	bool                              m_native_lean_op = false;
 	uint32_t         m_index_buffer_size                = 0;
 	uint64_t         m_index_base_addr                  = 0;
 	uint64_t         m_draw_indirect_args_base_addr     = 0;

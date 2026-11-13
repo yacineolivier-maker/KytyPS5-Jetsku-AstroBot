@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRENDER_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRENDER_H_
 
+#include "loader/gameCapture.h" // Astro Bot PC (KYTY_NATIVE_MODE=n3b)
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -1097,7 +1098,63 @@ public:
 	// KYTY_DRAW_PREP_BINDINGS texturememo: the memo draw-prep threads read hints from (FindHint).
 	[[nodiscard]] const TextureBindingMemo& GetTextureMemo() const noexcept { return m_texture_memo; }
 
+	// Astro Bot PC (KYTY_NATIVE_MODE=n3b, loader/gameCapture.h "n3b", renderDraw.cpp "N3b"): lean
+	// commit of native continuations. Set by the command processor around the commit of a native
+	// draw op's own published slot (its op flags, 0 otherwise); read back after the op.
+	uint32_t m_native_op            = 0;
+	uint32_t m_native_lean_reason   = 0;     // Loader::GameCapture::NativeLeanReason of the last draw
+	bool     m_native_lean_done     = false; // the last draw completed on the lean path
+	bool     m_native_lean_checked  = false; // a verify sample's predictions were checked
+	bool     m_native_lean_mismatch = false; // and differed
+
 private:
+	// N3b state (GPU thread, under the render mutex).
+	// The register test that decides the generic checks passed: they were skipped (DrawIndex/DrawAuto).
+	bool     m_native_lean_pre    = false;
+	bool     m_native_lean        = false; // the lean path is taken for the rest of the draw
+	bool     m_native_lean_sample = false; // verify sample: normal path, lean predictions compared
+	uint32_t m_native_samples     = 0;
+	// Set by every draw that reaches the run-record step (ExecutePreparedDraw): the engine thread slot
+	// of the native draw that made or last continued the current run record (-1: not a native draw,
+	// an indirect draw, or no record), and what a lean continuation of it reuses.
+	struct NativeLeanRecord {
+		int32_t slot         = -1;
+		bool    barrier_safe = false;
+		bool    plain_pixel  = false;
+		bool    sink         = false; // BarrierSinkEnabled() when barrier_safe was computed
+		// The identity of the run record it describes (m_run after the record step): a record
+		// installed any other way (a recall, a draw that returned before its record step) differs.
+		uint64_t key = 0, activity = 0, rendering_serial = 0, push_epoch = 0;
+	} m_native_record;
+	// DrawIndex/DrawAuto, after BeginDrawRun: whether the generic checks may be skipped (n3b).
+	[[nodiscard]] bool NativeLeanPrecheck(const CommandBuffer& buffer);
+	// After PrepareDrawRenderState: whether the draw continues on the lean path.
+	void NativeLeanDecide();
+	// Drops the lean path for the rest of the draw (normal path from here on), with the reason.
+	void NativeLeanDrop(uint32_t reason);
+	// A lean prediction differed from the normal path (verify sample): logged, then the emulator stops.
+	void NativeLeanMismatch(const char* what, uint64_t detail);
+	// DrawIndex/DrawAuto: the per-draw N3b state is reset at the start and at every return.
+	struct NativeLeanDrawGuard {
+		RenderExecutor& ex;
+		explicit NativeLeanDrawGuard(RenderExecutor& e): ex(e) {
+			ex.m_native_lean_reason   = Loader::GameCapture::kNlEarly;
+			ex.m_native_lean_done     = false;
+			ex.m_native_lean_checked  = false;
+			ex.m_native_lean_mismatch = false;
+			ex.m_native_lean_pre      = false;
+			ex.m_native_lean          = false;
+			ex.m_native_lean_sample   = false;
+		}
+		~NativeLeanDrawGuard() {
+			ex.m_native_lean_pre    = false;
+			ex.m_native_lean        = false;
+			ex.m_native_lean_sample = false;
+		}
+		NativeLeanDrawGuard(const NativeLeanDrawGuard&)            = delete;
+		NativeLeanDrawGuard& operator=(const NativeLeanDrawGuard&) = delete;
+	};
+
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 	// Records a GPU-sourced indirect draw. Returns false, before recording anything, when the

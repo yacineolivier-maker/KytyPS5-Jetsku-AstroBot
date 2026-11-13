@@ -87,6 +87,7 @@ static bool ClockLocal() {
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <utility> // Astro Bot PC (n3b: std::exchange)
 #include <xxhash.h>
 
 #if defined(_M_X64) || defined(__x86_64__)
@@ -2998,6 +2999,7 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 		view.rt0_base = m_ctx.GetRenderTarget(0).base.addr;
 		view.ps_addr  = m_sh_ctx.GetPs().ps_regs.data_addr;
 		view.gs_addr  = m_sh_ctx.GetVs().gs_regs.data_addr;
+		view.es_addr  = m_sh_ctx.GetVs().es_regs.data_addr;
 		view.hs_addr  = m_sh_ctx.GetVs().hs_regs.data_addr;
 		Loader::GameCapture::CheckCpDraw(view);
 	}
@@ -3313,12 +3315,45 @@ void CommandProcessor::NoteNativeResolvedOp(uint32_t flags, uint64_t start) {
 	                                                            : GC::kNrContinued)
 	                     : ex.m_run_targets_kept ? GC::kNrTargets
 	                                             : GC::kNrStarted;
-	GC::NoteNativeResolved(flags, start, end, run);
+	// N3b: a continuation committed on the lean path is reported as its own class.
+	const bool lean_op = std::exchange(m_native_lean_op, false);
+	GC::NoteNativeResolved(flags, start, end, lean_op && ex.m_native_lean_done ? GC::kNrLean : run);
+	if (GC::NativeLean()) {
+		// A draw that passed every lean test but returned before its record step did not complete.
+		const uint32_t reason = !lean_op                                ? GC::kNlOff
+		                        : ex.m_native_lean_done                 ? GC::kNlLean
+		                        : ex.m_native_lean_reason == GC::kNlLean ? GC::kNlEarly
+		                                                                : ex.m_native_lean_reason;
+		GC::NoteNativeLean(flags, reason, lean_op && ex.m_native_lean_checked, lean_op && ex.m_native_lean_mismatch);
+	}
 	if (m_native_tier_valid) {
 		m_native_tier_valid = false;
 		GC::NoteNativeN3(flags, start, end, m_native_tier_draw);
 	}
 }
+
+// Astro Bot PC (KYTY_NATIVE_MODE=n3b, stage N3b): the native op flags handed to the executor for
+// the commit of the op's own published slot (exactly this draw), so that it may take the lean path
+// (RenderExecutor::NativeLeanPrecheck); 0 for every other draw it commits.
+struct NativeLeanScope {
+	RenderExecutor* ex = nullptr;
+	NativeLeanScope(RenderExecutor& e, uint32_t op_flags, bool& lean_op) {
+		namespace GC = Loader::GameCapture;
+		lean_op      = false;
+		if ((op_flags & CpSeq::DrawFlagNativeMask) != 0 && GC::NativeLean()) [[unlikely]] {
+			ex            = &e;
+			lean_op       = true;
+			e.m_native_op = op_flags & GC::kNativeOpMask;
+		}
+	}
+	~NativeLeanScope() {
+		if (ex != nullptr) [[unlikely]] {
+			ex->m_native_op = 0;
+		}
+	}
+	NativeLeanScope(const NativeLeanScope&)            = delete;
+	NativeLeanScope& operator=(const NativeLeanScope&) = delete;
+};
 
 // Astro Bot PC (KYTY_NATIVE_MODE=n3, stage N3a): the buffer cache's segment resolution windows
 // (BufferCache::NativeTierBegin) for the duration of a native draw op. Declared after the
@@ -3388,6 +3423,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 	}
 	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
 		// Thread mode: the sequencer published the draw; commit its prepared slot now, in order.
+		const NativeLeanScope native_lean(m_renderer.GetRenderExecutor(), op.flags, m_native_lean_op);
 		ResolvePrep()->CommitPublished(
 		    op.window, m_submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
@@ -4062,6 +4098,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 		args.instance_count = NumInstances();
 	}
 	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
+		const NativeLeanScope native_lean(m_renderer.GetRenderExecutor(), op.flags, m_native_lean_op);
 		ResolvePrep()->CommitPublished(
 		    op.window, m_submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);

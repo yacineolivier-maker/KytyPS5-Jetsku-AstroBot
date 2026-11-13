@@ -122,6 +122,7 @@ struct NativeConfig {
 	bool        splice = false;    // KYTY_NATIVE_MODE=splice (stage N1) or n2, else drop (N0)
 	bool        n2     = false;    // KYTY_NATIVE_MODE=n2 or n3 (stage N2: N1 + records, verify, timing)
 	bool        n3     = false;    // KYTY_NATIVE_MODE=n3 (stage N3a: N2 + segment resolution windows)
+	bool        n3b    = false;    // KYTY_NATIVE_MODE=n3b (stage N3b: N2 + lean native continuations)
 	bool        verify = false;    // KYTY_NATIVE_VERIFY=1: a splice record miss exits
 };
 
@@ -171,7 +172,8 @@ NativeConfig ParseNative() {
 		config.mode = "drop";
 	}
 	config.n3     = config.mode == "n3";
-	config.n2     = config.mode == "n2" || config.n3;
+	config.n3b    = config.mode == "n3b";
+	config.n2     = config.mode == "n2" || config.n3 || config.n3b;
 	config.splice = config.mode == "splice" || config.n2;
 	config.valid  = (config.mode == "drop" || config.splice) && config.mask != 0;
 	const char* verify = std::getenv("KYTY_NATIVE_VERIFY");
@@ -517,7 +519,21 @@ constexpr const char* kNvNames[GameCapture::kNvCount] = {
     "color-ctl", "target-mask", "blend", "poly-offset", "viewport", "scissor", "index-base", "index-type"};
 // Resolver side (Thread_Gpu): native draw ops by draw-run treatment, their TSC cycles, segments
 // (first op start to last op end of a run of ops of one segment) and their draws.
-constexpr const char* kNrNames[GameCapture::kNrCount] = {"cont", "recall", "swap", "targets", "start"};
+constexpr const char* kNrNames[GameCapture::kNrCount] = {"cont", "recall", "swap", "targets", "start", "lean"};
+// n3b (resolver): why each native draw took the lean or the normal path, and the verify samples.
+constexpr const char* kNlNames[GameCapture::kNlCount] = {"lean", "seg-start", "chain", "off", "regs", "not-cont", "recall",
+                                                         "swap", "writes", "shape", "late", "sample", "early"};
+struct NlResolve {
+	std::array<std::atomic<uint64_t>, GameCapture::kNlCount> reasons {};
+	std::atomic<uint64_t>                                    verified {0};
+	std::atomic<uint64_t>                                    mismatches {0};
+};
+std::array<NlResolve, kEngineThreads> g_nl_resolve {};
+struct NlResolveLast {
+	std::array<uint64_t, GameCapture::kNlCount> reasons {};
+	uint64_t                                    verified = 0, mismatches = 0;
+};
+std::array<NlResolveLast, kEngineThreads> g_nl_resolve_last {}; // reporter only
 struct N2Resolve {
 	std::array<std::atomic<uint64_t>, GameCapture::kNrCount> draws {};
 	std::array<std::atomic<uint64_t>, GameCapture::kNrCount> ticks {};
@@ -1492,6 +1508,44 @@ std::string N3SlotReport(uint32_t s) {
 	return out;
 }
 
+// KYTY_NATIVE_MODE=n3b part of a slot (reporter only): lean draws and their Thread_Gpu time against
+// the continuations that took the normal path, and why the others did not take the lean path.
+std::string N3bSlotReport(uint32_t s, const std::array<uint64_t, GameCapture::kNrCount>& draws,
+                          const std::array<uint64_t, GameCapture::kNrCount>& ticks) {
+	auto&      r    = g_nl_resolve[s];
+	auto&      last = g_nl_resolve_last[s];
+	const auto take = [](std::atomic<uint64_t>& v, uint64_t& l) {
+		const auto now = v.load(std::memory_order_relaxed);
+		const auto d   = now - l;
+		l              = now;
+		return d;
+	};
+	std::array<uint64_t, GameCapture::kNlCount> reasons {};
+	uint64_t                                    all = 0;
+	for (uint32_t k = 0; k < GameCapture::kNlCount; k++) {
+		reasons[k] = take(r.reasons[k], last.reasons[k]);
+		all += reasons[k];
+	}
+	const auto   verified   = take(r.verified, last.verified);
+	const auto   mismatches = take(r.mismatches, last.mismatches);
+	const double tpu        = g_n2_tsc_per_us;
+	const auto   us         = [&](uint64_t t, uint64_t n) {
+        return tpu <= 0.0 || n == 0 ? 0.0 : static_cast<double>(t) / tpu / static_cast<double>(n);
+	};
+	const auto lean = GameCapture::kNrLean;
+	const auto cont = GameCapture::kNrContinued;
+	std::string out = fmt::format(" | n3b lean {} ({:.1f}%) {:.2f} us/draw vs normal-path continuation {} {:.2f} us/draw | n3b normal path:", draws[lean],
+	                              all == 0 ? 0.0 : 100.0 * static_cast<double>(reasons[GameCapture::kNlLean]) / static_cast<double>(all),
+	                              us(ticks[lean], draws[lean]), draws[cont], us(ticks[cont], draws[cont]));
+	for (uint32_t k = 1; k < GameCapture::kNlCount; k++) {
+		if (reasons[k] != 0) out += fmt::format(" {} {}", kNlNames[k], reasons[k]);
+	}
+	if (Native().verify) {
+		out += fmt::format(" | n3b verify: samples {} mismatches {}", verified, mismatches);
+	}
+	return out;
+}
+
 std::string N2SlotReport(uint32_t s, uint64_t segments_game, uint64_t rec_incomplete, uint64_t flips) {
 	auto& r    = g_n2_resolve[s];
 	auto& last = g_n2_resolve_last[s];
@@ -1531,6 +1585,8 @@ std::string N2SlotReport(uint32_t s, uint64_t segments_game, uint64_t rec_incomp
 	                              segments_game);
 	if (Native().n3) {
 		out += N3SlotReport(s);
+	} else if (Native().n3b) {
+		out += N3bSlotReport(s, draws, ticks);
 	} else {
 		out += fmt::format(" | emission: emulator path (splice) {} n2-native 0 (fallback reason: native emission not implemented)", all_draws);
 	}
@@ -1905,12 +1961,13 @@ void OnInstalled() {
 		}
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "GameNative: KYTY_NATIVE {} | mode {}{}{} | threads:{}{}{}\n",
-		    !native.valid ? "ignored" : !ok ? "inactive (capture hooks not installed)" : native.n3 ? "active (stage N3a)" : native.n2 ? "active (stage N2)" : native.splice ? "active (stage N1)" : "active (stage N0)",
-		    native.mode, native.mode == "drop" || native.splice ? "" : " (unsupported: drop, splice, n2 or n3)",
+		    !native.valid ? "ignored" : !ok ? "inactive (capture hooks not installed)" : native.n3 ? "active (stage N3a)" : native.n3b ? "active (stage N3b)" : native.n2 ? "active (stage N2)" : native.splice ? "active (stage N1)" : "active (stage N0)",
+		    native.mode, native.mode == "drop" || native.splice ? "" : " (unsupported: drop, splice, n2, n3 or n3b)",
 		    native.splice ? fmt::format(" (ring {} entries{})", kNativeRingSize, native.verify ? ", verify" : "") : std::string {},
 		    threads.empty() ? " none" : threads, native.unknown.empty() ? "" : " | unknown:", native.unknown));
 		if (native.valid && ok) {
 			GameCapture::g_native_mode.store(static_cast<uint8_t>(native.n3       ? GameCapture::NativeMode::N3
+			                                                      : native.n3b    ? GameCapture::NativeMode::N3b
 			                                                      : native.n2     ? GameCapture::NativeMode::N2
 			                                                      : native.splice ? GameCapture::NativeMode::Splice
 			                                                                      : GameCapture::NativeMode::Drop),
@@ -2080,15 +2137,18 @@ void CheckCpDrawSlow(const CpDrawView& view) {
 		cmp(kCmpPs, view.ps_addr == (w[4] & 0xffffffffffffull));
 	}
 	if (w[5] != 0) {
-		cmp(kCmpGeom, ((geom_slot & 1u) != 0 ? view.hs_addr : view.gs_addr) == (w[5] & 0xffffffffffffull));
+		// GS-family slot: the CP holds the engine's geometry program in the ES pair (es_regs, what the
+		// emulator draws with); the GS pair is accepted too.
+		const uint64_t code = w[5] & 0xffffffffffffull;
+		cmp(kCmpGeom, (geom_slot & 1u) != 0 ? view.hs_addr == code : (view.es_addr == code || view.gs_addr == code));
 	}
 	if (bad != 0 && g_cp.logged.fetch_add(1, std::memory_order_relaxed) < 8) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "GameCapture CP mismatch 0x{:x} at packet 0x{:x}: game {} count {} first {} inst {} ib 0x{:x}/{} rt0 0x{:x} ps 0x{:x} geom s{} 0x{:x} | "
-		    "CP op 0x{:x} count {} first {} inst {}{} ib 0x{:x}/{} rt0 0x{:x} ps 0x{:x} gs 0x{:x} hs 0x{:x}\n",
+		    "CP op 0x{:x} count {} first {} inst {}{} ib 0x{:x}/{} rt0 0x{:x} ps 0x{:x} es 0x{:x} gs 0x{:x} hs 0x{:x}\n",
 		    bad, view.packet, kKindNames[std::min<uint32_t>(kind, 5u)], count, first, instances, w[2], ib32 ? 32 : 16, w[3], w[4], geom_slot,
 		    w[5], view.opcode, view.index_count, view.index_offset, view.instances, view.instances_known ? "" : "?", view.ib_base,
-		    view.ib_type, view.rt0_base, view.ps_addr, view.gs_addr, view.hs_addr));
+		    view.ib_type, view.rt0_base, view.ps_addr, view.es_addr, view.gs_addr, view.hs_addr));
 	}
 }
 
@@ -2271,6 +2331,21 @@ void NoteNativeResolved(uint32_t op_flags, uint64_t start_tsc, uint64_t end_tsc,
 	}
 	span.end = end_tsc;
 	span.draws++;
+}
+
+void NoteNativeLean(uint32_t op_flags, uint32_t reason, bool verified, bool mismatch) {
+	const uint32_t slot = (op_flags >> kNativeOpSlotShift) & kNativeSlotMask;
+	if (slot >= kEngineThreads || reason >= kNlCount) {
+		return;
+	}
+	auto& r = g_nl_resolve[slot];
+	Inc(r.reasons[reason]);
+	if (verified) {
+		Inc(r.verified);
+	}
+	if (mismatch) {
+		Inc(r.mismatches);
+	}
 }
 
 namespace {

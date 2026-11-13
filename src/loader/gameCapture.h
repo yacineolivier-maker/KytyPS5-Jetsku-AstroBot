@@ -58,7 +58,7 @@ void NoteNativeMarker(const uint32_t* body, uint32_t body_dw);
 // (the CP has not consumed far enough): no marker, the normal packet stays (counted). The CP's
 // CpOpNativeDraw looks the record up and runs the original packet's handler at the marker's
 // position, with the CP state of that position, so the image is the emulator's own.
-enum class NativeMode : uint8_t { Off, Drop, Splice, N2, N3 };
+enum class NativeMode : uint8_t { Off, Drop, Splice, N2, N3, N3b };
 extern std::atomic<uint8_t> g_native_mode; // NativeMode, set once the hooks are installed
 [[nodiscard]] inline NativeMode GetNativeMode() {
 	return static_cast<NativeMode>(g_native_mode.load(std::memory_order_relaxed));
@@ -67,12 +67,17 @@ extern std::atomic<uint8_t> g_native_mode; // NativeMode, set once the hooks are
 // emission is still the emulator's own draw path (N3: with the segment resolution windows below).
 [[nodiscard]] inline bool NativeSplices() {
 	const auto mode = GetNativeMode();
-	return mode == NativeMode::Splice || mode == NativeMode::N2 || mode == NativeMode::N3;
+	return mode == NativeMode::Splice || mode == NativeMode::N2 || mode == NativeMode::N3 ||
+	       mode == NativeMode::N3b;
 }
 // N2 and N3: game-thread records, op tags, record verification, resolver timing.
 [[nodiscard]] inline bool NativeRecords() {
 	const auto mode = GetNativeMode();
-	return mode == NativeMode::N2 || mode == NativeMode::N3;
+	return mode == NativeMode::N2 || mode == NativeMode::N3 || mode == NativeMode::N3b;
+}
+// N3b: lean continuations (renderer/renderDraw.cpp, RenderExecutor::NativeLeanPrecheck).
+[[nodiscard]] inline bool NativeLean() {
+	return GetNativeMode() == NativeMode::N3b;
 }
 
 // Marker word 1, low byte: bits 0..3 the engine thread slot; bit 7 (N2 only) the draw starts a
@@ -199,10 +204,44 @@ enum NativeRun : uint32_t {
 	kNrSwapped,   // continuation with a pipeline swap (KYTY_DRAW_RUN_PIPESWAP)
 	kNrTargets,   // new structure, targets kept (KYTY_DRAW_RUN_TARGETS)
 	kNrStarted,   // new structure, resolved in full
+	kNrLean,      // n3b: a continuation committed on the lean path
 	kNrCount
 };
 // Resolver (Thread_Gpu): a native draw op ran from `start_tsc` to `end_tsc`.
 void NoteNativeResolved(uint32_t op_flags, uint64_t start_tsc, uint64_t end_tsc, uint32_t run);
+
+// ---- KYTY_NATIVE_MODE=n3b (stage N3b, docs\PLAN-PARALLELE.md) ------------------------------------
+//
+// N3b = N2 plus a lean commit of native continuations (RenderExecutor, renderDraw.cpp "N3b"): a
+// native draw that continues the previous native draw of its segment (same engine thread slot, not a
+// segment start, the previous executed draw a native draw of that slot that left a run record, then
+// KYTY_DRAW_RUN's own certificate: same structure key, activity epoch, command buffer, tick,
+// rendering instance, programs, validated preparation; no recall, swap, buffer writes, indirect or
+// mesh draw) skips the generic work whose result is the previous draw's: the colour/depth target
+// operations (gated by the register test that decides them), the hardware register checks, the
+// barrier-safety evaluation and the run-record eligibility. Everything per draw (certificate,
+// shader data, buffer bindings, vertex/index, descriptors, push constants, rendering begin,
+// pipeline bind, draw) runs as on the normal path, so the packets are the normal path's.
+// Why a native draw took the normal path (or kNlLean), reported per slot in "Native 10s".
+enum NativeLeanReason : uint32_t {
+	kNlLean,     // took the lean path
+	kNlSegStart, // first draw of a native segment
+	kNlChain,    // the previous executed draw was not a recorded native draw of this slot
+	kNlOff,      // not an engine commit, or KYTY_DRAW_RUN not 1
+	kNlRegs,     // registers may run a target operation, debug dump, MRT split pass
+	kNlNotCont,  // KYTY_DRAW_RUN did not continue (start, targets kept, ...)
+	kNlRecall,   // continued an earlier record (recall)
+	kNlSwap,     // continued with a pipeline swap
+	kNlWrites,   // the run's programs write buffers
+	kNlShape,    // indirect, mesh, plain-pixel variant changed, shader writes, no lean record
+	kNlLate,     // the continuation fell back late (images or command changed)
+	kNlSample,   // KYTY_NATIVE_VERIFY=1: sampled for verification (normal path, predictions checked)
+	kNlEarly,    // the draw returned before recording
+	kNlCount
+};
+// Resolver: why a native draw took its path; `verify`: a sampled draw's predictions were checked,
+// `mismatch`: and differed (verify mode stops the emulator after logging).
+void NoteNativeLean(uint32_t op_flags, uint32_t reason, bool verified, bool mismatch);
 
 // ---- KYTY_NATIVE_MODE=n3 (stage N3a, docs\PLAN-PARALLELE.md) -------------------------------------
 //
@@ -262,6 +301,10 @@ struct CpDrawView {
 	uint64_t rt0_base     = 0; // CB_COLOR0_BASE(+EXT) as decoded by the emulator
 	uint64_t ps_addr      = 0; // SPI_SHADER_PGM_LO/HI_PS
 	uint64_t gs_addr      = 0; // SPI_SHADER_PGM_LO/HI_GS
+	// SPI_SHADER_PGM_LO/HI_ES: the program the emulator runs as the vertex/geometry stage
+	// (es_regs, DrawHasValidVertexShader). The engine's GS-family code is compared with it: the GS
+	// pair held one constant value in every logged "geom s2" mismatch (14/11).
+	uint64_t es_addr      = 0;
 	uint64_t hs_addr      = 0; // SPI_SHADER_PGM_LO/HI_HS
 };
 
