@@ -26,6 +26,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/gameCapture.h"
 
 #include <algorithm>
 #include <array>
@@ -2806,6 +2807,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
 	cmd[4] = index_count;
 	cmd[5] = decode_draw_index_initiator(modifier);
 
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_2); // Astro Bot PC : KYTY_GAME_HOOKS=capture
+
 	return cmd;
 }
 
@@ -2911,6 +2914,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_c
 	cmd[1] = index_count;
 	cmd[2] = decode_draw_index_initiator(modifier) | 0x2u;
 
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_AUTO); // Astro Bot PC : KYTY_GAME_HOOKS=capture
+
 	return cmd;
 }
 
@@ -2941,6 +2946,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index
 	cmd[2] = index_offset;
 	cmd[3] = index_count;
 	cmd[4] = decode_draw_index_initiator(modifier);
+
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_OFFSET_2); // Astro Bot PC : KYTY_GAME_HOOKS=capture
 
 	return cmd;
 }
@@ -3000,6 +3007,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 	cmd[3] = static_cast<uint32_t>(patch_offsets >> 32u);
 	cmd[4] = decode_draw_index_initiator(modifier);
 
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_INDIRECT); // Astro Bot PC : KYTY_GAME_HOOKS=capture
+
 	return cmd;
 }
 
@@ -3025,6 +3034,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_off
 	cmd[2] = static_cast<uint32_t>(patch_offsets);
 	cmd[3] = static_cast<uint32_t>(patch_offsets >> 32u);
 	cmd[4] = decode_indirect_draw_initiator(modifier);
+
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDIRECT); // Astro Bot PC : KYTY_GAME_HOOKS=capture
 
 	return cmd;
 }
@@ -3088,6 +3099,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
 	draw[8] = stride_in_bytes;
 	draw[9] = decode_indirect_draw_initiator(modifier);
 
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDIRECT_MULTI); // Astro Bot PC : KYTY_GAME_HOOKS=capture
+
 	return cmd;
 }
 
@@ -3140,6 +3153,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	cmd[7] = static_cast<uint32_t>(count_vaddr >> 32u);
 	cmd[8] = stride_in_bytes;
 	cmd[9] = decode_draw_index_initiator(modifier);
+
+	Loader::GameCapture::NoteDrawPacket(cmd, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI); // Astro Bot PC : KYTY_GAME_HOOKS=capture
 
 	return cmd;
 }

@@ -64,6 +64,7 @@ static bool ClockLocal() {
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "loader/gameCapture.h"
 
 #include <algorithm>
 #include <array>
@@ -2965,6 +2966,39 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 				engine->OnPacket(packet_class, fence_kind);
 			}
 		}
+	}
+	if (Loader::GameCapture::Active() && !reference &&
+	    (opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
+	     opcode == Pm4::IT_DRAW_INDEX_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_2)) [[unlikely]] {
+		// Astro Bot PC (KYTY_GAME_HOOKS=capture): the CP's view of this draw, compared with the
+		// game-side record sampled under the same packet address (loader/gameCapture.h).
+		Loader::GameCapture::CpDrawView view;
+		view.packet      = guest_packet;
+		view.opcode      = opcode;
+		view.speculative = prefetch;
+		const auto* body = packet + 1;
+		if (opcode == Pm4::IT_DRAW_INDEX_OFFSET_2) {
+			view.index_offset = body[1];
+			view.index_count  = body[2];
+		} else if (opcode == Pm4::IT_DRAW_INDEX_AUTO) {
+			view.index_count = body[0];
+		} else if (opcode == Pm4::IT_DRAW_INDEX_2) {
+			view.index_count = body[3];
+		}
+		if (m_front_mode != FrontMode::Direct) {
+			view.instances_known = m_front_instances_known;
+			view.instances       = m_front_num_instances;
+		} else {
+			view.instances_known = m_pending_num_instances.empty();
+			view.instances       = m_num_instances;
+		}
+		view.ib_base  = m_index_base_addr;
+		view.ib_type  = m_index_type_and_size;
+		view.rt0_base = m_ctx.GetRenderTarget(0).base.addr;
+		view.ps_addr  = m_sh_ctx.GetPs().ps_regs.data_addr;
+		view.gs_addr  = m_sh_ctx.GetVs().gs_regs.data_addr;
+		view.hs_addr  = m_sh_ctx.GetVs().hs_regs.data_addr;
+		Loader::GameCapture::CheckCpDraw(view);
 	}
 	const auto packet_dw =
 	    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;

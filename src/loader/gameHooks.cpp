@@ -27,6 +27,10 @@ namespace Loader::GameHooks {
 namespace Trace {
 void RegisterHooks(); // gameHooksTrace.cpp
 } // namespace Trace
+namespace Capture {
+void RegisterHooks();  // gameHooksCapture.cpp
+void OnInstalled();    // gameHooksCapture.cpp: after Install() placed the hooks
+} // namespace Capture
 
 struct HookRecord {
 	int         id = -1;
@@ -113,6 +117,9 @@ KYTY_SYSV_ABI void DispatchEnter(GuestCallContext* ctx) {
 		return;
 	}
 	// After
+	if (hook->spec.entry_fn != nullptr) {
+		hook->spec.entry_fn(*ctx);
+	}
 	auto* ret_slot = reinterpret_cast<uint64_t*>(ctx->rsp);
 	t_shadow.push_back({*ret_slot, ctx->rsp + 8, hook});
 	*ret_slot = g_return_stub;
@@ -258,6 +265,10 @@ void Install(Program* main_program) {
 	if (SetEnabled("trace")) {
 		Trace::RegisterHooks();
 	}
+	const bool capture = SetEnabled("capture");
+	if (capture) {
+		Capture::RegisterHooks();
+	}
 	g_installed = true;
 	if (main_program == nullptr || main_program->elf == nullptr || main_program->elf->IsShared() ||
 	    main_program->base_vaddr == 0) {
@@ -386,6 +397,9 @@ void Install(Program* main_program) {
 		                               : fmt::format("no original entry ({})", why)));
 	}
 	Common::VirtualMemory::FlushInstructionCache(g_cave_addr, g_cave_size);
+	if (capture) {
+		Capture::OnInstalled();
+	}
 }
 
 bool IsInstalled(int id) {

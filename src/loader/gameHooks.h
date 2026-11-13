@@ -11,8 +11,9 @@
 // INSIDE the main guest program (the eboot), not only its library imports.
 //
 //   KYTY_GAME_HOOKS=<set>[,<set>...]   built-in hook sets to register ("trace": see
-//                                      gameHooksTrace.cpp); unset, "", "0" or "off" = nothing
-//                                      is registered, allocated or written.
+//                                      gameHooksTrace.cpp; "capture": gameHooksCapture.cpp);
+//                                      unset, "", "0" or "off" = nothing is registered,
+//                                      allocated or written.
 //
 // A hook is registered with the function's ELF virtual address (the guest address is
 // main_program->base_vaddr + elf_address) and the bytes expected there. At load time (after
@@ -87,6 +88,11 @@ struct HookSpec {
 	std::vector<uint8_t> expected; // original bytes at elf_address (at least the patch size)
 	void*                replace_fn  = nullptr; // Replace: KYTY_SYSV_ABI fn, guest signature
 	ObserverFn           observer_fn = nullptr; // Before/After
+	// After only (optional): also called at the function entry with the argument registers,
+	// before the return address is diverted (an "around" observer: entry_fn, then observer_fn
+	// at the return). Its changes to the argument registers are passed on; skip_original is
+	// ignored.
+	ObserverFn           entry_fn    = nullptr;
 	void*                user        = nullptr; // GuestCallContext::User()
 };
 
