@@ -257,6 +257,22 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+	// Astro Bot PC (KYTY_HOST_IMPORT, step B0): the backing offset of [vaddr, vaddr + size) when
+	// one mapping holds the whole range (under the mapping lock; the offset stays valid as long
+	// as that mapping does).
+	bool TryGuestToBacking(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		if (offset == nullptr || !IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		MapReadLock lock(m_mutex);
+		MapEntry    entry {};
+		if (!FindContainingUnlocked(vaddr, size, &entry)) {
+			return false;
+		}
+		*offset = entry.backing_offset + (vaddr - entry.vaddr);
+		return true;
+	}
+
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
@@ -1238,6 +1254,9 @@ public:
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
+	bool TryGuestToBacking(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		return m_backing != nullptr && m_backing->TryGuestToBacking(vaddr, size, offset);
+	}
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);

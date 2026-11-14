@@ -2202,6 +2202,7 @@ void WindowContext::CreateVulkan() {
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	// Astro Bot PC (KYTY_HOST_IMPORT_PROBE, diagnostic, step S0): guest memory import probes.
 	HostImportProbe::Start(graphic_ctx);
+	HostImport::Start(graphic_ctx);
 	// KYTY_SPEC_UNMAPPED_NULL (default on): a V# the renderer binds as empty specializes as null.
 	if (const auto* env = std::getenv("KYTY_SPEC_UNMAPPED_NULL"); env == nullptr || std::strcmp(env, "0") != 0) {
 		ShaderRecompiler::IR::SetUnmappedBufferProbe([](uint64_t base, uint64_t size) {
@@ -2233,6 +2234,7 @@ void WindowContext::RecreateSurface() {
 }
 
 WindowContext::~WindowContext() {
+	HostImport::Stop();
 	HostImportProbe::Stop();
 	Vr::OpenXrShutdown();
 	ShutdownSystemOverlayInput();

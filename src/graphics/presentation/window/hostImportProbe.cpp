@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -335,9 +336,13 @@ bool Enabled() {
 	return enabled;
 }
 
+bool ExtensionEnabled() {
+	return GetState().extension;
+}
+
 void AppendDeviceExtension(std::vector<const char*>&                 device_extensions,
                            const std::vector<vk::ExtensionProperties>& available) {
-	if (!Enabled()) {
+	if (!Enabled() && !HostImport::Enabled()) {
 		return;
 	}
 	bool found = false;
@@ -439,3 +444,325 @@ void Stop() {
 }
 
 } // namespace Libs::Graphics::HostImportProbe
+
+// Astro Bot PC: KYTY_HOST_IMPORT (hostImportProbe.h, step B0 of docs\PLAN-PARALLELE.md).
+namespace Libs::Graphics::HostImport {
+
+namespace {
+
+using HostImportProbe::Format;
+using HostImportProbe::GuardedAllocate;
+using HostImportProbe::GuardedHostPointerProperties;
+using HostImportProbe::MicrosSince;
+
+constexpr uint32_t ChunkBits = 26; // 64 MiB of the backing per import
+constexpr uint64_t ChunkSize = uint64_t {1} << ChunkBits;
+
+enum : uint8_t { ChunkNone = 0, ChunkRequested = 1, ChunkReady = 2, ChunkFailed = 3 };
+
+struct Chunk {
+	std::atomic<uint64_t> address {0};
+	std::atomic<uint8_t>  state {ChunkNone};
+	VkBuffer              buffer = VK_NULL_HANDLE;
+	VkDeviceMemory        memory = VK_NULL_HANDLE;
+};
+
+struct Manager {
+	VkDevice                          device = VK_NULL_HANDLE;
+	VkPhysicalDeviceMemoryProperties  memory {};
+	uint64_t                          alignment    = 0x1000;
+	uint64_t                          backing      = 0;
+	uint64_t                          backing_size = 0;
+	uint32_t                          chunk_count  = 0;
+	std::unique_ptr<Chunk[]>          chunks;
+	std::atomic<bool>                 ready {false};
+	std::mutex                        mutex;
+	std::condition_variable           wake;
+	std::vector<uint32_t>             queue;
+	bool                              stop = false;
+	std::thread                       worker;
+	std::atomic<uint64_t>             lookups {0};
+	std::atomic<uint64_t>             hits {0};
+	std::atomic<uint64_t>             unmapped {0};
+	std::atomic<uint64_t>             cross {0};
+	std::atomic<uint64_t>             pending {0};
+	std::atomic<uint64_t>             failed_lookups {0};
+	uint64_t                          imported  = 0; // worker only
+	uint64_t                          failures  = 0; // worker only
+	double                            import_us = 0; // worker only
+};
+
+Manager& GetManager() {
+	static Manager manager;
+	return manager;
+}
+
+int64_t Mode() {
+	static const int64_t mode = [] {
+		const auto* value = std::getenv("KYTY_HOST_IMPORT");
+		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) return int64_t {0};
+		return std::strcmp(value, "census") == 0 ? int64_t {2} : int64_t {1};
+	}();
+	return mode;
+}
+
+void Log(const std::string& text) {
+	std::printf("HostImport: %s\n", text.c_str());
+	std::fflush(stdout);
+}
+
+uint32_t FindMemoryType(const Manager& m, uint32_t bits) {
+	for (uint32_t pass = 0; pass < 2; pass++) {
+		for (uint32_t i = 0; i < m.memory.memoryTypeCount; i++) {
+			const auto flags    = m.memory.memoryTypes[i].propertyFlags;
+			const auto wanted   = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+			const bool coherent = (flags & wanted) == wanted;
+			if ((bits & (1u << i)) != 0 && (pass == 1 || coherent)) return i;
+		}
+	}
+	return UINT32_MAX;
+}
+
+// Worker: imports one 64 MiB chunk of the backing alias view (the backing outlives every guest
+// view of it, so a guest unmap never frees imported pages).
+bool ImportChunk(Manager& m, uint32_t index, std::string& error) {
+	const auto& d     = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto  start = static_cast<uint64_t>(index) << ChunkBits;
+	const auto  size  = std::min(ChunkSize, m.backing_size - start) & ~(m.alignment - 1);
+	if (size == 0) {
+		error = "empty chunk";
+		return false;
+	}
+	auto* pointer = reinterpret_cast<void*>(m.backing + start);
+	VkMemoryHostPointerPropertiesEXT props {};
+	props.sType  = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+	bool faulted = false;
+	if (GuardedHostPointerProperties(m.device, pointer, &props, &faulted) != VK_SUCCESS || faulted) {
+		error = faulted ? "host pointer fault" : "host pointer properties";
+		return false;
+	}
+	VkExternalMemoryBufferCreateInfo external {};
+	external.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+	external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	VkBufferCreateInfo buffer_info {};
+	buffer_info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	buffer_info.pNext       = &external;
+	buffer_info.size        = size;
+	buffer_info.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+	                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+	                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+	buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VkBuffer buffer         = VK_NULL_HANDLE;
+	if (d.vkCreateBuffer(m.device, &buffer_info, nullptr, &buffer) != VK_SUCCESS) {
+		error = "vkCreateBuffer";
+		return false;
+	}
+	VkMemoryRequirements reqs {};
+	d.vkGetBufferMemoryRequirements(m.device, buffer, &reqs);
+	const auto type = FindMemoryType(m, props.memoryTypeBits & reqs.memoryTypeBits);
+	if (type == UINT32_MAX || reqs.size > size) {
+		d.vkDestroyBuffer(m.device, buffer, nullptr);
+		error = "no memory type";
+		return false;
+	}
+	VkMemoryAllocateFlagsInfo flags_info {};
+	flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+	flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+	VkImportMemoryHostPointerInfoEXT import_info {};
+	import_info.sType        = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+	import_info.pNext        = &flags_info;
+	import_info.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	import_info.pHostPointer = pointer;
+	VkMemoryAllocateInfo allocate {};
+	allocate.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocate.pNext           = &import_info;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = type;
+	VkDeviceMemory memory    = VK_NULL_HANDLE;
+	if (GuardedAllocate(m.device, &allocate, &memory, &faulted) != VK_SUCCESS || faulted ||
+	    memory == VK_NULL_HANDLE) {
+		d.vkDestroyBuffer(m.device, buffer, nullptr);
+		error = faulted ? "allocate fault" : "vkAllocateMemory(import)";
+		return false;
+	}
+	if (d.vkBindBufferMemory(m.device, buffer, memory, 0) != VK_SUCCESS) {
+		d.vkDestroyBuffer(m.device, buffer, nullptr);
+		d.vkFreeMemory(m.device, memory, nullptr);
+		error = "vkBindBufferMemory";
+		return false;
+	}
+	VkBufferDeviceAddressInfo address_info {};
+	address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+	address_info.buffer = buffer;
+	const auto get_address = d.vkGetBufferDeviceAddress != nullptr ? d.vkGetBufferDeviceAddress
+	                                                               : d.vkGetBufferDeviceAddressKHR;
+	const auto address     = static_cast<uint64_t>(get_address(m.device, &address_info));
+	auto&      chunk       = m.chunks[index];
+	chunk.buffer           = buffer;
+	chunk.memory           = memory;
+	chunk.address.store(address, std::memory_order_release);
+	return address != 0;
+}
+
+void Report(Manager& m) {
+	const auto lookups = m.lookups.exchange(0, std::memory_order_relaxed);
+	const auto hits    = m.hits.exchange(0, std::memory_order_relaxed);
+	if (lookups == 0 && m.imported == 0) return;
+	char text[512];
+	std::snprintf(text, sizeof(text),
+	              "10s: lookups %" PRIu64 " served %" PRIu64 " (%.1f%%), not one guest view %" PRIu64
+	              ", across chunks %" PRIu64 ", chunk pending %" PRIu64 ", chunk failed %" PRIu64
+	              " | chunks imported %" PRIu64 " (%" PRIu64 " MiB of %" PRIu64 " MiB), failures %" PRIu64
+	              ", import %.1f ms",
+	              lookups, hits, lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0,
+	              m.unmapped.exchange(0, std::memory_order_relaxed), m.cross.exchange(0, std::memory_order_relaxed),
+	              m.pending.exchange(0, std::memory_order_relaxed),
+	              m.failed_lookups.exchange(0, std::memory_order_relaxed), m.imported,
+	              (m.imported * ChunkSize) >> 20u, m.backing_size >> 20u, m.failures, m.import_us * 1e-3);
+	Log(text);
+}
+
+void WorkerLoop() {
+	auto& m           = GetManager();
+	auto  last_report = std::chrono::steady_clock::now();
+	for (;;) {
+		std::vector<uint32_t> batch;
+		{
+			std::unique_lock lock(m.mutex);
+			m.wake.wait_for(lock, std::chrono::seconds(1), [&] { return m.stop || !m.queue.empty(); });
+			if (m.stop) return;
+			batch.swap(m.queue);
+		}
+		for (const auto index: batch) {
+			auto&       chunk = m.chunks[index];
+			std::string error;
+			const auto  t0 = std::chrono::steady_clock::now();
+			const bool  ok = ImportChunk(m, index, error);
+			m.import_us += MicrosSince(t0);
+			if (ok) {
+				m.imported++;
+				chunk.state.store(ChunkReady, std::memory_order_release);
+			} else {
+				m.failures++;
+				chunk.state.store(ChunkFailed, std::memory_order_release);
+				if (m.failures <= 8) {
+					Log(Format("chunk %u (backing 0x%" PRIx64 ") not imported: %s", index,
+					           static_cast<uint64_t>(index) << ChunkBits, error.c_str()));
+				}
+			}
+		}
+		if (std::chrono::steady_clock::now() - last_report >= std::chrono::seconds(10)) {
+			last_report = std::chrono::steady_clock::now();
+			Report(m);
+		}
+	}
+}
+
+} // namespace
+
+bool Enabled() {
+	return Mode() != 0;
+}
+
+bool CensusEnabled() {
+	return Mode() == 2;
+}
+
+uint64_t Lookup(uint64_t vaddr, uint64_t size) {
+	auto& m = GetManager();
+	if (!m.ready.load(std::memory_order_acquire) || size == 0) return 0;
+	m.lookups.fetch_add(1, std::memory_order_relaxed);
+	uint64_t offset = 0;
+	if (!LibKernel::Memory::GuestToBacking(vaddr, size, &offset) || offset >= m.backing_size ||
+	    m.backing_size - offset < size) {
+		m.unmapped.fetch_add(1, std::memory_order_relaxed);
+		return 0;
+	}
+	const auto index = static_cast<uint32_t>(offset >> ChunkBits);
+	if (((offset + size - 1) >> ChunkBits) != index) {
+		m.cross.fetch_add(1, std::memory_order_relaxed);
+		return 0;
+	}
+	auto&      chunk = m.chunks[index];
+	const auto state = chunk.state.load(std::memory_order_acquire);
+	if (state == ChunkReady) {
+		m.hits.fetch_add(1, std::memory_order_relaxed);
+		return chunk.address.load(std::memory_order_relaxed) + (offset & (ChunkSize - 1));
+	}
+	if (state == ChunkFailed) {
+		m.failed_lookups.fetch_add(1, std::memory_order_relaxed);
+		return 0;
+	}
+	m.pending.fetch_add(1, std::memory_order_relaxed);
+	uint8_t expected = ChunkNone;
+	if (chunk.state.compare_exchange_strong(expected, ChunkRequested, std::memory_order_acq_rel)) {
+		{
+			std::lock_guard lock(m.mutex);
+			m.queue.push_back(index);
+		}
+		m.wake.notify_one();
+	}
+	return 0;
+}
+
+void Start(GraphicContext& ctx) {
+	if (!Enabled()) return;
+	auto& m = GetManager();
+	if (!HostImportProbe::ExtensionEnabled()) {
+		Log("VK_EXT_external_memory_host not available: off");
+		return;
+	}
+	if (!LibKernel::Memory::DiagGuestBacking(&m.backing, &m.backing_size)) {
+		Log("guest backing section not available: off");
+		return;
+	}
+	m.device       = static_cast<VkDevice>(ctx.device);
+	const auto& d  = VULKAN_HPP_DEFAULT_DISPATCHER;
+	auto physical  = static_cast<VkPhysicalDevice>(ctx.physical_device);
+	if (d.vkGetPhysicalDeviceProperties2 != nullptr) {
+		VkPhysicalDeviceExternalMemoryHostPropertiesEXT host {};
+		host.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+		VkPhysicalDeviceProperties2 props {};
+		props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+		props.pNext = &host;
+		d.vkGetPhysicalDeviceProperties2(physical, &props);
+		if (host.minImportedHostPointerAlignment != 0) m.alignment = host.minImportedHostPointerAlignment;
+	}
+	d.vkGetPhysicalDeviceMemoryProperties(physical, &m.memory);
+	if ((m.alignment & (m.alignment - 1)) != 0 || (m.backing & (m.alignment - 1)) != 0 ||
+	    m.alignment > ChunkSize) {
+		Log("alignment unusable: off");
+		return;
+	}
+	m.chunk_count = static_cast<uint32_t>((m.backing_size + ChunkSize - 1) >> ChunkBits);
+	m.chunks      = std::make_unique<Chunk[]>(m.chunk_count);
+	m.stop        = false;
+	m.worker      = std::thread(WorkerLoop);
+	m.ready.store(true, std::memory_order_release);
+	Log(Format("on (%s): backing 0x%016" PRIx64 " size 0x%" PRIx64 ", %u chunks of 64 MiB imported on demand",
+	           CensusEnabled() ? "census of the buffer read bindings" : "no consumer yet", m.backing,
+	           m.backing_size, m.chunk_count));
+}
+
+void Stop() {
+	auto& m = GetManager();
+	if (!m.worker.joinable()) return;
+	m.ready.store(false, std::memory_order_release);
+	{
+		std::lock_guard lock(m.mutex);
+		m.stop = true;
+	}
+	m.wake.notify_all();
+	m.worker.join();
+	Report(m);
+	const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+	for (uint32_t i = 0; i < m.chunk_count; i++) {
+		auto& chunk = m.chunks[i];
+		if (chunk.buffer != VK_NULL_HANDLE) d.vkDestroyBuffer(m.device, chunk.buffer, nullptr);
+		if (chunk.memory != VK_NULL_HANDLE) d.vkFreeMemory(m.device, chunk.memory, nullptr);
+		chunk.buffer = VK_NULL_HANDLE;
+		chunk.memory = VK_NULL_HANDLE;
+	}
+}
+
+} // namespace Libs::Graphics::HostImport

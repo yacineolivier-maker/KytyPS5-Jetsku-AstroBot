@@ -13,6 +13,7 @@
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
+#include "graphics/presentation/window/hostImportProbe.h"
 #include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -3947,6 +3948,9 @@ void PrintBindingMemoStats() {
 // KYTY_CP_COMMIT_STATS=steps: the memo lookup's time by outcome (diagnostic only).
 std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint64_t size,
                                                             BufferId id) {
+	if (HostImport::CensusEnabled()) [[unlikely]] {
+		(void)HostImport::Lookup(vaddr, size); // KYTY_HOST_IMPORT=census
+	}
 	if (!CommitStats::StepsEnabled()) [[likely]] {
 		return ObtainReadBindingMemo(vaddr, size, id);
 	}

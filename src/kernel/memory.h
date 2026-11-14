@@ -190,6 +190,9 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 [[nodiscard]] bool DiagQueryVirtualRange(uint64_t vaddr, VirtualQueryInfo* info);
 // The writable alias view of the whole direct/flexible backing section, and its size.
 [[nodiscard]] bool DiagGuestBacking(uint64_t* base, uint64_t* size);
+// Astro Bot PC (KYTY_HOST_IMPORT): the backing offset of [vaddr, vaddr + size) when one guest view
+// of the shared backing holds it whole (any thread; takes the mapping lock shared).
+[[nodiscard]] bool GuestToBacking(uint64_t vaddr, uint64_t size, uint64_t* offset);
 // The largest direct (or flexible) range of at least min_size that is one guest view of the
 // shared backing.
 [[nodiscard]] bool DiagFindBackedRange(bool flexible, uint64_t min_size, VirtualQueryInfo* info);

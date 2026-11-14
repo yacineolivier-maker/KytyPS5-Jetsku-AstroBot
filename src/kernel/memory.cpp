@@ -1723,6 +1723,10 @@ bool DiagGuestBacking(uint64_t* base, uint64_t* size) {
 	return *base != 0 && *size != 0;
 }
 
+bool GuestToBacking(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+	return g_guest_address_space != nullptr && g_guest_address_space->TryGuestToBacking(vaddr, size, offset);
+}
+
 bool DiagFindBackedRange(bool flexible, uint64_t min_size, VirtualQueryInfo* info) {
 	if (info == nullptr || g_virtual_ranges == nullptr || g_guest_address_space == nullptr) {
 		return false;

@@ -31,7 +31,28 @@ void AppendDeviceExtension(std::vector<const char*>&                 device_exte
 void Start(GraphicContext& ctx);
 // Before the device is destroyed: stops and joins the (b) thread.
 void Stop();
+// VK_EXT_external_memory_host was enabled on the device (by the probe or by KYTY_HOST_IMPORT).
+[[nodiscard]] bool ExtensionEnabled();
 
 } // namespace Libs::Graphics::HostImportProbe
+
+// Astro Bot PC: KYTY_HOST_IMPORT (default off; step B0 of the "buffers by address" track,
+// docs\PLAN-PARALLELE.md). The guest's direct/flexible backing section is imported as Vulkan
+// memory (VK_EXT_external_memory_host, host-coherent system memory), 64 MiB of its alias view at
+// a time, on demand, by a background thread: a chunk stays imported until shutdown (the backing
+// outlives every guest view of it). Lookup gives the device address of a guest range held whole
+// by one guest view of the backing and one imported chunk (0 otherwise, and the chunk is then
+// requested). 1: on, no consumer; census: ObtainReadBinding looks every buffer read binding up
+// (diagnostic). One "HostImport 10s: ..." line every 10 s.
+namespace Libs::Graphics::HostImport {
+
+[[nodiscard]] bool Enabled();
+[[nodiscard]] bool CensusEnabled();
+// Any thread. 0: not available now.
+[[nodiscard]] uint64_t Lookup(uint64_t vaddr, uint64_t size);
+void Start(GraphicContext& ctx);
+void Stop();
+
+} // namespace Libs::Graphics::HostImport
 
 #endif /* EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_HOSTIMPORTPROBE_H_ */
