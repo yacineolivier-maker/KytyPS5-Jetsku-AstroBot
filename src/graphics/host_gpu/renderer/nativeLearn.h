@@ -118,6 +118,30 @@
 //    fails (bytes not clean) falls back (kS1Read): the walk would have followed both edges where the
 //    normal path's read may succeed.
 
+// S1d (full census, user-data layout, buffer writes, eligibility cache):
+//  - User-data layout. snapshot.user_data is ShaderParams::user_data[0, user_data_count): the
+//    stage's user SGPRs copied at an offset (GetShaderParams' user_data_base argument, shader.cpp
+//    PrepareProgram): 8 for a merged / NGG vertex program (logical stage Mesh), whose dwords 0..1
+//    are the GS user-data address when the program has a GS back half (kGsFront), else 0; 0 for a
+//    legacy vertex program and for the pixel stage. The plan's user_data_base (8 for the legacy
+//    vertex stage, 0 for Mesh and pixel) is the SGPR number of user_data[0], not a prefix length:
+//    S1b/S1c took it for one, which made every legacy vertex program "prefix" (its first SGPRs are
+//    not zero) and evaluated the recipes 8 dwords off. The entry now learns the prefix length as
+//    user_data size minus the bound SGPR count (DrawView::user_sgpr_count), checks its content
+//    (zero with a nonzero GS address bound, or the GS address then zeros; ambiguous otherwise), and
+//    the prediction rebuilds prefix + bound SGPRs and evaluates the recipes on the whole user data
+//    (recipe indices are user_data indices: SGPR - user_data_base).
+//  - Census: every uncovered property of an entry is a bit of s1_mask (GC::S1ShapeBit), reported
+//    per slot with the draws whose entry is fully covered (the predicted emitted share before the
+//    dynamic checks).
+//  - Buffer writes (V# written / atomic) are covered: the emission binds them through the
+//    emulator's binding functions (ObtainBuffer / ObtainWrittenBuffer with the precise write ranges
+//    from the rebuilt snapshot) and records the normal path's post-draw ShaderWriteBarrier
+//    (HasShaderBufferWrites per stage; KYTY_DRAW_WRITE_SINK off: EndRendering first). Image writes,
+//    atomics, address writes and GDS stay uncovered (kShWrites / kShBinding).
+//  - Eligibility cache: a direct-mapped table keyed by the selection signature (NativeRegsHash,
+//    which includes the stage program addresses) and the formats remembers a base entry that is not
+//    covered: such a draw returns before the record lookup.
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -205,7 +229,8 @@ struct Entry {
 		const ShaderRecompiler::IR::ResourcePlan* plan = nullptr;
 		uint32_t ud_count    = 0; // snapshot.user_data size (user SGPR base + count)
 		uint32_t ud_base     = 0; // the plan's user SGPR base
-		uint32_t prefix_mode = 0; // 0: prefix dwords 0; 1: dwords 0..1 the GS user-data address; 2: other
+		uint32_t prefix_mode = 0; // 0: prefix dwords 0; 1: dwords 0..1 the GS user-data address; 2: other / ambiguous
+		uint32_t ud_prefix   = 0; // S1d: user_data dwords before the bound user SGPRs (0 or 8)
 		uint32_t flat_size   = 0; // flattened SRT dwords
 	};
 	std::array<S1Stage, 2> s1 {};
@@ -214,6 +239,8 @@ struct Entry {
 	bool     s1_covered     = false;
 	uint32_t s1_shape       = 0; // first uncovered property (Loader::GameCapture::NativeS1Shape)
 	uint32_t s1_shape_stage = 0; // and its stage
+	uint64_t s1_mask        = 0; // S1d: every uncovered property (GC::S1ShapeBit), 0: covered
+	uint32_t write_kinds    = 0; // S1d: GC::NativeS1WriteKind bits of both stages
 };
 
 // S1: a native op's rebuilt stages (PredictS1), owned by the session.
@@ -285,7 +312,12 @@ struct DrawView {
 	bool                           plain_available   = false; // S1b: the pixel permutation has a plain variant
 	bool                           ps_mip_stats      = false; // S1b: the pixel bindings record mip statistics
 	const ShaderVertexInputInfo*   vertex_info       = nullptr; // S1c: the draw's vertex input info
+	std::array<uint32_t, 2>        user_sgpr_count {};          // S1d: the bound user SGPR count per stage
+	std::array<bool, 2>            buffer_writes {};            // S1d: HasShaderBufferWrites per stage (verify)
 };
+
+// S1d: KYTY_NATIVE_S1_WRITES (default 1): buffer-writing programs are emitted natively.
+[[nodiscard]] bool S1WritesEnabled();
 
 class Session {
 public:
@@ -321,6 +353,11 @@ public:
 	// S1b: the last kS1Shape's first uncovered property and stage.
 	[[nodiscard]] uint32_t S1ShapeCode() const { return m_s1_shape; }
 	[[nodiscard]] uint32_t S1ShapeStage() const { return m_s1_shape_stage; }
+	// S1d: the census of the last PredictS1 (census: a learned base entry was found; mask: every
+	// uncovered property met, 0 when covered) and the entry's write kinds.
+	[[nodiscard]] bool     S1Census() const { return m_s1_census; }
+	[[nodiscard]] uint64_t S1Mask() const { return m_s1_mask; }
+	[[nodiscard]] uint32_t S1WriteKinds() const { return m_s1_write_kinds; }
 	// S1 verify: the prediction is compared by the op's own draw on the normal path (Begin).
 	void ArmS1Check() {
 		m_s1_armed    = true;
@@ -358,6 +395,17 @@ private:
 	uint32_t     m_s1_samples  = 0;
 	uint32_t     m_s1_shape       = 0;
 	uint32_t     m_s1_shape_stage = 0;
+	bool         m_s1_census      = false;
+	uint64_t     m_s1_mask        = 0;
+	uint32_t     m_s1_write_kinds = 0;
+	// S1d: eligibility cache (see the header): tag = Mix(regs_hash, formats_hash).
+	struct S1Ineligible {
+		uint64_t tag   = 0;
+		uint64_t mask  = 0;
+		uint32_t shape = 0, stage = 0, write_kinds = 0, hits = 0;
+	};
+	static constexpr uint32_t kS1CacheSize = 2048; // power of two
+	std::unique_ptr<std::array<S1Ineligible, kS1CacheSize>> m_s1_cache;
 	std::vector<uint8_t> m_s1_active; // S1c: active descriptor sources of the stage being predicted
 	// Verify sample: what the native path would push (expected) and what the commit pushed.
 	std::array<uint32_t, 32> m_push_expected {};

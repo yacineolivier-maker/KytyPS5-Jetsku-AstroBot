@@ -444,7 +444,20 @@ enum NativeS1Shape : uint32_t {
 	kShPipeline,    // no pipeline object (or mesh flag differs)
 	kShLodVerify,   // pixel stage with KYTY_LOD_STATS_PLAIN_VARIANT=verify (canary)
 	kShImageClass,  // pixel/vertex image not covered (storage, indirect image table)
+	// S1d: V# buffer writes / atomics (covered: the emulator's binding functions and post-draw
+	// ShaderWriteBarrier; uncovered only with KYTY_NATIVE_S1_WRITES=0). kShWrites now means image
+	// writes / atomics or address writes.
+	kShBufWrites,
 	kShCount
+};
+// S1d (full census): a learned entry's uncovered properties as a bitmask, bit = NativeS1Shape code,
+// bits 0..31 the vertex/mesh stage, 32..63 the pixel stage.
+constexpr uint64_t S1ShapeBit(uint32_t shape, uint32_t stage) {
+	return uint64_t {1} << ((shape & 31u) + (stage != 0 ? 32u : 0u));
+}
+// S1d: the static write kinds of a learned entry (diagnostic: what the programs write).
+enum NativeS1WriteKind : uint32_t {
+	kWkBufWrite, kWkBufAtomic, kWkImgWrite, kWkImgAtomic, kWkAddress, kWkGds, kWkPixel, kWkCount
 };
 struct NativeS1Draw {
 	uint32_t reason      = kS1Emitted;
@@ -454,12 +467,21 @@ struct NativeS1Draw {
 	// S1c (kS1Regs with KYTY_NATIVE_S1_REGS_DIAG=1): the register groups that differ from the
 	// segment's last normal draw, bit = NativeS1RegPart.
 	uint32_t regs_parts  = 0;
+	// S1d: the full census (census: the op's learned entry was found; shape_mask: every uncovered
+	// property, 0 when covered) and the entry's write kinds (bit = NativeS1WriteKind).
+	bool     census      = false;
+	uint64_t shape_mask  = 0;
+	uint32_t write_kinds = 0;
+	bool     relaxed     = false; // S1d: registers differed in accepted groups only (KYTY_NATIVE_S1_REGS_RELAX)
 };
 // S1c: register groups of a kS1Regs fallback (HW::Context::VisitKeyDiagParts groups, then the user
 // clip planes, the user-config registers and context bytes outside every group).
 enum NativeS1RegPart : uint32_t {
 	kRpTargets, kRpClear, kRpDepth, kRpBlend, kRpBlendColor, kRpDepthState, kRpStencil, kRpClearValues, kRpViewport,
-	kRpRaster, kRpShRegs, kRpUserClip, kRpUserConfig, kRpOther, kRpCount
+	kRpRaster, kRpShRegs, kRpUserClip, kRpUserConfig, kRpOther,
+	// S1d: the members of the raster group and the export part of the shader registers.
+	kRpRasterLine, kRpRasterReset, kRpRasterScan, kRpRasterAaSample, kRpRasterAaConfig, kRpRasterMode, kRpRasterPoly,
+	kRpRasterEqaa, kRpShStages, kRpShExport, kRpShOther, kRpCount
 };
 // Executor: one native op's S1 outcome (emitted, or why not).
 void NoteNativeS1(uint32_t op_flags, const NativeS1Draw& draw);

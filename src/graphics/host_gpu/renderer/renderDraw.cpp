@@ -4122,6 +4122,14 @@ void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineC
 	view.vertex_buffers    = static_cast<uint32_t>(std::max(state.vertex_info[0].buffers_num, 0));
 	view.user_clip_planes  = state.vertex_info[0].user_clip_planes;
 	view.vertex_info       = &state.vertex_info[0];
+	// S1d: the bound user SGPR counts (the user-data prefix is the rest of the snapshot's user data)
+	// and the stages' buffer writes (verify of the native post-draw barrier).
+	view.user_sgpr_count[0] = vs_regs.gs_regs.rsrc2.user_sgpr;
+	view.buffer_writes[0]   = HasShaderBufferWrites(state.vertex_info[0].stage);
+	if (state.ps_active) {
+		view.user_sgpr_count[1] = buffer.GetShaders().GetPs().ps_regs.rsrc2.user_sgpr;
+		view.buffer_writes[1]   = HasShaderBufferWrites(state.ps_input_info.stage);
+	}
 	// S1 verify: the native prediction of this normal-path native draw (a segment head, or a draw
 	// that fell back), compared by Begin with what the normal path prepared.
 	if (Loader::GameCapture::NativeS1() && Loader::GameCapture::NativeVerifyEnabled() && !m_native_s0->S1Armed() &&
@@ -4205,6 +4213,7 @@ struct RenderExecutor::NativeS1State {
 		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX> color_ids {}; // S1b: attachments (feedback check)
 		bool              has_clear      = false;
 		bool              viewport_index = false;
+		uint64_t          relaxed_key    = 0; // S1d: NativeS1RelaxedKey of the segment's registers (0: not computed)
 	};
 	Segment               seg;
 	PreparedBindings      bindings;
@@ -4250,6 +4259,126 @@ static uint32_t NativeS1RegParts(const HW::Context& a, const HW::UserConfig& ua,
 	return parts;
 }
 
+// S1d: KYTY_NATIVE_S1_REGS_RELAX (default 1). A continuation whose registers differ from the
+// segment's last draw only in
+//  - the shader registers (m_sh_regs) and VGT_SHADER_STAGES_EN, but the target output modes and
+//    CB_SHADER_MASK (the export mapping, DrawColorOutputFilter): every one of them is part of the
+//    selection signature (NativeContextSelectionHash), recomputed for the draw, so the NativeKey,
+//    i.e. the program permutations and the pipeline, follows them;
+//  - the line width, the primitive reset index (ResolvePrimitiveRestart reads the draw's), the
+//    mode control (cull mode, front face, polygon offset enables: dynamic state; the rest is in the
+//    selection signature) and the polygon offset (dynamic depth bias), and the blend colour
+//    (dynamic blend constants): SetGraphicsDynamicParams records them from the draw's registers,
+//    the dynamic state is then always set (its shadow skips equal values),
+// is emitted natively. Every other register (targets, depth / stencil state: RenderDepthInfo and
+// the rendering state; viewports and scan mode: the written rectangle; AA / EQAA; user config;
+// user clip planes) must still equal the segment's.
+static bool NativeS1RegsRelax() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_REGS_RELAX");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// S1d: the context byte ranges NativeS1RelaxedKey leaves out, found once through
+// VisitKeyDiagParts (raster members by their order: line width, reset index, scan mode, AA sample,
+// AA config, mode control, polygon offset, EQAA; shader group: stages, shader registers); each
+// size is checked against its type (a mismatch disables the relaxation).
+struct NativeS1Excluded {
+	bool                                       valid = false;
+	std::vector<std::pair<size_t, size_t>>     ranges; // sorted [offset, offset + size)
+	std::array<std::pair<size_t, size_t>, 8>   raster {}; // S1d diag: the raster members
+	size_t                                     sh_offset = 0;
+};
+static const NativeS1Excluded& NativeS1ExcludedRanges() {
+	static const NativeS1Excluded excluded = [] {
+		NativeS1Excluded e;
+		const auto       context = std::make_unique<HW::Context>();
+		const auto       base    = reinterpret_cast<const char*>(context.get());
+		uint32_t         raster = 0, sh = 0;
+		bool             ok     = true;
+		enum : uint32_t { BlendColor = 4, Raster = 9, ShRegs = 10 };
+		context->VisitKeyDiagParts([&](uint32_t group, const void* data, size_t size) {
+			const size_t offset = static_cast<const char*>(data) - base;
+			if (group == BlendColor) {
+				ok = ok && size == sizeof(HW::BlendColor);
+				e.ranges.emplace_back(offset, offset + size);
+			} else if (group == Raster) {
+				if (raster < e.raster.size()) e.raster[raster] = {offset, size};
+				static constexpr size_t sizes[8] = {sizeof(float), sizeof(uint32_t), sizeof(HW::ScanModeControl), sizeof(HW::AaSampleControl),
+				                                    sizeof(HW::AaConfig), sizeof(HW::ModeControl), sizeof(HW::PolyOffset), sizeof(HW::EqaaControl)};
+				ok = ok && raster < 8 && size == sizes[raster];
+				if (raster == 0 || raster == 1 || raster == 5 || raster == 6) e.ranges.emplace_back(offset, offset + size);
+				raster++;
+			} else if (group == ShRegs) {
+				ok = ok && sh < 2 && size == (sh == 0 ? sizeof(uint32_t) : sizeof(HW::ShaderRegisters));
+				if (sh == 1) e.sh_offset = offset;
+				e.ranges.emplace_back(offset, offset + size);
+				sh++;
+			}
+		});
+		ok = ok && raster == 8 && sh == 2;
+		std::sort(e.ranges.begin(), e.ranges.end());
+		for (size_t i = 1; ok && i < e.ranges.size(); i++) ok = e.ranges[i - 1].second <= e.ranges[i].first;
+		e.valid = ok;
+		return e;
+	}();
+	return excluded;
+}
+
+// S1d: the targets key (NativeTargetsKey) without the relaxed registers, with the export part of
+// the shader registers (target output modes, CB_SHADER_MASK) kept. 0: relaxation unavailable.
+static uint64_t NativeS1RelaxedKey(const HW::Context& context, const HW::UserConfig& user_config) {
+	const auto& ex = NativeS1ExcludedRanges();
+	if (!ex.valid) return 0;
+	const auto base = reinterpret_cast<const char*>(&context);
+	uint64_t   hash = 0x9e3779b97f4a7c15ull;
+	size_t     at   = 0;
+	for (const auto& [begin, end]: ex.ranges) {
+		if (begin > at) hash = XXH3_64bits_withSeed(base + at, begin - at, hash);
+		at = end;
+	}
+	if (sizeof(context) > at) hash = XXH3_64bits_withSeed(base + at, sizeof(context) - at, hash);
+	const auto& sh = context.GetShaderRegisters();
+	hash           = XXH3_64bits_withSeed(sh.target_output_mode, sizeof(sh.target_output_mode), hash);
+	hash           = XXH3_64bits_withSeed(&sh.m_cbShaderMask, sizeof(sh.m_cbShaderMask), hash);
+	auto config    = user_config;
+	config.SetIndexOffset(0);
+	config.SetObjectId(0);
+	hash = XXH3_64bits_withSeed(&config, sizeof(config), hash);
+	return hash != 0 ? hash : 1;
+}
+
+// S1d: the finer register parts of a "regs" fallback (KYTY_NATIVE_S1_REGS_DIAG=1): which raster
+// member, and whether the shader stages, the export part or the rest of the shader registers differ.
+static uint32_t NativeS1RegSubParts(const HW::Context& a, const HW::Context& b) {
+	namespace GC   = Loader::GameCapture;
+	const auto& ex = NativeS1ExcludedRanges();
+	if (!ex.valid) return 0;
+	const auto x     = reinterpret_cast<const char*>(&a);
+	const auto y     = reinterpret_cast<const char*>(&b);
+	uint32_t   parts = 0;
+	for (uint32_t i = 0; i < 8; i++) {
+		const auto [offset, size] = ex.raster[i];
+		if (std::memcmp(x + offset, y + offset, size) != 0) parts |= 1u << (GC::kRpRasterLine + i);
+	}
+	if (a.GetShaderStages() != b.GetShaderStages()) parts |= 1u << GC::kRpShStages;
+	const auto& sa = a.GetShaderRegisters();
+	const auto& sb = b.GetShaderRegisters();
+	if (std::memcmp(sa.target_output_mode, sb.target_output_mode, sizeof(sa.target_output_mode)) != 0 ||
+	    sa.m_cbShaderMask != sb.m_cbShaderMask) {
+		parts |= 1u << GC::kRpShExport;
+	}
+	auto ca = sa;
+	auto cb = sb;
+	std::memset(ca.target_output_mode, 0, sizeof(ca.target_output_mode));
+	std::memset(cb.target_output_mode, 0, sizeof(cb.target_output_mode));
+	ca.m_cbShaderMask = cb.m_cbShaderMask = 0;
+	if (std::memcmp(&ca, &cb, sizeof(ca)) != 0) parts |= 1u << GC::kRpShOther;
+	return parts;
+}
+
 void RenderExecutor::NativeS1BreakSegment() {
 	if (m_native_s1 != nullptr) {
 		m_native_s1->seg.valid   = false;
@@ -4285,6 +4414,7 @@ void RenderExecutor::NativeS1SegmentDraw(const CommandBuffer& buffer, const Draw
 	}
 	seg.targets_key  = m_run_targets_key != 0 ? m_run_targets_key : NativeTargetsKey(buffer.GetRegisters(), buffer.GetUserConfig());
 	seg.formats_hash = m_native_s0->ActiveFormats();
+	seg.relaxed_key  = NativeS1RegsRelax() ? NativeS1RelaxedKey(buffer.GetRegisters(), buffer.GetUserConfig()) : 0;
 	if (NativeS1RegsDiag()) [[unlikely]] {
 		if (m_native_s1->diag_context == nullptr) {
 			m_native_s1->diag_context = std::make_unique<HW::Context>();
@@ -4318,11 +4448,17 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	namespace GC  = Loader::GameCapture;
 	const auto op = m_native_s0_op;
 	GC::NativeS1Draw note;
+	bool             predicted = false; // S1d: PredictS1 ran (its census applies)
 	const auto out = [&](uint32_t reason) {
 		note.reason = reason;
 		if (reason == GC::kS1Shape && m_native_s0 != nullptr) {
 			note.shape       = m_native_s0->S1ShapeCode();
 			note.shape_stage = m_native_s0->S1ShapeStage();
+		}
+		if (predicted) {
+			note.census      = m_native_s0->S1Census();
+			note.shape_mask  = m_native_s0->S1Mask();
+			note.write_kinds = m_native_s0->S1WriteKinds();
 		}
 		GC::NoteNativeS1(op, note);
 		return false;
@@ -4373,11 +4509,18 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	note.pixel       = pixel;
 	if (pixel && !NativeS1PixelEnabled()) return out(GC::kS1Pixel);
 	const uint64_t targets_key = m_run_targets_key != 0 ? m_run_targets_key : NativeTargetsKey(buffer.GetRegisters(), ucfg);
+	// S1d: registers that differ in the relaxed groups only (NativeS1RegsRelax).
+	bool relaxed = false;
 	if (targets_key != seg.targets_key) {
-		if (NativeS1RegsDiag() && st.diag_context != nullptr) [[unlikely]] {
-			note.regs_parts = NativeS1RegParts(buffer.GetRegisters(), ucfg, *st.diag_context, *st.diag_config);
+		relaxed = seg.relaxed_key != 0 && NativeS1RelaxedKey(buffer.GetRegisters(), ucfg) == seg.relaxed_key;
+		if (!relaxed) {
+			if (NativeS1RegsDiag() && st.diag_context != nullptr) [[unlikely]] {
+				note.regs_parts = NativeS1RegParts(buffer.GetRegisters(), ucfg, *st.diag_context, *st.diag_config) |
+				                  NativeS1RegSubParts(buffer.GetRegisters(), *st.diag_context);
+			}
+			return out(GC::kS1Regs);
 		}
-		return out(GC::kS1Regs);
+		note.relaxed = true;
 	}
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) return out(GC::kS1Kind);
@@ -4386,8 +4529,10 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	NativeLearn::S1Inputs in;
 	in.op_flags          = op;
 	// S1b: the registers equal the segment's last normal draw's (targets key): its selection
-	// signature's context part and export mapping are this draw's.
-	in.regs_hash         = NativeRegsHash(buffer, seg.context_hash, pixel ? seg.export_hash : 0u);
+	// signature's context part and export mapping are this draw's. S1d: relaxed, the context part is
+	// recomputed from the draw's registers (the export mapping's registers are equal).
+	const uint64_t context_hash = relaxed ? NativeContextSelectionHash(buffer.GetRegisters(), ucfg) : seg.context_hash;
+	in.regs_hash         = NativeRegsHash(buffer, context_hash, pixel ? seg.export_hash : 0u);
 	in.formats_hash      = seg.formats_hash;
 	in.index_count       = args.index_count;
 	in.es_addr           = vs_regs.es_regs.data_addr;
@@ -4396,6 +4541,7 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	in.user_sgpr_max     = HW::UserSgprInfo::SGPRS_MAX;
 	in.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
 	NativeS1PixelInputs(buffer, pixel, in);
+	predicted = true;
 	if (const auto reason = m_native_s0->PredictS1(in); reason != GC::kS1Emitted) return out(reason);
 	const auto& pred  = m_native_s0->Prediction();
 	const auto& entry = *pred.entry;
@@ -4405,8 +4551,13 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	}
 	const bool mesh = entry.mesh_active;
 	if (mesh != (entry.vs->stage == ShaderType::Mesh) || entry.current == nullptr) {
-		note.shape = GC::kShPipeline;
-		GC::NoteNativeS1(op, {GC::kS1Shape, GC::kShPipeline, 0, pixel});
+		note.reason      = GC::kS1Shape;
+		note.shape       = GC::kShPipeline;
+		note.shape_stage = 0;
+		note.census      = true;
+		note.shape_mask  = GC::S1ShapeBit(GC::kShPipeline, 0);
+		note.write_kinds = m_native_s0->S1WriteKinds();
+		GC::NoteNativeS1(op, note);
 		return false;
 	}
 	// A pipeline replaced since the normal path last selected the key's (its old handle may be
@@ -4474,6 +4625,11 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		}
 		index_binding = PrepareIndexBuffer(buffer, index_source);
 	}
+	// S1d: the stages' buffer writes, as the normal path derives them (HasShaderBufferWrites on the
+	// stage's program and snapshot), for the post-draw ShaderWriteBarrier.
+	vk::PipelineStageFlags shader_write_stages = {};
+	if (HasShaderBufferWrites(st.runtime)) shader_write_stages |= ShaderPipelineStages(NativeShaderStage(entry.vs->stage));
+	if (pixel && HasShaderBufferWrites(st.ps_runtime)) shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	// Late check: the binding work may submit, end rendering, change images or retire buffers.
 	if (buffer.Identity() != seg.command || scheduler.CurrentTick() != seg.tick ||
 	    buffer.ActiveRenderingSerial() != seg.rendering_serial || ImageStateEpoch() != seg.image_epoch ||
@@ -4492,7 +4648,8 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		// of the vertex program's viewport-index output: kept when the shadow describes it.
 		const bool feedback_ok = !m_context.GetGraphics().attachment_feedback_loop_enabled ||
 		                         (m_dynamic_state.feedback_valid && !m_dynamic_state.feedback);
-		const bool dynamic_kept = DynamicStateShadowEnabled() && m_dynamic_state.valid &&
+		// S1d: relaxed registers: always recorded from the draw's registers (the shadow skips equal values).
+		const bool dynamic_kept = !relaxed && DynamicStateShadowEnabled() && m_dynamic_state.valid &&
 		                          m_dynamic_state.command == vk_buffer.Identity() && m_dynamic_state.pipeline != nullptr &&
 		                          buffer.BoundPipeline(vk::PipelineBindPoint::eGraphics) == m_dynamic_state.pipeline &&
 		                          feedback_ok && entry.viewport_index == seg.viewport_index;
@@ -4552,6 +4709,20 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		} else {
 			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 		}
+		// S1d: the normal path's post-draw write barrier (ExecutePreparedDraw): queued inside the
+		// rendering instance with KYTY_DRAW_WRITE_SINK, else after ending it.
+		if (shader_write_stages) {
+			if (DrawWriteSinkEnabled()) {
+				ShaderWriteBarrier(buffer, shader_write_stages);
+				m_indirect_barrier_rendering = 0;
+			} else {
+				{
+					KYTY_GPU_OP_SITE("draw.write_barrier");
+					scheduler.EndRendering();
+				}
+				ShaderWriteBarrier(buffer, shader_write_stages);
+			}
+		}
 	}
 	ResetBindings();
 	// The DrawRun records no longer describe the command buffer's descriptors and pipeline.
@@ -4567,10 +4738,20 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	seg.draw_counter     = m_native_draw_counter;
 	seg.viewport_index   = entry.viewport_index;
 	seg.valid            = seg.rendering_serial != 0;
+	if (relaxed) {
+		// S1d: the next continuation compares with this draw's registers (equal to the last
+		// normal draw's outside the relaxed groups).
+		seg.targets_key  = targets_key;
+		seg.context_hash = context_hash;
+	}
 	m_native_s0->NoteS1Emitted(op);
 	m_native_s0_op   = 0;
 	m_native_s1_done = true;
-	GC::NoteNativeS1(op, {GC::kS1Emitted});
+	note.reason      = GC::kS1Emitted;
+	note.census      = m_native_s0->S1Census();
+	note.shape_mask  = 0;
+	note.write_kinds = m_native_s0->S1WriteKinds();
+	GC::NoteNativeS1(op, note);
 	return true;
 }
 

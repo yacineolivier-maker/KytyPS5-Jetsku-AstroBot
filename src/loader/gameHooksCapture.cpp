@@ -631,7 +631,43 @@ constexpr const char* kS1ReasonNames[GameCapture::kS1Count] = {"emitted", "seg-s
 // S1b: kS1Shape broken down by first uncovered property, per stage (vertex/mesh, pixel).
 constexpr const char* kS1ShapeNames[GameCapture::kShCount] = {"covered", "tess",    "flow",     "deep",     "writes",   "binding",
                                                               "uniform", "fetch",   "clip",     "prefix",   "indirect", "flat",
-                                                              "ud-count", "variant", "pipeline", "lod-verify", "image-class"};
+                                                              "ud-count", "variant", "pipeline", "lod-verify", "image-class",
+                                                              "buf-writes"};
+// S1d (full census): per slot, the uncovered-property combinations of the entries the shape
+// fallbacks met (open addressing over the mask; lock-free inserts), and the census totals.
+struct S1Combo {
+	std::atomic<uint64_t> mask {0};
+	std::atomic<uint64_t> count {0};
+};
+constexpr uint32_t kS1Combos = 128;
+struct S1Census {
+	std::array<S1Combo, kS1Combos>                         combos {};
+	std::atomic<uint64_t>                                  overflow {0};
+	std::atomic<uint64_t>                                  draws {0}, covered {0}, relaxed {0}, relaxed_emitted {0};
+	std::array<std::atomic<uint64_t>, GameCapture::kWkCount> write_kinds {};
+	std::atomic<uint64_t>                                  write_draws {0}, write_emitted {0};
+};
+std::array<S1Census, kEngineThreads> g_s1_census {};
+struct S1CensusLast {
+	std::array<uint64_t, kS1Combos>                 combos {};
+	uint64_t                                        overflow = 0, draws = 0, covered = 0, relaxed = 0, relaxed_emitted = 0;
+	std::array<uint64_t, GameCapture::kWkCount>     write_kinds {};
+	uint64_t                                        write_draws = 0, write_emitted = 0;
+};
+std::array<S1CensusLast, kEngineThreads> g_s1_census_last {};
+constexpr const char* kS1WriteKindNames[GameCapture::kWkCount] = {"buf-write", "buf-atomic", "img-write", "img-atomic",
+                                                                  "address",   "gds",        "in-pixel-stage"};
+std::string S1MaskText(uint64_t mask) {
+	std::string text;
+	for (uint32_t st = 0; st < 2; st++) {
+		std::string part;
+		for (uint32_t k = 1; k < GameCapture::kShCount; k++) {
+			if ((mask & GameCapture::S1ShapeBit(k, st)) != 0) part += (part.empty() ? "" : "+") + std::string(kS1ShapeNames[k]);
+		}
+		if (!part.empty()) text += (text.empty() ? "" : " ") + std::string(st == 0 ? "vs:" : "ps:") + part;
+	}
+	return text.empty() ? "none" : text;
+}
 struct S1Resolve {
 	std::array<std::atomic<uint64_t>, GameCapture::kS1Count> reasons {};
 	std::atomic<uint64_t>                                    checked {0}, mismatched {0};
@@ -642,7 +678,11 @@ struct S1Resolve {
 std::array<S1Resolve, kEngineThreads> g_s1 {};
 constexpr const char* kS1RegPartNames[GameCapture::kRpCount] = {"targets", "clear", "depth", "blend", "blend-color",
                                                                "depth-state", "stencil", "clear-values", "viewport", "raster",
-                                                               "sh-regs", "user-clip", "user-config", "other"};
+                                                               "sh-regs", "user-clip", "user-config", "other",
+                                                               "raster.line-width", "raster.prim-reset", "raster.scan-mode",
+                                                               "raster.aa-sample", "raster.aa-config", "raster.mode-control",
+                                                               "raster.poly-offset", "raster.eqaa", "sh.stages", "sh.export",
+                                                               "sh.other"};
 struct S1ResolveLast {
 	std::array<uint64_t, GameCapture::kS1Count> reasons {};
 	uint64_t                                    checked = 0, mismatched = 0;
@@ -1739,6 +1779,40 @@ std::string S0SlotReport(uint32_t s) {
 			}
 			if (!parts.empty()) out += " | s1 regs parts:" + parts;
 		}
+		// S1d: the full census (every uncovered property of the learned entries met) and the write kinds.
+		{
+			auto&      c     = g_s1_census[s];
+			auto&      cl    = g_s1_census_last[s];
+			const auto draws = take(c.draws, cl.draws);
+			const auto cov   = take(c.covered, cl.covered);
+			std::vector<std::pair<uint64_t, uint64_t>> combos;
+			for (uint32_t i = 0; i < kS1Combos; i++) {
+				const auto mask = c.combos[i].mask.load(std::memory_order_acquire);
+				const auto d    = take(c.combos[i].count, cl.combos[i]);
+				if (mask != 0 && d != 0) combos.emplace_back(d, mask);
+			}
+			std::sort(combos.begin(), combos.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+			std::string top;
+			for (size_t i = 0; i < combos.size() && i < 8; i++) {
+				top += fmt::format("{} [{}] {}", i == 0 ? "" : ",", S1MaskText(combos[i].second), combos[i].first);
+			}
+			const auto over = take(c.overflow, cl.overflow);
+			if (over != 0) top += fmt::format(", [other combinations] {}", over);
+			out += fmt::format(" | s1 census: draws with a learned entry {} all covered {} ({:.1f}%) uncovered combinations:{}", draws, cov,
+			                   draws == 0 ? 0.0 : 100.0 * static_cast<double>(cov) / static_cast<double>(draws),
+			                   top.empty() ? " none" : top);
+			std::string kinds;
+			for (uint32_t k = 0; k < GameCapture::kWkCount; k++) {
+				const auto d = take(c.write_kinds[k], cl.write_kinds[k]);
+				if (d != 0) kinds += fmt::format(" {} {}", kS1WriteKindNames[k], d);
+			}
+			const auto wd = take(c.write_draws, cl.write_draws);
+			const auto we = take(c.write_emitted, cl.write_emitted);
+			out += fmt::format(" | s1 writing draws {} emitted {}{}", wd, we, kinds.empty() ? "" : " (kinds:" + kinds + ")");
+			const auto rd = take(c.relaxed, cl.relaxed);
+			const auto re = take(c.relaxed_emitted, cl.relaxed_emitted);
+			out += fmt::format(" | s1 relaxed-regs draws {} emitted {}", rd, re);
+		}
 		out += fmt::format(" | s1 verify: predictions checked {} mismatched {}{}", checked, mismatched,
 		                   Native().verify ? "" : " (off: KYTY_NATIVE_VERIFY=1)");
 		out += " | s1 HOT copies: through the emulator's BufferCache (ObtainBuffer) in this subset, not counted separately";
@@ -2633,6 +2707,38 @@ void NoteNativeS1(uint32_t op_flags, const NativeS1Draw& d) {
 	if (d.pixel) {
 		Inc(r.pixel_draws);
 		if (d.reason == kS1Emitted) Inc(r.pixel_emitted);
+	}
+	// S1d: the full census.
+	auto& c = g_s1_census[slot];
+	if (d.census) {
+		Inc(c.draws);
+		if (d.shape_mask == 0) {
+			Inc(c.covered);
+		} else {
+			bool placed = false;
+			for (uint32_t p = 0, h = static_cast<uint32_t>((d.shape_mask * 0x9e3779b97f4a7c15ull) >> 57u); p < kS1Combos; p++) {
+				auto&    e        = c.combos[(h + p) & (kS1Combos - 1u)];
+				uint64_t expected = e.mask.load(std::memory_order_acquire);
+				if (expected == 0 && e.mask.compare_exchange_strong(expected, d.shape_mask, std::memory_order_acq_rel)) expected = d.shape_mask;
+				if (expected == d.shape_mask) {
+					Inc(e.count);
+					placed = true;
+					break;
+				}
+			}
+			if (!placed) Inc(c.overflow);
+		}
+	}
+	if (d.write_kinds != 0) {
+		Inc(c.write_draws);
+		if (d.reason == kS1Emitted) Inc(c.write_emitted);
+		for (uint32_t k = 0; k < kWkCount; k++) {
+			if ((d.write_kinds & (1u << k)) != 0) Inc(c.write_kinds[k]);
+		}
+	}
+	if (d.relaxed) {
+		Inc(c.relaxed);
+		if (d.reason == kS1Emitted) Inc(c.relaxed_emitted);
 	}
 }
 

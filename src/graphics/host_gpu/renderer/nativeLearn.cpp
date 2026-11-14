@@ -2,6 +2,7 @@
 // (nativeLearn.h).
 
 #include "graphics/host_gpu/renderer/nativeLearn.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <string>
@@ -281,29 +283,41 @@ uint64_t BaseKey(const GC::NativeDraw& record, uint64_t formats_hash, uint64_t r
 	return base;
 }
 
-// S1 coverage of one stage of a learned entry (0: the vertex/mesh stage, 1: the pixel stage);
-// GC::kShCovered, else the first uncovered property (GC::NativeS1Shape).
-uint32_t S1StageShape(const Entry& e, uint32_t s, const DrawView& view) {
+// S1 coverage of one stage of a learned entry (0: the vertex/mesh stage, 1: the pixel stage).
+// S1d (full census): every uncovered property is a bit (GC::S1ShapeBit); `first` receives the
+// first one in the S1b order (GC::kShCovered: none).
+uint64_t S1StageMask(const Entry& e, uint32_t s, const DrawView& view, uint32_t& first) {
 	using Kind          = IR::DescriptorBindingKind;
 	const auto& program = s == 0 ? *e.vs : *e.ps;
 	const auto& st      = e.s1[s];
 	const auto& recipe  = e.recipe[s];
-	if (s == 0 && view.vertex_stage_count != 1) return GC::kShTess;
+	uint64_t    mask    = 0;
+	first               = GC::kShCovered;
+	const auto  add     = [&](uint32_t code) {
+        if (first == GC::kShCovered) first = code;
+        mask |= GC::S1ShapeBit(code, s);
+	};
+	if (s == 0 && view.vertex_stage_count != 1) add(GC::kShTess);
 	// S1c: a simple recipe with control flow is covered (active-source walk at prediction).
-	if (recipe.reason != GC::kS0Simple && recipe.reason != GC::kS0Flow) return GC::kShDeep; // deep, indirect descriptor, const buffer
+	if (recipe.reason != GC::kS0Simple && recipe.reason != GC::kS0Flow) add(GC::kShDeep); // deep, indirect descriptor, const buffer
+	// S1d: image writes / atomics and address writes stay uncovered; V# buffer writes are covered.
 	if (program.has_address_writes ||
-	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(), [](const auto& b) { return b.written || b.atomic; }) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& i) { return i.written || i.atomic; })) {
-		return GC::kShWrites;
+		add(GC::kShWrites);
+	}
+	if (!S1WritesEnabled() &&
+	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(), [](const auto& b) { return b.written || b.atomic; })) {
+		add(GC::kShBufWrites);
 	}
 	if (std::any_of(program.info.images.begin(), program.info.images.end(),
 	                [](const auto& i) { return i.resource_class != IR::ImageResourceClass::Sampled || !i.indirect_resources.empty() ||
 	                                       i.indirect_root != IR::ImageResource::NoIndirectImage;
 	                })) {
-		return GC::kShImageClass;
+		add(GC::kShImageClass);
 	}
-	for (const auto& binding: program.bindings.descriptors) {
-		switch (binding.kind) {
+	bool binding = false;
+	for (const auto& b: program.bindings.descriptors) {
+		switch (b.kind) {
 			case Kind::Buffers:
 			case Kind::UniformBuffers:
 			case Kind::BdaPagetable:
@@ -313,40 +327,77 @@ uint32_t S1StageShape(const Entry& e, uint32_t s, const DrawView& view) {
 			case Kind::ShaderData: break;
 			case Kind::MipStats:
 				if (s == 1) break; // the pixel stage's mip statistics (bound by the emulator's functions)
-				return GC::kShBinding;
+				binding = true;
+				break;
 			default:
-				if (IR::ImageBindingResourceClass(binding.kind) == IR::ImageResourceClass::Sampled) break;
-				return GC::kShBinding;
+				if (IR::ImageBindingResourceClass(b.kind) == IR::ImageResourceClass::Sampled) break;
+				binding = true;
+				break;
 		}
 	}
-	if (st.plan == nullptr) return GC::kShFlow;
-	// S1c: the flow walk evaluates block conditions only (not the uniform fill's values).
-	if (st.plan->uniform_fill.fill.words != 0) return GC::kShUniform;
+	if (binding) add(GC::kShBinding);
+	if (st.plan == nullptr) {
+		add(GC::kShFlow);
+	} else if (st.plan->uniform_fill.fill.words != 0) {
+		add(GC::kShUniform); // S1c: the flow walk evaluates block conditions only (not the uniform fill's values)
+	}
 	// S1c: embedded fetch is covered on the vertex (non-mesh) path with a learned template.
 	if (s == 0 && (view.fetch_embedded || view.vertex_buffers != 0) &&
 	    (e.mesh_active || e.fetch == nullptr || !view.fetch_embedded)) {
-		return GC::kShFetch;
+		add(GC::kShFetch);
 	}
-	if (s == 0 && view.user_clip_planes != 0) return GC::kShClip;
-	if (st.prefix_mode > 1 || st.ud_count < st.ud_base) return GC::kShPrefix;
+	if (s == 0 && view.user_clip_planes != 0) add(GC::kShClip);
+	if (st.prefix_mode > 1) add(GC::kShPrefix);
+	bool indirect = false;
 	for (const auto* list: {&recipe.buffers, &recipe.images, &recipe.samplers}) {
-		for (const auto& r: *list) {
-			if (r.dword_count == 0) return GC::kShIndirect;
-		}
+		for (const auto& r: *list) indirect = indirect || r.dword_count == 0;
 	}
-	if (view.stages[s].snapshot->flattened_srt.size() != st.flat_size) return GC::kShFlat;
-	return GC::kShCovered;
+	if (indirect) add(GC::kShIndirect);
+	if (view.stages[s].snapshot->flattened_srt.size() != st.flat_size) add(GC::kShFlat);
+	return mask;
 }
 
-// S1 coverage of a learned entry: every stage covered (shape/stage: the first uncovered one).
+// S1d: what the entry's programs write (GC::NativeS1WriteKind bits; diagnostic).
+uint32_t WriteKinds(const Entry& e) {
+	using Kind     = IR::DescriptorBindingKind;
+	uint32_t kinds = 0;
+	for (uint32_t s = 0; s < e.stage_count; s++) {
+		const auto& program = s == 0 ? *e.vs : *e.ps;
+		uint32_t    k       = 0;
+		for (const auto& b: program.info.buffers) {
+			if (b.written) k |= 1u << GC::kWkBufWrite;
+			if (b.atomic) k |= 1u << GC::kWkBufAtomic;
+		}
+		for (const auto& i: program.info.images) {
+			if (i.written) k |= 1u << GC::kWkImgWrite;
+			if (i.atomic) k |= 1u << GC::kWkImgAtomic;
+		}
+		if (program.has_address_writes) k |= 1u << GC::kWkAddress;
+		for (const auto& b: program.bindings.descriptors) {
+			if (b.kind == Kind::Gds) k |= 1u << GC::kWkGds;
+		}
+		if (s == 1 && k != 0) k |= 1u << GC::kWkPixel;
+		kinds |= k;
+	}
+	return kinds;
+}
+
+// S1 coverage of a learned entry: every stage covered (shape/stage: the first uncovered one; S1d:
+// s1_mask every uncovered property of both stages).
 void S1Shape(Entry& e, const DrawView& view) {
 	e.s1_shape       = GC::kShCovered;
 	e.s1_shape_stage = 0;
-	for (uint32_t s = 0; s < e.stage_count && e.s1_shape == GC::kShCovered; s++) {
-		e.s1_shape       = S1StageShape(e, s, view);
-		e.s1_shape_stage = s;
+	e.s1_mask        = 0;
+	for (uint32_t s = 0; s < e.stage_count; s++) {
+		uint32_t first = GC::kShCovered;
+		e.s1_mask |= S1StageMask(e, s, view, first);
+		if (e.s1_shape == GC::kShCovered && first != GC::kShCovered) {
+			e.s1_shape       = first;
+			e.s1_shape_stage = s;
+		}
 	}
-	e.s1_covered = e.s1_shape == GC::kShCovered;
+	e.s1_covered  = e.s1_mask == 0;
+	e.write_kinds = WriteKinds(e);
 }
 
 bool SameFetch(const Entry& a, const Entry& b) {
@@ -370,6 +421,7 @@ bool SameS1Stages(const Entry& a, const Entry& b) {
 		const auto& x = a.s1[s];
 		const auto& y = b.s1[s];
 		if (x.plan != y.plan || x.ud_count != y.ud_count || x.ud_base != y.ud_base || x.prefix_mode != y.prefix_mode ||
+		    x.ud_prefix != y.ud_prefix ||
 		    x.flat_size != y.flat_size || !SameRecipe(a.recipe[s], b.recipe[s])) {
 			return false;
 		}
@@ -419,6 +471,14 @@ bool ActiveSources(const IR::ResourcePlan& plan, std::span<const uint32_t> user_
 }
 
 } // namespace
+
+bool S1WritesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_WRITES");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 // S1b/S1c (nativeLearn.h): one XXH3 over the packed words (was one call per buffer and attribute
 // list): the embedded fetch inputs of the vertex program key (per resource the destination
@@ -682,13 +742,22 @@ bool Session::Begin(const DrawView& view) {
 			st.ud_base           = st.plan->user_data_base;
 			st.ud_count          = static_cast<uint32_t>(snapshot.user_data.size());
 			st.flat_size         = static_cast<uint32_t>(snapshot.flattened_srt.size());
-			bool zero = true;
-			for (uint32_t i = 0; i < st.ud_base && i < st.ud_count; i++) zero = zero && snapshot.user_data[i] == 0;
-			bool front = s == 0 && st.ud_base >= 2 && st.ud_count >= 2 &&
-			             snapshot.user_data[0] == static_cast<uint32_t>(view.gs_user_data_addr) &&
-			             snapshot.user_data[1] == static_cast<uint32_t>(view.gs_user_data_addr >> 32u);
-			for (uint32_t i = 2; front && i < st.ud_base && i < st.ud_count; i++) front = snapshot.user_data[i] == 0;
-			st.prefix_mode = zero ? 0u : front ? 1u : 2u;
+			// S1d (header "User-data layout"): the dwords before the bound user SGPRs.
+			const uint32_t sgprs = view.user_sgpr_count[s];
+			if (st.ud_count < sgprs || st.ud_count - sgprs > 8u || (s != 0 && st.ud_count != sgprs)) {
+				st.ud_prefix   = 0;
+				st.prefix_mode = 2;
+			} else {
+				st.ud_prefix    = st.ud_count - sgprs;
+				const auto addr = view.gs_user_data_addr;
+				bool       zero = true;
+				for (uint32_t i = 0; i < st.ud_prefix; i++) zero = zero && snapshot.user_data[i] == 0;
+				bool front = st.ud_prefix >= 2 && addr != 0 && snapshot.user_data[0] == static_cast<uint32_t>(addr) &&
+				             snapshot.user_data[1] == static_cast<uint32_t>(addr >> 32u);
+				for (uint32_t i = 2; front && i < st.ud_prefix; i++) front = snapshot.user_data[i] == 0;
+				// A zero prefix with no GS address bound cannot tell a GS back half's prefix from none.
+				st.prefix_mode = st.ud_prefix == 0 || (zero && addr != 0) ? 0u : front ? 1u : 2u;
+			}
 		}
 		// S1c: the embedded fetch's static part.
 		if (view.fetch_embedded && view.vertex_info != nullptr && !view.mesh_active) {
@@ -896,12 +965,31 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 	m_s1_armed         = false;
 	m_s1_shape         = GC::kShCovered;
 	m_s1_shape_stage   = 0;
+	m_s1_census        = false;
+	m_s1_mask          = 0;
+	m_s1_write_kinds   = 0;
 	m_prediction.entry = nullptr;
 	const auto shape   = [&](uint32_t code, uint32_t stage) {
         m_s1_shape       = code;
         m_s1_shape_stage = stage;
+        m_s1_mask |= GC::S1ShapeBit(code, stage);
         return GC::kS1Shape;
 	};
+	// S1d: a known ineligible selection returns before the record lookup.
+	if (m_s1_cache == nullptr) m_s1_cache = std::make_unique<std::array<S1Ineligible, kS1CacheSize>>();
+	uint64_t tag = Mix(Mix(in.regs_hash, in.formats_hash), in.pixel ? in.ps_addr : 0u);
+	tag          = tag == 0 ? 1 : tag;
+	auto& cached = (*m_s1_cache)[static_cast<uint32_t>(tag >> 40u) & (kS1CacheSize - 1u)];
+	// The tag leaves out the record's state hash: one hit in 16 takes the full path again, which
+	// clears the slot when the base entry it finds is covered.
+	if (cached.tag == tag && (++cached.hits & 15u) != 0) {
+		m_s1_census      = true;
+		m_s1_mask        = cached.mask;
+		m_s1_shape       = cached.shape;
+		m_s1_shape_stage = cached.stage;
+		m_s1_write_kinds = cached.write_kinds;
+		return GC::kS1Shape;
+	}
 	if (!GC::LookupNativeRecordForOp(in.op_flags, m_record)) {
 		return GC::kS1Record;
 	}
@@ -912,7 +1000,16 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 	const uint64_t base = BaseKey(m_record, in.formats_hash, in.regs_hash);
 	const Entry*   rep  = m_table->FindBase(base);
 	if (rep == nullptr) return GC::kS1Miss;
-	if (!rep->s1_covered) return shape(rep->s1_shape, rep->s1_shape_stage);
+	m_s1_census      = true;
+	m_s1_write_kinds = rep->write_kinds;
+	if (!rep->s1_covered) {
+		cached = {tag, rep->s1_mask, rep->s1_shape, rep->s1_shape_stage, rep->write_kinds};
+		m_s1_mask = rep->s1_mask;
+		m_s1_shape       = rep->s1_shape;
+		m_s1_shape_stage = rep->s1_shape_stage;
+		return GC::kS1Shape;
+	}
+	if (cached.tag == tag) cached.tag = 0;
 	const uint32_t stages = in.pixel ? 2u : 1u;
 	if (rep->stage_count != stages) return shape(GC::kShVariant, stages - 1u);
 	// The plain pixel variant (KYTY_LOD_STATS_PLAIN_VARIANT): verify mode binds a canary the native
@@ -925,15 +1022,18 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 		const auto&     st     = rep->s1[s];
 		const uint32_t* sgpr   = s == 0 ? in.user_sgpr : in.ps_user_sgpr;
 		const uint32_t  sgpr_n = s == 0 ? in.user_sgpr_count : in.ps_user_sgpr_count;
-		if (sgpr_n + st.ud_base != st.ud_count || sgpr_n > 32u) return shape(GC::kShUdCount, s);
+		// S1d: user_data = prefix (zeros, or the GS user-data address) + the bound user SGPRs; the
+		// recipe indices are user_data indices.
+		if (sgpr_n + st.ud_prefix != st.ud_count || sgpr_n > 32u) return shape(GC::kShUdCount, s);
 		auto& snap = m_prediction.snapshot[s];
 		snap.user_data.assign(st.ud_count, 0u);
 		if (st.prefix_mode == 1u) {
 			snap.user_data[0] = static_cast<uint32_t>(in.gs_user_data_addr);
 			snap.user_data[1] = static_cast<uint32_t>(in.gs_user_data_addr >> 32u);
 		}
-		std::copy_n(sgpr, sgpr_n, snap.user_data.begin() + st.ud_base);
-		const uint32_t* ud     = snap.user_data.data() + st.ud_base;
+		std::copy_n(sgpr, sgpr_n, snap.user_data.begin() + st.ud_prefix);
+		const uint32_t* ud     = snap.user_data.data();
+		const uint32_t  ud_n   = st.ud_count;
 		const auto&     recipe = rep->recipe[s];
 		const auto&     info   = (s == 0 ? rep->vs : rep->ps)->info;
 		// S1c: the plan's active sources (control flow): an inactive source materializes as zeros.
@@ -954,8 +1054,8 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 					}
 				}
 				for (uint32_t k = 0; k < r.dword_count; k++) {
-					if (!EvaluateBound(r.dwords[k], ud, sgpr_n, v.dwords[k])) return false;
-				}
+				if (!EvaluateBound(r.dwords[k], ud, ud_n, v.dwords[k])) return false;
+			}
 			}
 			return true;
 		};
@@ -967,7 +1067,7 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 		snap.flattened_srt.assign(st.flat_size, 0u);
 		for (const auto& flat: recipe.flat) {
 			if (flat.flat_offset >= st.flat_size) return shape(GC::kShFlat, s);
-			if (!EvaluateBound(flat.recipe, ud, sgpr_n, snap.flattened_srt[flat.flat_offset])) return GC::kS1Read;
+			if (!EvaluateBound(flat.recipe, ud, ud_n, snap.flattened_srt[flat.flat_offset])) return GC::kS1Read;
 		}
 		// The whole specialization as materialization derives it (null V#s and invalid T#s zeroed,
 		// the image remap applied to the snapshot).
@@ -995,7 +1095,11 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 	key          = key == 0 ? 1 : key;
 	const Entry* entry = m_table->Find(key);
 	if (entry == nullptr || entry->conflicted) return GC::kS1Miss;
-	if (!entry->s1_covered) return shape(entry->s1_shape, entry->s1_shape_stage);
+	if (!entry->s1_covered) {
+		m_s1_mask |= entry->s1_mask;
+		return shape(entry->s1_shape, entry->s1_shape_stage);
+	}
+	m_s1_write_kinds = entry->write_kinds;
 	if (!SameS1Stages(*entry, *rep)) return shape(GC::kShVariant, 0);
 	m_prediction.entry       = entry;
 	m_prediction.key         = key;
@@ -1070,6 +1174,12 @@ void Session::CheckS1(const DrawView& view, uint64_t key, const Entry* entry) {
 		if (snap->user_data != p.user_data) fail(fmt::format("{} user data ({} dwords)", stage, snap->user_data.size()));
 		if (!(snap->uniform_fill == p.uniform_fill)) fail(fmt::format("{} uniform fill", stage));
 		if (view.stages[s].spec == nullptr || !(*view.stages[s].spec == pred.specialization[s])) fail(fmt::format("{} specialization", stage));
+		// S1d: the post-draw write barrier the emission derives from the rebuilt snapshot.
+		if (pred.entry != nullptr && p.buffers.size() == (s == 0 ? pred.entry->vs : pred.entry->ps)->info.buffers.size()) {
+			const ShaderStageRuntime runtime {s == 0 ? pred.entry->vs : pred.entry->ps, &p};
+			const bool               writes = HasShaderBufferWrites(runtime);
+			if (writes != view.buffer_writes[s]) fail(fmt::format("{} buffer writes {} predicted {}", stage, view.buffer_writes[s], writes));
+		}
 	}
 	// S1c: the rebuilt embedded fetch against the normal path's vertex input info.
 	const bool view_fetch = view.vertex_info != nullptr && view.vertex_info->fetch_embedded;
