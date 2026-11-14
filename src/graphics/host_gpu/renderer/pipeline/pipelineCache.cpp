@@ -1452,7 +1452,14 @@ struct PipelineCache::Permutation {
 	ShaderProgram                                plain;
 	// Position in the owning source's PermutationList, fixed when it is published.
 	uint32_t                                     index = 0;
+	// Astro Bot PC (KYTY_NATIVE_MODE=s0, renderer/nativeLearn.h): the owning source's sealed
+	// resource plan (immutable, lives as long as the cache), set when the permutation is published.
+	const ShaderRecompiler::IR::ResourcePlan*    plan  = nullptr;
 };
+
+const ShaderRecompiler::IR::ResourcePlan* PipelineCache::PermutationResourcePlan(const StagePrep& prep) {
+	return prep.permutation != nullptr ? prep.permutation->plan : nullptr;
+}
 
 // Program preparation is split into a shared lookup (FindSource), a pure per-draw
 // materialization into caller-owned StagePrep (MaterializeStage), a lock-free permutation
@@ -3135,6 +3142,7 @@ struct PipelineCache::ProgramCache {
 		const char* reason = source->permutations.Size() == 0 ? "first"
 		                     : same_specialization            ? "push"
 		                                                      : "spec";
+		compiled->plan          = &source->resource_plan; // Astro Bot PC (KYTY_NATIVE_MODE=s0)
 		const auto& permutation = source->permutations.Append(std::move(*compiled));
 		FinishInFlight(record);
 		lock.unlock();

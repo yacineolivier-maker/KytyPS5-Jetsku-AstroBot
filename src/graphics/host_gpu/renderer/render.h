@@ -31,6 +31,10 @@ class UserConfig;
 class Shader;
 } // namespace HW
 
+namespace NativeLearn {
+class Session; // Astro Bot PC (KYTY_NATIVE_MODE=s0, nativeLearn.h)
+} // namespace NativeLearn
+
 struct GraphicContext;
 class Buffer;
 struct ShaderBufferResource;
@@ -1106,8 +1110,19 @@ public:
 	bool     m_native_lean_done     = false; // the last draw completed on the lean path
 	bool     m_native_lean_checked  = false; // a verify sample's predictions were checked
 	bool     m_native_lean_mismatch = false; // and differed
+	// Astro Bot PC (KYTY_NATIVE_MODE=s0, nativeLearn.h): the native op being executed (its flags with
+	// slot and serial, 0 otherwise), set by the command processor around the op; consumed by the
+	// learning hook of the op's own draw (ExecutePreparedDraw). The op's end is reported.
+	uint32_t m_native_s0_op = 0;
+	void     NativeS0EndOp(uint32_t op_flags);
 
 private:
+	NativeLearn::Session* m_native_s0 = nullptr; // created on the first S0 draw, never freed
+	// S0: the learning hook after the pipeline selection (renderDraw.cpp), and the end of the draw.
+	void NativeS0Learn(const DrawRenderState& state, const PipelineCache::Pipeline& pipeline,
+	                   const PipelineCache::GraphicsPrograms& programs, bool plain_pixel, bool mesh_active,
+	                   uint32_t vertex_stage_count, bool indexed, uint32_t index_count, uint64_t cp_es_addr);
+	void NativeS0Finish();
 	// N3b state (GPU thread, under the render mutex).
 	// The register test that decides the generic checks passed: they were skipped (DrawIndex/DrawAuto).
 	bool     m_native_lean_pre    = false;

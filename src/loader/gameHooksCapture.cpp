@@ -123,6 +123,7 @@ struct NativeConfig {
 	bool        n2     = false;    // KYTY_NATIVE_MODE=n2 or n3 (stage N2: N1 + records, verify, timing)
 	bool        n3     = false;    // KYTY_NATIVE_MODE=n3 (stage N3a: N2 + segment resolution windows)
 	bool        n3b    = false;    // KYTY_NATIVE_MODE=n3b (stage N3b: N2 + lean native continuations)
+	bool        s0     = false;    // KYTY_NATIVE_MODE=s0 (stage S0: N2 + native learning, recipes, verify)
 	bool        verify = false;    // KYTY_NATIVE_VERIFY=1: a splice record miss exits
 };
 
@@ -173,7 +174,8 @@ NativeConfig ParseNative() {
 	}
 	config.n3     = config.mode == "n3";
 	config.n3b    = config.mode == "n3b";
-	config.n2     = config.mode == "n2" || config.n3 || config.n3b;
+	config.s0     = config.mode == "s0";
+	config.n2     = config.mode == "n2" || config.n3 || config.n3b || config.s0;
 	config.splice = config.mode == "splice" || config.n2;
 	config.valid  = (config.mode == "drop" || config.splice) && config.mask != 0;
 	const char* verify = std::getenv("KYTY_NATIVE_VERIFY");
@@ -572,6 +574,36 @@ struct N3ResolveLast {
 	uint64_t                        segments = 0, segments_window = 0;
 };
 std::array<N3ResolveLast, kEngineThreads> g_n3_resolve_last {}; // reporter only
+// S0 (executor, Thread_Gpu): learning outcomes per slot; (CP, real parse) segment lengths.
+constexpr const char* kS0ReasonNames[GameCapture::kS0ReasonCount] = {"simple",    "flow", "no-record", "wrong-draw", "no-plan",
+                                                                     "tess",      "indirect", "deep", "const-buffer", "table-full",
+                                                                     "skipped"};
+constexpr uint32_t kS0Fields = 18;
+enum S0Field : uint32_t {
+	kS0fDraws, kS0fFound, kS0fLearned, kS0fConflict, kS0fReplaced, kS0fVerified, kS0fCompared, kS0fMismatch, kS0fBadDraws,
+	kS0fNulled, kS0fUd, kS0fUdShadowEq, kS0fUdShadowNe, kS0fUdShadowUnk, kS0fUdCopyEq, kS0fUdCopyNe, kS0fSegHeads, kS0fSegDraws
+};
+constexpr uint32_t kS0SegFields = 6; // heads, draws in heads, length ok, length bad, open at parse, orphan
+struct S0Resolve {
+	std::array<std::atomic<uint64_t>, GameCapture::kS0ReasonCount> reasons {};
+	std::array<std::atomic<uint64_t>, kS0Fields>                   fields {};
+	std::array<std::atomic<uint64_t>, kS0SegFields>                seg {}; // CP side
+	std::array<std::atomic<uint64_t>, 5>                           seg_hist {}; // head counts 1, 2-4, 5-16, 17-64, 65+
+	// kS0Deep: the IR opcodes that stopped a recipe (+1), a small open table (executor only writes).
+	std::array<std::atomic<uint32_t>, 16> deep_op {};
+	std::array<std::atomic<uint64_t>, 16> deep_n {};
+};
+std::array<S0Resolve, kEngineThreads> g_s0 {};
+struct S0ResolveLast {
+	std::array<uint64_t, GameCapture::kS0ReasonCount> reasons {};
+	std::array<uint64_t, kS0Fields>                   fields {};
+	std::array<uint64_t, kS0SegFields>                seg {};
+	std::array<uint64_t, 5>                           seg_hist {};
+};
+std::array<S0ResolveLast, kEngineThreads> g_s0_last {}; // reporter only
+std::atomic<uint32_t> g_s0_keys {0}, g_s0_base_keys {0};
+std::atomic<uint32_t> g_s0_logged {0};
+std::atomic<uint32_t> g_s0_seg_logged {0};
 std::array<uint64_t, kEngineThreads + 1> g_n2_rec_ok_last {}, g_n2_rec_miss_last {}, g_n2_verified_last {},
     g_n2_verify_bad_last {};
 std::array<uint64_t, GameCapture::kNvCount> g_n2_field_bad_last {}, g_n2_field_unknown_last {};
@@ -657,6 +689,9 @@ struct alignas(64) ThreadState {
 	bool                    seg_broken = true;
 	uint64_t                seg_ctx    = 0;
 	uint64_t                seg_rt     = 0;
+	// S0: serial of the open segment's head record (0: none) and its draws with a marker so far.
+	uint32_t                seg_head_serial = 0;
+	uint32_t                seg_len         = 0;
 	std::array<std::atomic<uint64_t>, kNCount> n {};
 	std::array<uint64_t, kNCount>              n_last {}; // reporter only
 
@@ -1098,6 +1133,9 @@ void BuildNativeDraw(ThreadState* t, const DrawRecord& r, const ContextState* st
 	n.code_geom   = r.code[r.geom_slot];
 	n.code_ps     = (r.active & 2u) != 0 ? r.code[1] : 0;
 	n.rt_hash     = r.rt_hash;
+	// The engine's user SGPR copies of the geometry and pixel slots (CopySgprs, after the flush).
+	if (r.sgpr_slot[0] >= 0) std::memcpy(n.sgpr_geom, r.sgpr[0], sizeof(n.sgpr_geom));
+	if (r.sgpr_slot[1] >= 0) std::memcpy(n.sgpr_ps, r.sgpr[1], sizeof(n.sgpr_ps));
 	uint32_t known = 0;
 	if (state != nullptr) {
 		const auto cx = [&](uint32_t reg, uint32_t bit, uint32_t& out) {
@@ -1546,6 +1584,53 @@ std::string N3bSlotReport(uint32_t s, const std::array<uint64_t, GameCapture::kN
 	return out;
 }
 
+// S0: what the learning found for this slot's native draws in the window, and the CP's check of
+// the segment lengths the game thread wrote.
+std::string S0SlotReport(uint32_t s) {
+	auto&      r    = g_s0[s];
+	auto&      last = g_s0_last[s];
+	const auto take = [](std::atomic<uint64_t>& v, uint64_t& l) {
+		const auto now = v.load(std::memory_order_relaxed);
+		const auto d   = now - l;
+		l              = now;
+		return d;
+	};
+	std::array<uint64_t, kS0Fields> f {};
+	for (uint32_t k = 0; k < kS0Fields; k++) f[k] = take(r.fields[k], last.fields[k]);
+	const uint64_t draws = f[kS0fDraws];
+	const auto     pct   = [&](uint64_t v) { return draws == 0 ? 0.0 : 100.0 * static_cast<double>(v) / static_cast<double>(draws); };
+	std::array<uint64_t, GameCapture::kS0ReasonCount> reasons {};
+	for (uint32_t k = 0; k < GameCapture::kS0ReasonCount; k++) reasons[k] = take(r.reasons[k], last.reasons[k]);
+	std::string out = fmt::format(" | s0: native draws {} learned-key found {} ({:.1f}%) new {} conflict {} pipeline-replaced {} | recipe simple {} ({:.1f}%)",
+	                              draws, f[kS0fFound], pct(f[kS0fFound]), f[kS0fLearned], f[kS0fConflict], f[kS0fReplaced],
+	                              reasons[GameCapture::kS0Simple], pct(reasons[GameCapture::kS0Simple]));
+	out += " not covered:";
+	for (uint32_t k = 1; k < GameCapture::kS0ReasonCount; k++) {
+		if (reasons[k] != 0) out += fmt::format(" {} {}", kS0ReasonNames[k], reasons[k]);
+	}
+	std::string deep;
+	for (uint32_t k = 0; k < r.deep_op.size(); k++) {
+		const auto op = r.deep_op[k].load(std::memory_order_relaxed);
+		if (op != 0) deep += fmt::format(" op{}x{}", op - 1u, r.deep_n[k].load(std::memory_order_relaxed));
+	}
+	if (!deep.empty()) out += " (deep, cumulative:" + deep + ")";
+	if (Native().verify) {
+		out += fmt::format(" | s0 verify: samples {} dwords {} differ {} (draws {}) nulled {} | user data (ES/mesh stage vs record): dwords {} shadow eq {} ne {} unknown {}, slot copy eq {} ne {}",
+		                   f[kS0fVerified], f[kS0fCompared], f[kS0fMismatch], f[kS0fBadDraws], f[kS0fNulled], f[kS0fUd], f[kS0fUdShadowEq],
+		                   f[kS0fUdShadowNe], f[kS0fUdShadowUnk], f[kS0fUdCopyEq], f[kS0fUdCopyNe]);
+	} else {
+		out += " | s0 verify off (KYTY_NATIVE_VERIFY=1)";
+	}
+	std::array<uint64_t, kS0SegFields> seg {};
+	for (uint32_t k = 0; k < kS0SegFields; k++) seg[k] = take(r.seg[k], last.seg[k]);
+	std::array<uint64_t, 5> hist {};
+	for (uint32_t k = 0; k < 5; k++) hist[k] = take(r.seg_hist[k], last.seg_hist[k]);
+	out += fmt::format(" | segment length (CP, head records): heads {} draws/segment {:.1f} (len 1:{} 2-4:{} 5-16:{} 17-64:{} 65+:{}) marker check ok {} bad {} open {} orphan {}",
+	                   seg[0], seg[0] == 0 ? 0.0 : static_cast<double>(seg[1]) / static_cast<double>(seg[0]), hist[0], hist[1], hist[2], hist[3],
+	                   hist[4], seg[2], seg[3], seg[4], seg[5]);
+	return out;
+}
+
 std::string N2SlotReport(uint32_t s, uint64_t segments_game, uint64_t rec_incomplete, uint64_t flips) {
 	auto& r    = g_n2_resolve[s];
 	auto& last = g_n2_resolve_last[s];
@@ -1587,6 +1672,9 @@ std::string N2SlotReport(uint32_t s, uint64_t segments_game, uint64_t rec_incomp
 		out += N3SlotReport(s);
 	} else if (Native().n3b) {
 		out += N3bSlotReport(s, draws, ticks);
+	} else if (Native().s0) {
+		out += fmt::format(" | emission: emulator path (splice) {}", all_draws);
+		out += S0SlotReport(s);
 	} else {
 		out += fmt::format(" | emission: emulator path (splice) {} n2-native 0 (fallback reason: native emission not implemented)", all_draws);
 	}
@@ -1871,6 +1959,10 @@ void Report(int64_t now) {
 		if (Native().n2) {
 			native += N2VerifyReport();
 		}
+		if (Native().s0) {
+			native += fmt::format(" | s0 native pipeline table: keys {} (without specialization {})",
+			                      g_s0_keys.load(std::memory_order_relaxed), g_s0_base_keys.load(std::memory_order_relaxed));
+		}
 		native += fmt::format(" | total chosen {} written {} cp-seen {} (other slots {}, malformed {}) per frame written {:.1f}\n", total[kNChosen],
 		                      total[kNWritten], total_seen,
 		                      [&] {
@@ -1961,13 +2053,14 @@ void OnInstalled() {
 		}
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "GameNative: KYTY_NATIVE {} | mode {}{}{} | threads:{}{}{}\n",
-		    !native.valid ? "ignored" : !ok ? "inactive (capture hooks not installed)" : native.n3 ? "active (stage N3a)" : native.n3b ? "active (stage N3b)" : native.n2 ? "active (stage N2)" : native.splice ? "active (stage N1)" : "active (stage N0)",
-		    native.mode, native.mode == "drop" || native.splice ? "" : " (unsupported: drop, splice, n2, n3 or n3b)",
+		    !native.valid ? "ignored" : !ok ? "inactive (capture hooks not installed)" : native.n3 ? "active (stage N3a)" : native.n3b ? "active (stage N3b)" : native.s0 ? "active (stage S0)" : native.n2 ? "active (stage N2)" : native.splice ? "active (stage N1)" : "active (stage N0)",
+		    native.mode, native.mode == "drop" || native.splice ? "" : " (unsupported: drop, splice, n2, n3, n3b or s0)",
 		    native.splice ? fmt::format(" (ring {} entries{})", kNativeRingSize, native.verify ? ", verify" : "") : std::string {},
 		    threads.empty() ? " none" : threads, native.unknown.empty() ? "" : " | unknown:", native.unknown));
 		if (native.valid && ok) {
 			GameCapture::g_native_mode.store(static_cast<uint8_t>(native.n3       ? GameCapture::NativeMode::N3
 			                                                      : native.n3b    ? GameCapture::NativeMode::N3b
+			                                                      : native.s0     ? GameCapture::NativeMode::S0
 			                                                      : native.n2     ? GameCapture::NativeMode::N2
 			                                                      : native.splice ? GameCapture::NativeMode::Splice
 			                                                                      : GameCapture::NativeMode::Drop),
@@ -2013,6 +2106,20 @@ MarkerResult WriteNativeMarker(ThreadState* t, uint32_t* packet, uint32_t opcode
 		if (auto* records = g_native_records[t->native_slot]; records != nullptr) {
 			// n2: the record first, under the same serial (the CP reads it at the marker).
 			t->native_rec.serial = serial;
+			// S0: segment length. A head closes the previous segment and counts 1; a continuation
+			// adds itself to its head's count (both only for draws whose marker is written: every
+			// fallback breaks the segment, so the next native draw is a head).
+			const bool s0_head = Native().s0 && t->native_rec.seg_start != 0;
+			if (s0_head) {
+				if (t->seg_head_serial != 0) {
+					auto& prev = records->entries[t->seg_head_serial & (kNativeRingSize - 1u)];
+					if (prev.serial.load(std::memory_order_relaxed) == t->seg_head_serial) {
+						prev.words[GameCapture::kNativeSegClosedWord].store(1, std::memory_order_release);
+					}
+				}
+				t->native_rec.seg_count  = 1;
+				t->native_rec.seg_closed = 0;
+			}
 			uint32_t words[GameCapture::kNativeDrawDw];
 			std::memcpy(words, &t->native_rec, sizeof(words));
 			auto& r = records->entries[serial & (kNativeRingSize - 1u)];
@@ -2022,6 +2129,18 @@ MarkerResult WriteNativeMarker(ThreadState* t, uint32_t* packet, uint32_t opcode
 				r.words[i].store(words[i], std::memory_order_relaxed);
 			}
 			r.serial.store(serial, std::memory_order_release);
+			if (s0_head) {
+				t->seg_head_serial = serial;
+				t->seg_len         = 1;
+			} else if (Native().s0 && t->seg_head_serial != 0) {
+				// Within one segment the head is at most a few thousand serials old: its entry is the
+				// producer's own and cannot have been reused (ring of 16384, reuse after consumption).
+				t->seg_len++;
+				auto& head = records->entries[t->seg_head_serial & (kNativeRingSize - 1u)];
+				if (head.serial.load(std::memory_order_relaxed) == t->seg_head_serial) {
+					head.words[GameCapture::kNativeSegCountWord].store(t->seg_len, std::memory_order_release);
+				}
+			}
 		}
 		auto& e = ring->entries[serial & (kNativeRingSize - 1u)];
 		e.serial.store(0, std::memory_order_relaxed);
@@ -2162,6 +2281,47 @@ uint32_t MarkerSlot(const uint32_t* body) {
 	return kEngineThreads; // malformed
 }
 
+// S0 (CP, real parse): per CP thread and slot, the open segment (the head record's count and the
+// markers of the slot parsed since). A segment never spans two lists (a list begin breaks it), and
+// one list is parsed by one CP thread at a time.
+struct S0SegCheck {
+	uint32_t expected = 0, seen = 0, head = 0;
+	bool     open = false;
+};
+thread_local std::array<S0SegCheck, kEngineThreads> t_s0_seg {};
+
+void NoteS0SegmentMarker(uint32_t slot, const NativeDraw& n) {
+	auto& r = g_s0[slot];
+	auto& c = t_s0_seg[slot];
+	if (n.seg_start != 0) {
+		if (c.open) {
+			if (c.seen == c.expected) {
+				Inc(r.seg[2]);
+			} else {
+				Inc(r.seg[3]);
+				if (g_s0_seg_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+					Log::WriteToConsoleAndLog(fmt::format("GameNative s0: \"{}\" segment head serial {}: head count {} but {} markers parsed\n",
+					                                      kEngineThreadNames[slot], c.head, c.expected, c.seen));
+				}
+			}
+		}
+		c.open     = true;
+		c.expected = n.seg_count;
+		c.seen     = 1;
+		c.head     = n.serial;
+		Inc(r.seg[0]);
+		Inc(r.seg[1], n.seg_count);
+		const uint32_t len    = n.seg_count;
+		const uint32_t bucket = len <= 1 ? 0 : len <= 4 ? 1 : len <= 16 ? 2 : len <= 64 ? 3 : 4;
+		Inc(r.seg_hist[bucket]);
+		if (n.seg_closed == 0) Inc(r.seg[4]);
+	} else if (c.open) {
+		c.seen++;
+	} else {
+		Inc(r.seg[5]);
+	}
+}
+
 [[noreturn]] void NativeVerifyExit(const char* what, const uint32_t* body, uint32_t marker_size_dw, const NativeDrawPacket* packet) {
 	const auto msg = fmt::format("GameNative: KYTY_NATIVE_VERIFY: splice record miss ({}): marker word1 0x{:08x} serial {} size {} | record size {} "
 	                             "header 0x{:08x}\n",
@@ -2254,7 +2414,88 @@ bool LookupNativeRecord(const uint32_t* body, uint32_t marker_size_dw, bool real
 		return false;
 	}
 	if (real) g_n2_rec_ok[slot].fetch_add(1, std::memory_order_relaxed);
+	if (real && Native().s0) {
+		NoteS0SegmentMarker(slot, out);
+	}
 	return true;
+}
+
+namespace {
+// Executor-side record copy (any thread): the entry of the op's slot whose serial has the op's low
+// 16 bits, read under its seqlock.
+bool ReadRecordEntry(uint32_t slot, uint32_t serial16, NativeDraw& out) {
+	if (slot >= kEngineThreads || g_native_records[slot] == nullptr) {
+		return false;
+	}
+	auto&          e = g_native_records[slot]->entries[serial16 & (kNativeRingSize - 1u)];
+	uint32_t       words[kNativeDrawDw];
+	const uint32_t s1 = e.serial.load(std::memory_order_acquire);
+	for (uint32_t i = 0; i < kNativeDrawDw; i++) {
+		words[i] = e.words[i].load(std::memory_order_relaxed);
+	}
+	std::atomic_thread_fence(std::memory_order_acquire);
+	const uint32_t s2 = e.serial.load(std::memory_order_relaxed);
+	std::memcpy(&out, words, sizeof(words));
+	return s1 != 0 && s1 == s2 && out.serial == s1 && (s1 & 0xffffu) == serial16;
+}
+} // namespace
+
+bool LookupNativeRecordForOp(uint32_t op_flags, NativeDraw& out) {
+	if ((op_flags & kNativeOpFlag) == 0) {
+		return false;
+	}
+	return ReadRecordEntry((op_flags >> kNativeOpSlotShift) & kNativeSlotMask, op_flags >> kNativeOpSerialShift, out);
+}
+
+void NoteNativeS0(uint32_t op_flags, const NativeS0Draw& d) {
+	const uint32_t slot = (op_flags >> kNativeOpSlotShift) & kNativeSlotMask;
+	if (slot >= kEngineThreads) {
+		return;
+	}
+	auto& r = g_s0[slot];
+	Inc(r.fields[kS0fDraws]);
+	Inc(r.reasons[std::min<uint32_t>(d.reason, kS0ReasonCount - 1u)]);
+	if (d.found) Inc(r.fields[kS0fFound]);
+	if (d.learned) Inc(r.fields[kS0fLearned]);
+	if (d.conflict) Inc(r.fields[kS0fConflict]);
+	if (d.replaced) Inc(r.fields[kS0fReplaced]);
+	if (d.verified) {
+		Inc(r.fields[kS0fVerified]);
+		Inc(r.fields[kS0fCompared], d.compared);
+		Inc(r.fields[kS0fMismatch], d.mismatches);
+		if (d.mismatches != 0) Inc(r.fields[kS0fBadDraws]);
+		Inc(r.fields[kS0fNulled], d.nulled);
+		Inc(r.fields[kS0fUd], d.ud_compared);
+		Inc(r.fields[kS0fUdShadowEq], d.ud_shadow_eq);
+		Inc(r.fields[kS0fUdShadowNe], d.ud_shadow_ne);
+		Inc(r.fields[kS0fUdShadowUnk], d.ud_shadow_unk);
+		Inc(r.fields[kS0fUdCopyEq], d.ud_copy_eq);
+		Inc(r.fields[kS0fUdCopyNe], d.ud_copy_ne);
+	}
+	if (d.reason == kS0Deep && d.deep_opcode != 0) {
+		for (uint32_t k = 0; k < r.deep_op.size(); k++) {
+			const auto op = r.deep_op[k].load(std::memory_order_relaxed);
+			if (op == d.deep_opcode || op == 0) {
+				r.deep_op[k].store(d.deep_opcode, std::memory_order_relaxed);
+				Inc(r.deep_n[k]);
+				break;
+			}
+		}
+	}
+}
+
+void NoteNativeS0Mismatch(uint32_t op_flags, const char* text) {
+	const uint32_t slot = (op_flags >> kNativeOpSlotShift) & kNativeSlotMask;
+	if (g_s0_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		Log::WriteToConsoleAndLog(fmt::format("GameNative s0 verify: \"{}\" serial(lo16) {}: {}\n",
+		                                      slot < kEngineThreads ? kEngineThreadNames[slot] : "?", op_flags >> kNativeOpSerialShift,
+		                                      text != nullptr ? text : ""));
+	}
+}
+
+void NoteNativeS0Table(uint32_t keys, uint32_t base_keys) {
+	g_s0_keys.store(keys, std::memory_order_relaxed);
+	g_s0_base_keys.store(base_keys, std::memory_order_relaxed);
 }
 
 bool NativeVerifyEnabled() {

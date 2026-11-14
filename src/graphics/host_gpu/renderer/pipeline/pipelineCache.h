@@ -167,6 +167,9 @@ public:
 	// KYTY_LOD_STATS_PLAIN_VARIANT: the prepared pixel program compiled without GET_LOD_STATS
 	// feedback (same bindings and pipeline layout), or an empty program when it has none.
 	[[nodiscard]] static ShaderProgram PlainPixelProgram(const StagePrep& prep);
+	// Astro Bot PC (KYTY_NATIVE_MODE=s0): the sealed resource plan of the prepared permutation's
+	// source (descriptor-source graph), or null. Valid for the cache lifetime.
+	[[nodiscard]] static const ShaderRecompiler::IR::ResourcePlan* PermutationResourcePlan(const StagePrep& prep);
 
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,

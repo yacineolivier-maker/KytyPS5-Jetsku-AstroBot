@@ -3382,6 +3382,29 @@ struct NativeTierScope {
 	NativeTierScope& operator=(const NativeTierScope&) = delete;
 };
 
+// Astro Bot PC (KYTY_NATIVE_MODE=s0, renderer/nativeLearn.h): the native op (slot, serial) handed to
+// the executor for the whole op, so that the learning hook of the op's own draw finds its record;
+// the op's end is reported (a draw that never reached the hook is counted as skipped).
+struct NativeS0Scope {
+	RenderExecutor* ex    = nullptr;
+	uint32_t        flags = 0;
+	NativeS0Scope(RenderExecutor& e, uint32_t op_flags) {
+		namespace GC = Loader::GameCapture;
+		if ((op_flags & CpSeq::DrawFlagNativeMask) != 0 && GC::NativeS0()) [[unlikely]] {
+			ex              = &e;
+			flags           = op_flags & (GC::kNativeOpMask | (0xffffu << GC::kNativeOpSerialShift));
+			e.m_native_s0_op = flags;
+		}
+	}
+	~NativeS0Scope() {
+		if (ex != nullptr) [[unlikely]] {
+			ex->NativeS0EndOp(flags);
+		}
+	}
+	NativeS0Scope(const NativeS0Scope&)            = delete;
+	NativeS0Scope& operator=(const NativeS0Scope&) = delete;
+};
+
 // Astro Bot PC (KYTY_BINDING_CENSUS, bindingCensus.h): the engine thread slot of the native draw
 // op being executed, for the census's per-slot binding time (bindings resolved later, outside the
 // op, count as non-native).
@@ -3413,6 +3436,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 	});
 	const NativeTierScope native_tier(m_renderer.GetBufferCache(), op.flags, m_native_tier_draw,
 	                                  m_native_tier_valid);
+	const NativeS0Scope native_s0(m_renderer.GetRenderExecutor(), op.flags);
 	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
@@ -4090,6 +4114,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 	});
 	const NativeTierScope native_tier(m_renderer.GetBufferCache(), op.flags, m_native_tier_draw,
 	                                  m_native_tier_valid);
+	const NativeS0Scope native_s0(m_renderer.GetRenderExecutor(), op.flags);
 	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {

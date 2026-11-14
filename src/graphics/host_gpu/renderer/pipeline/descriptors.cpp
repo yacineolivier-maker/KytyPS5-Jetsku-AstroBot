@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/cbRanges.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/nativeLearn.h" // Astro Bot PC (KYTY_NATIVE_MODE=s0)
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
 
@@ -2914,6 +2915,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		const CommitStats::SubScope push_scope(CommitStats::Sub::PushConst);
 		buffer.PushConstants(pipeline.pipeline_layout, push_stages, sizeof(push_data),
 		                     push_data.dwords.data());
+	}
+	// Astro Bot PC (KYTY_NATIVE_MODE=s0, nativeLearn.h): a verify sample's committed push constants.
+	if (m_native_s0 != nullptr && pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
+	    m_native_s0->Capturing()) [[unlikely]] {
+		m_native_s0->CapturePush(push_data.dwords.data(), has_push_data);
 	}
 	if (pipeline_bind_point == vk::PipelineBindPoint::eGraphics) {
 		CommitStats::AddItems(CommitStats::Item::DescWrites, m_descriptor_writes.size());

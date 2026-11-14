@@ -19,6 +19,7 @@
 // Both calls are a single relaxed load of a global flag when capture is off.
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 namespace Loader::GameCapture {
@@ -58,22 +59,28 @@ void NoteNativeMarker(const uint32_t* body, uint32_t body_dw);
 // (the CP has not consumed far enough): no marker, the normal packet stays (counted). The CP's
 // CpOpNativeDraw looks the record up and runs the original packet's handler at the marker's
 // position, with the CP state of that position, so the image is the emulator's own.
-enum class NativeMode : uint8_t { Off, Drop, Splice, N2, N3, N3b };
+enum class NativeMode : uint8_t { Off, Drop, Splice, N2, N3, N3b, S0 };
 extern std::atomic<uint8_t> g_native_mode; // NativeMode, set once the hooks are installed
 [[nodiscard]] inline NativeMode GetNativeMode() {
 	return static_cast<NativeMode>(g_native_mode.load(std::memory_order_relaxed));
 }
 // The CP hands the original packet to its handler at the marker: N1 (splice), N2 and N3, whose
 // emission is still the emulator's own draw path (N3: with the segment resolution windows below).
+// S0 (KYTY_NATIVE_MODE=s0, docs\CONCEPTION-RENDU-NATIF.md stage S0): N2 plus the learning and
+// diagnostics of the standalone native renderer (below); emission is still N1's.
 [[nodiscard]] inline bool NativeSplices() {
 	const auto mode = GetNativeMode();
 	return mode == NativeMode::Splice || mode == NativeMode::N2 || mode == NativeMode::N3 ||
-	       mode == NativeMode::N3b;
+	       mode == NativeMode::N3b || mode == NativeMode::S0;
 }
-// N2 and N3: game-thread records, op tags, record verification, resolver timing.
+// N2, N3 and S0: game-thread records, op tags, record verification, resolver timing.
 [[nodiscard]] inline bool NativeRecords() {
 	const auto mode = GetNativeMode();
-	return mode == NativeMode::N2 || mode == NativeMode::N3 || mode == NativeMode::N3b;
+	return mode == NativeMode::N2 || mode == NativeMode::N3 || mode == NativeMode::N3b ||
+	       mode == NativeMode::S0;
+}
+[[nodiscard]] inline bool NativeS0() {
+	return GetNativeMode() == NativeMode::S0;
 }
 // N3b: lean continuations (renderer/renderDraw.cpp, RenderExecutor::NativeLeanPrecheck).
 [[nodiscard]] inline bool NativeLean() {
@@ -147,6 +154,12 @@ struct NativeDraw {
 	uint32_t known     = 0; // NativeKnown
 	uint8_t  seg_start = 0; // first draw of a native segment
 	uint8_t  pad0[3] {};
+	// S0, segment length: in the head record (seg_start) the game thread keeps the number of draws
+	// of the segment whose marker was written so far (1 at the head, then +1 per draw); the list
+	// is complete before it is submitted, so the CP reads the final count at the head marker.
+	// seg_closed: a later draw started another segment, or the segment was broken.
+	uint32_t seg_count  = 0;
+	uint32_t seg_closed = 0;
 	uint32_t prim = 0, count = 0, instances = 0, first = 0, vertex_offset = 0;
 	uint32_t ib_count = 0, ib_32 = 0;
 	uint32_t user_gs_known = 0, user_ps_known = 0; // bit per user SGPR re-emitted since the list began
@@ -167,9 +180,16 @@ struct NativeDraw {
 	uint32_t poly_offset[6] {}; // DB_FMT_CNTL, CLAMP, FRONT_SCALE, FRONT_OFFSET, BACK_SCALE, BACK_OFFSET
 	uint32_t vport[6] {};       // XSCALE, XOFFSET, YSCALE, YOFFSET, ZSCALE, ZOFFSET (viewport 0)
 	uint32_t vport_scissor[2] {}, screen_scissor[2] {};
+	// The engine's own copy of the 32 user SGPRs of the geometry stage slot and of the pixel slot
+	// (stage slot + 0x10, after the flush wrote this draw's descriptors into them; 0: no copy).
+	uint32_t sgpr_geom[32] {};
+	uint32_t sgpr_ps[32] {};
 };
 constexpr uint32_t kNativeDrawDw = sizeof(NativeDraw) / 4u;
 static_assert(sizeof(NativeDraw) % 4u == 0);
+constexpr uint32_t kNativeSegCountWord  = offsetof(NativeDraw, seg_count) / 4u;
+constexpr uint32_t kNativeSegClosedWord = offsetof(NativeDraw, seg_closed) / 4u;
+static_assert(offsetof(NativeDraw, seg_count) % 4u == 0);
 
 // The record of a marker, from any CP front (no consumption: the packet lookup consumes).
 // False when the mode is not n2 or the entry was rewritten (counted on a real parse).
@@ -193,9 +213,13 @@ constexpr uint32_t kNativeOpFlag      = 1u << 8u;
 constexpr uint32_t kNativeOpSlotShift = 9u;
 constexpr uint32_t kNativeOpSegStart  = 1u << 13u;
 constexpr uint32_t kNativeOpMask      = 0x3fu << 8u;
+// S0 only: bits 16..31 carry the low 16 bits of the marker serial, so that the executor can find
+// the draw's record (LookupNativeRecordForOp). Other modes leave them 0.
+constexpr uint32_t kNativeOpSerialShift = 16u;
 [[nodiscard]] inline uint32_t NativeOpTag(const uint32_t* body) {
 	return kNativeOpFlag | ((body[0] & kNativeSlotMask) << kNativeOpSlotShift) |
-	       ((body[0] & kNativeSegStartFlag) != 0 ? kNativeOpSegStart : 0u);
+	       ((body[0] & kNativeSegStartFlag) != 0 ? kNativeOpSegStart : 0u) |
+	       (NativeS0() ? (body[1] & 0xffffu) << kNativeOpSerialShift : 0u);
 }
 // How the emulator's draw run (KYTY_DRAW_RUN) treated a resolved native draw.
 enum NativeRun : uint32_t {
@@ -278,6 +302,67 @@ struct NativeN3Draw {
 };
 // Resolver: a native draw op ran under the windows from `start_tsc` to `end_tsc`.
 void NoteNativeN3(uint32_t op_flags, uint64_t start_tsc, uint64_t end_tsc, const NativeN3Draw& draw);
+
+// ---- KYTY_NATIVE_MODE=s0 (stage S0, docs\CONCEPTION-RENDU-NATIF.md) ------------------------------
+//
+// S0 = N2 (emission is still the emulator's N1 path) plus what a standalone native emitter needs to
+// learn, and the proof that it could rebuild each draw from the record alone:
+//  - segment length: the head record holds the segment's draw count (NativeDraw::seg_count); the CP
+//    reads it at the head marker and checks it against the markers it then parses;
+//  - learning (renderer/nativeLearn.h): right after the pipeline selection of a native draw on the
+//    normal path, a native pipeline table keyed by NativeKey (ES and PS programs, record state hash,
+//    target formats, primitive, specialization signature) keeps the pipeline, both compiled shaders,
+//    mesh info, push-data start and a "resource recipe": for every V#/T#/S# and flat SRT dword, where
+//    it comes from in terms of the draw's inputs (a user-data SGPR, a constant, or one load from a
+//    user-data pointer + immediate offset); a deeper descriptor graph is not native-eligible;
+//  - KYTY_NATIVE_VERIFY=1: 1 native draw in 64 is rebuilt from the record + recipe (V#/T#/S#, flat
+//    SRT, shader-data user dwords, push constants, mesh draw dwords) and compared with what the
+//    normal path committed; the first differences are logged;
+//  - user-data mapping: the record's GS user registers (shadow) and the engine's slot copies are
+//    compared with the user data the emulator's ES/mesh stage actually used.
+// Executor (Thread_Gpu): the record of the draw of a native op (op flags carry slot and serial).
+[[nodiscard]] bool LookupNativeRecordForOp(uint32_t op_flags, NativeDraw& out);
+// Why a native draw is not covered by the native emitter (S0 learning), reported per slot.
+enum NativeS0Reason : uint32_t {
+	kS0Simple,      // every resource dword has a simple recipe
+	kS0Flow,        // simple recipes, but resource sources gated by shader control flow
+	kS0NoRecord,    // the op's record was rewritten or missing
+	kS0WrongDraw,   // the executed draw is not the record's (an earlier pending draw)
+	kS0NoPlan,      // no resource plan for a stage's permutation
+	kS0Tess,        // more than one vertex stage
+	kS0Indirect,    // an indirect (table-selected) descriptor
+	kS0Deep,        // a descriptor dword deeper than one load from a user-data pointer
+	kS0ConstBuffer, // a descriptor dword read through a V# (ReadConstBuffer)
+	kS0TableFull,   // the native pipeline table is full
+	kS0Skipped,     // the op's draw never reached the pipeline selection (no draw, copy, skipped)
+	kS0ReasonCount
+};
+struct NativeS0Draw {
+	uint32_t reason      = kS0NoRecord;
+	bool     found       = false; // NativeKey already learned
+	bool     learned     = false; // inserted by this draw
+	bool     conflict    = false; // found, but a different program pair / layout: the key is too weak
+	bool     replaced    = false; // found, same programs and layout, another pipeline object
+	bool     verified    = false; // KYTY_NATIVE_VERIFY=1 sample rebuilt and compared
+	uint32_t compared    = 0;     // dwords compared
+	uint32_t mismatches  = 0;     // dwords that differ
+	uint32_t nulled      = 0;     // recipe value non-zero, committed value zero (inactive / nulled)
+	uint32_t deep_opcode = 0;     // kS0Deep: the IR opcode that stopped the recipe (+1, 0: none)
+	// User-data mapping (verified samples): the emulator's ES/mesh user data vs the record.
+	uint32_t ud_compared   = 0;  // user dwords compared
+	uint32_t ud_shadow_eq  = 0;  // record shadow (GS user registers) == emulator, known dwords
+	uint32_t ud_shadow_ne  = 0;  // and different
+	uint32_t ud_shadow_unk = 0;  // shadow dword not known
+	uint32_t ud_copy_eq    = 0;  // engine slot copy == emulator
+	uint32_t ud_copy_ne    = 0;
+};
+// Executor: one native draw's S0 outcome (after its draw command, or at an early stop).
+void NoteNativeS0(uint32_t op_flags, const NativeS0Draw& draw);
+// Executor: a verify sample differed (text logged for the first 16, then counted only).
+void NoteNativeS0Mismatch(uint32_t op_flags, const char* text);
+// Executor: the native pipeline table size (distinct NativeKeys, and distinct keys without the
+// specialization signature), for the report.
+void NoteNativeS0Table(uint32_t keys, uint32_t base_keys);
 
 // Guest flips (graphics/presentation/videoOut.cpp), for the per-frame averages.
 extern std::atomic<uint64_t> g_flips;

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/passStats.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/nativeLearn.h" // Astro Bot PC (KYTY_NATIVE_MODE=s0)
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
 
@@ -3923,6 +3924,68 @@ static CommitStats::DrawShape MakeCommitShape(
 	return shape;
 }
 
+// Astro Bot PC (KYTY_NATIVE_MODE=s0, nativeLearn.h): the learning hook, right after the pipeline
+// selection of a draw executed under a native op. The op is consumed by its own draw only (an op may
+// first commit earlier pending draws, which the record check tells apart).
+void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineCache::Pipeline& pipeline,
+                                   const PipelineCache::GraphicsPrograms& programs, bool plain_pixel, bool mesh_active,
+                                   uint32_t vertex_stage_count, bool indexed, uint32_t index_count, uint64_t cp_es_addr) {
+	if (m_native_s0 == nullptr) {
+		m_native_s0 = new NativeLearn::Session; // never freed (one executor)
+	}
+	NativeLearn::DrawView view;
+	view.op_flags           = m_native_s0_op;
+	view.vertex_stage_count = vertex_stage_count;
+	view.mesh_active        = mesh_active;
+	view.plain_pixel        = plain_pixel;
+	view.indexed            = indexed;
+	view.pipeline           = &pipeline;
+	view.mesh               = &state.vertex_info[0].mesh;
+	view.cp_es_addr         = cp_es_addr;
+	view.index_count        = index_count;
+	const auto stage = [&](NativeLearn::StageView& out, const ShaderStageRuntime& runtime, const PipelineCache::StagePrep& prep,
+	                       const PreparedBindings* bindings, uint64_t id) {
+		out.program     = runtime.program;
+		out.snapshot    = runtime.resources;
+		out.plan        = PipelineCache::PermutationResourcePlan(prep);
+		out.spec        = &prep.specialization;
+		out.shader_data = bindings != nullptr ? &bindings->shader_data : nullptr;
+		out.program_id  = id;
+	};
+	stage(view.stages[0], state.vertex_info[0].stage, state.stage_preps.vertex[0], &m_graphics_bindings.vertex[0], programs.vertex[0].id);
+	view.stage_count = 1;
+	if (state.ps_active) {
+		stage(view.stages[1], state.ps_input_info.stage, state.stage_preps.pixel,
+		      m_graphics_bindings.pixel.has_value() ? &*m_graphics_bindings.pixel : nullptr, programs.pixel.id);
+		view.stage_count = 2;
+	}
+	uint64_t formats = 0xcbf29ce484222325ull;
+	const auto mix   = [&](uint64_t v) { formats = (formats ^ v) * 0x100000001b3ull; };
+	mix(state.color_count);
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		mix(static_cast<uint64_t>(state.color_info[i].desc.info.guest_format));
+		mix(state.color_info[i].target_slot);
+	}
+	mix(static_cast<bool>(state.depth_info.image_id) ? 1u : 0u);
+	if (state.depth_info.image_id) mix(static_cast<uint64_t>(state.depth_info.desc.info.guest_format));
+	view.formats_hash = formats;
+	if (m_native_s0->Begin(view)) {
+		m_native_s0_op = 0; // consumed: the op's later executor calls (an MRT split pass) are not its draw
+	}
+}
+
+void RenderExecutor::NativeS0Finish() {
+	m_native_s0->Finish();
+}
+
+void RenderExecutor::NativeS0EndOp(uint32_t op_flags) {
+	if (m_native_s0 == nullptr) {
+		m_native_s0 = new NativeLearn::Session;
+	}
+	m_native_s0->EndOp(op_flags);
+	m_native_s0_op = 0;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -4331,6 +4394,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto& pipeline = *pipeline_object;
 	CommitStats::StepMark(CommitStats::Step::PipelineSel);
 	CommitStats::Mark(CommitStats::Phase::Pipeline);
+	// Astro Bot PC (KYTY_NATIVE_MODE=s0, nativeLearn.h): the learning hook of a native op's draw.
+	if (m_native_s0_op != 0) [[unlikely]] {
+		NativeS0Learn(state, pipeline, *programs, plain_pixel, mesh_active, static_cast<uint32_t>(vertex_stages.size()),
+		              draw.IsIndexed(), draw.index_count, buffer.GetShaders().GetVs().es_regs.data_addr);
+	}
 	if (mesh_indirect) {
 		// The conversion of the argument record into this draw's dispatches and draw dwords:
 		// outside rendering (it ends the active instance, before the targets are acquired for the
@@ -4652,6 +4720,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					    first_group};
 					static_assert(std::size(draw_data) ==
 					              ShaderRecompiler::IR::PushData::MeshDrawDwords(true));
+					if (m_native_s0 != nullptr && m_native_s0->Capturing()) [[unlikely]] {
+						m_native_s0->CaptureMesh(draw_data, mesh_draw_dwords);
+					}
 					vk_buffer.pushConstants(pipeline.pipeline_layout,
 					    vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment,
 					    0, mesh_draw_dwords * sizeof(uint32_t), draw_data);
@@ -4667,6 +4738,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 	draw_cmd_scope.Stop();
+	if (m_native_s0 != nullptr) [[unlikely]] {
+		NativeS0Finish(); // S0: compares a verify sample's captures, reports the draw
+	}
 	CommitStats::StepMark(CommitStats::Step::DrawCmd);
 	static const bool occlusion_draw_rows = [] {
 		const char* value = std::getenv("KYTY_HANG_TRACE_OCCLUSION_DRAWS");
