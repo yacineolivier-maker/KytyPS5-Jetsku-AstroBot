@@ -490,6 +490,7 @@ struct Manager {
 	std::atomic<uint64_t>             failed_lookups {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(BindFallback::Count)> bind {};
 	uint64_t                          imported  = 0; // worker only
+	uint64_t                          reserved_found = 0; // worker only: reserved bytes committed before import
 	uint64_t                          failures  = 0; // worker only
 	double                            import_us = 0; // worker only
 };
@@ -537,6 +538,33 @@ bool ImportChunk(Manager& m, uint32_t index, std::string& error) {
 		return false;
 	}
 	auto* pointer = reinterpret_cast<void*>(m.backing + start);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// B2 fix (device loss of 14/11 10:05): the backing section commits its pages lazily
+	// (GuestBackingStore::EnsureCommitted). A page still reserved when the chunk is imported is not
+	// part of what the driver maps for the GPU; once the guest commits and uses it, a GPU read of
+	// it faults. Every page of the chunk is committed first (pages never touched stay demand-zero;
+	// a later ZeroRange clears committed pages itself), and the reserved bytes found are counted.
+	{
+		uint64_t reserved = 0;
+		for (uint64_t at = 0; at < size;) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(static_cast<uint8_t*>(pointer) + at, &info, sizeof(info)) != sizeof(info)) {
+				error = "VirtualQuery";
+				return false;
+			}
+			const auto region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+			const auto bytes      = std::min(size - at, region_end - (reinterpret_cast<uint64_t>(pointer) + at));
+			if (bytes == 0) break;
+			if (info.State == MEM_RESERVE) reserved += bytes;
+			at += bytes;
+		}
+		m.reserved_found += reserved;
+		if (reserved != 0 && VirtualAlloc(pointer, size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+			error = "commit of the chunk's reserved pages";
+			return false;
+		}
+	}
+#endif
 	VkMemoryHostPointerPropertiesEXT props {};
 	props.sType  = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
 	bool faulted = false;
@@ -625,12 +653,13 @@ void Report(Manager& m) {
 	              "10s: lookups %" PRIu64 " served %" PRIu64 " (%.1f%%), not one guest view %" PRIu64
 	              ", across chunks %" PRIu64 ", chunk pending %" PRIu64 ", chunk failed %" PRIu64
 	              " | chunks imported %" PRIu64 " (%" PRIu64 " MiB of %" PRIu64 " MiB), failures %" PRIu64
-	              ", import %.1f ms",
+	              ", import %.1f ms, reserved pages committed first %" PRIu64 " MiB",
 	              lookups, hits, lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0,
 	              m.unmapped.exchange(0, std::memory_order_relaxed), m.cross.exchange(0, std::memory_order_relaxed),
 	              m.pending.exchange(0, std::memory_order_relaxed),
 	              m.failed_lookups.exchange(0, std::memory_order_relaxed), m.imported,
-	              (m.imported * ChunkSize) >> 20u, m.backing_size >> 20u, m.failures, m.import_us * 1e-3);
+	              (m.imported * ChunkSize) >> 20u, m.backing_size >> 20u, m.failures, m.import_us * 1e-3,
+	              m.reserved_found >> 20u);
 	Log(text);
 }
 
@@ -781,7 +810,7 @@ void Start(GraphicContext& ctx) {
 	m.worker      = std::thread(WorkerLoop);
 	m.ready.store(true, std::memory_order_release);
 	Log(Format("on (%s): backing 0x%016" PRIx64 " size 0x%" PRIx64 ", %u chunks of 64 MiB imported on demand",
-	           CensusEnabled() ? "census of the buffer read bindings" : "no consumer yet", m.backing,
+	           BindEnabled() ? "bind: small read-only buffer bindings read in place" : CensusEnabled() ? "census of the buffer read bindings" : "no consumer yet", m.backing,
 	           m.backing_size, m.chunk_count));
 }
 
