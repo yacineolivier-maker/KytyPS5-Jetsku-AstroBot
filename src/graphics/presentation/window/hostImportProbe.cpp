@@ -650,7 +650,7 @@ bool ImportChunk(Manager& m, uint32_t index, std::string& error) {
 void Report(Manager& m) {
 	const auto lookups = m.lookups.exchange(0, std::memory_order_relaxed);
 	const auto hits    = m.hits.exchange(0, std::memory_order_relaxed);
-	if (lookups == 0 && m.imported == 0) return;
+	if (lookups == 0 && m.imported == 0 && Mode() != 4) return;
 	if (Mode() == 4) {
 		const auto checked = m.race_checked.exchange(0, std::memory_order_relaxed);
 		const auto changed = m.race_changed.exchange(0, std::memory_order_relaxed);
