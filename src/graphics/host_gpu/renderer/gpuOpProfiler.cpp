@@ -2101,6 +2101,47 @@ void OnGuestFlip() {
 			}
 		}
 	}
+	// Astro Bot PC (KYTY_RENDER_END_STATS=1, with KYTY_GPU_OP_COUNTERS=1): every 10 s, the sites that
+	// ended guest rendering instances (each end is a later BeginRendering and a new run), largest
+	// first, as a console line "RenderEnds 10s: ...".
+	static const bool end_stats = [] {
+		const auto* value = std::getenv("KYTY_RENDER_END_STATS");
+		return value != nullptr && value[0] != 0 && std::strcmp(value, "0") != 0;
+	}();
+	if (end_stats) {
+		static auto                                      last_print = std::chrono::steady_clock::now();
+		static std::unordered_map<const Site*, uint64_t> last;
+		static uint64_t                                  flips = 0;
+		flips++;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last_print >= std::chrono::seconds(10)) {
+			last_print = now;
+			std::vector<std::pair<uint64_t, const Site*>> deltas;
+			uint64_t                                      total = 0;
+			const auto note = [&](const Site* site) {
+				const auto ends  = site->end_renderings.load(std::memory_order_relaxed);
+				const auto delta = ends - last[site];
+				last[site]       = ends;
+				if (delta != 0) deltas.emplace_back(delta, site);
+				total += delta;
+			};
+			for (auto* site = g_sites.load(std::memory_order_acquire); site != nullptr;
+			     site       = site->next.load(std::memory_order_relaxed)) {
+				note(site);
+			}
+			note(&g_unknown_site);
+			std::sort(deltas.begin(), deltas.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+			std::string line = fmt::format("RenderEnds 10s: {} ends over {} flips ({:.1f}/flip):", total, flips,
+			                               flips != 0 ? static_cast<double>(total) / static_cast<double>(flips) : 0.0);
+			for (size_t i = 0; i < deltas.size() && i < 16; i++) {
+				line += fmt::format(" {}={:.1f}", deltas[i].second->name,
+				                    flips != 0 ? static_cast<double>(deltas[i].first) / static_cast<double>(flips) : 0.0);
+			}
+			flips = 0;
+			std::printf("%s\n", line.c_str());
+			std::fflush(stdout);
+		}
+	}
 }
 
 void RegisterShader(uint64_t program_id, const char* stage, uint64_t guest_hash) {
