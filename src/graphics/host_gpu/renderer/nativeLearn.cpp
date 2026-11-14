@@ -522,6 +522,14 @@ bool FlowRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	return false;
 }
 
+bool S1FlowTraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_FLOW_TRACE");
+		return value == nullptr || value[0] == 0 || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 // S1c: the plan's active descriptor sources for the user data (MaterializeResources' clean walk).
 // False: a condition read refused. `active` empty: every source is active.
 bool ActiveSources(const IR::ResourcePlan& plan, std::span<const uint32_t> user_data, uint64_t shader_base,
@@ -536,9 +544,24 @@ bool ActiveSources(const IR::ResourcePlan& plan, std::span<const uint32_t> user_
 	     .read_specialization_memory = FlowRead,
 	     .is_guest_mapped = ShaderRecompiler::GetCodegenOptions().srt_variant_reads ? LibKernel::Memory::IsGpuMapped : nullptr,
     };
-	IR::SrtWalker clean(plan, IR::CleanRuntime(runtime));
-	const auto    found = clean.FindActiveSources();
+	if (!S1FlowTraceEnabled()) {
+		IR::SrtWalker clean(plan, IR::CleanRuntime(runtime));
+		const auto    found = clean.FindActiveSources();
+		if (reads.failed) return false;
+		active.assign(found.begin(), found.end());
+		return true;
+	}
+	// S1h (KYTY_NATIVE_S1_FLOW_TRACE, default 1): the walk served by the plan's trace on this thread
+	// (KYTY_SRT_TRACE, SrtWalker.h), as MaterializeResources does: a replay recomputes every
+	// condition from this draw's user data and guest words and stands only when each has the
+	// recorded truth; otherwise the walk continues from scratch. The trace's shape includes
+	// FlowRead: the normal path's traces of the plan are other variants.
+	IR::SrtWalker       clean(plan, IR::CleanRuntime(runtime));
+	IR::SrtWalker       walker(plan, runtime, plan.clean_flat_slots, &clean);
+	IR::SrtTraceSession trace(plan, clean, walker, runtime, true);
+	const auto          found = clean.FindActiveSources();
 	if (reads.failed) return false;
+	trace.Succeeded();
 	active.assign(found.begin(), found.end());
 	return true;
 }
