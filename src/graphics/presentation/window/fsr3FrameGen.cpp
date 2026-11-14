@@ -511,7 +511,22 @@ void PrepareFrame(VkCommandBuffer command) {
 	cfg.presentCallback                    = nullptr;
 	cfg.frameGenerationCallback            = DispatchCallback;
 	cfg.frameGenerationCallbackUserContext = &s.fg_ctx;
-	cfg.frameGenerationEnabled             = true;
+	// Astro Bot PC (14/11, gel au 1er affichage : le fil « AMD FSR Presenter Thread » bloqué dans
+	// NtDxgkSubmitPresentToHwQueue, le fil d'interpolation et videoOut en attente) : la génération
+	// d'images n'est activée qu'après KYTY_FSR3_FG_WARMUP images réelles (défaut 300) ; avant, la
+	// chaîne FSR 3 ne présente que les images du jeu.
+	static const uint64_t warmup = [] {
+		const char* v = std::getenv("KYTY_FSR3_FG_WARMUP");
+		return v != nullptr && v[0] != 0 ? std::strtoull(v, nullptr, 10) : uint64_t {300};
+	}();
+	cfg.frameGenerationEnabled = s.frame_id >= warmup;
+	static bool announced      = false;
+	if (cfg.frameGenerationEnabled && !announced) {
+		announced = true;
+		std::printf("FSR 3 : generation d'images activee apres %llu images reelles (KYTY_FSR3_FG_WARMUP)\n",
+		            static_cast<unsigned long long>(warmup));
+		std::fflush(stdout);
+	}
 	cfg.allowAsyncWorkloads                = false;
 	cfg.HUDLessColor                       = {};
 	cfg.flags = debug ? (FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS)
