@@ -3927,12 +3927,49 @@ static CommitStats::DrawShape MakeCommitShape(
 // Astro Bot PC (KYTY_NATIVE_MODE=s0, nativeLearn.h): the learning hook, right after the pipeline
 // selection of a draw executed under a native op. The op is consumed by its own draw only (an op may
 // first commit earlier pending draws, which the record check tells apart).
+// Astro Bot PC (S0b, nativeLearn.h): DrawRun::StructureKey's register part (the "targets key": every
+// context register, the user-config registers but the index offset and object id), computed the
+// same way, for draws whose engine commit did not bring one.
+static uint64_t NativeTargetsKey(const HW::Context& context, const HW::UserConfig& user_config) {
+	uint64_t hash   = XXH3_64bits_withSeed(&context, sizeof(context), 0x9e3779b97f4a7c15ull);
+	auto     config = user_config;
+	config.SetIndexOffset(0);
+	config.SetObjectId(0);
+	hash = XXH3_64bits_withSeed(&config, sizeof(config), hash);
+	return hash != 0 ? hash : 1;
+}
+
+// S0b: the program-selection register signature of the NativeKey: the targets key, the stage
+// program registers (HW::Shader) and, with a pixel stage, its target export mapping.
+static uint64_t NativeRegsHash(const CommandBuffer& buffer, uint64_t targets_key,
+                               const ShaderPixelInputInfo* pixel) {
+	const auto& vs = buffer.GetShaders().GetVs();
+	const auto& ps = buffer.GetShaders().GetPs().ps_regs;
+	uint64_t    h  = targets_key;
+	const auto  mix = [&](const void* data, size_t size) { h = XXH3_64bits_withSeed(data, size, h); };
+	mix(&vs.es_regs.data_addr, sizeof(vs.es_regs.data_addr));
+	mix(&vs.gs_regs.data_addr, sizeof(vs.gs_regs.data_addr));
+	mix(&vs.gs_regs.rsrc1, sizeof(vs.gs_regs.rsrc1));
+	mix(&vs.gs_regs.rsrc2, sizeof(vs.gs_regs.rsrc2));
+	mix(&vs.ls_regs.data_addr, sizeof(vs.ls_regs.data_addr));
+	mix(&vs.hs_regs.data_addr, sizeof(vs.hs_regs.data_addr));
+	mix(&vs.start_instance_user_sgpr, sizeof(vs.start_instance_user_sgpr));
+	mix(&ps.data_addr, sizeof(ps.data_addr));
+	mix(&ps.rsrc1, sizeof(ps.rsrc1));
+	mix(&ps.rsrc2, sizeof(ps.rsrc2));
+	if (pixel != nullptr) {
+		mix(pixel->target_export_mapping.data(), sizeof(pixel->target_export_mapping));
+	}
+	return h;
+}
+
 void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineCache::Pipeline& pipeline,
                                    const PipelineCache::GraphicsPrograms& programs, bool plain_pixel, bool mesh_active,
-                                   uint32_t vertex_stage_count, bool indexed, uint32_t index_count, uint64_t cp_es_addr) {
+                                   uint32_t vertex_stage_count, bool indexed, uint32_t index_count, const CommandBuffer& buffer) {
 	if (m_native_s0 == nullptr) {
 		m_native_s0 = new NativeLearn::Session; // never freed (one executor)
 	}
+	const uint64_t cp_es_addr = buffer.GetShaders().GetVs().es_regs.data_addr;
 	NativeLearn::DrawView view;
 	view.op_flags           = m_native_s0_op;
 	view.vertex_stage_count = vertex_stage_count;
@@ -3969,6 +4006,35 @@ void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineC
 	mix(static_cast<bool>(state.depth_info.image_id) ? 1u : 0u);
 	if (state.depth_info.image_id) mix(static_cast<uint64_t>(state.depth_info.desc.info.guest_format));
 	view.formats_hash = formats;
+	view.pipeline_generation = m_native_pipeline_generation;
+	// S0b: the register signature and the permutations' identities.
+	const uint64_t targets_key = m_run_targets_key != 0 ? m_run_targets_key
+	                                                    : NativeTargetsKey(buffer.GetRegisters(), buffer.GetUserConfig());
+	view.regs_hash         = NativeRegsHash(buffer, targets_key, state.ps_active ? &state.ps_input_info : nullptr);
+	view.identity[0]       = PipelineCache::NativePermutationIdentity(state.stage_preps.vertex[0]);
+	if (state.ps_active) view.identity[1] = PipelineCache::NativePermutationIdentity(state.stage_preps.pixel);
+	const auto& vs_regs    = buffer.GetShaders().GetVs();
+	view.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
+	view.fetch_embedded    = state.vertex_info[0].fetch_embedded;
+	view.vertex_buffers    = static_cast<uint32_t>(std::max(state.vertex_info[0].buffers_num, 0));
+	view.user_clip_planes  = state.vertex_info[0].user_clip_planes;
+	// S1 verify: the native prediction of this normal-path native draw (a segment head, or a draw
+	// that fell back), compared by Begin with what the normal path prepared.
+	if (Loader::GameCapture::NativeS1() && Loader::GameCapture::NativeVerifyEnabled() && !m_native_s0->S1Armed() &&
+	    !state.ps_active && Loader::GameCapture::NativeS1SlotEnabled(m_native_s0_op)) {
+		NativeLearn::S1Inputs in;
+		in.op_flags          = m_native_s0_op;
+		in.regs_hash         = view.regs_hash;
+		in.formats_hash      = formats;
+		in.index_count       = index_count;
+		in.es_addr           = cp_es_addr;
+		in.user_sgpr         = vs_regs.gs_user_sgpr.value;
+		in.user_sgpr_count   = vs_regs.gs_regs.rsrc2.user_sgpr;
+		in.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
+		if (m_native_s0->PredictS1(in) == Loader::GameCapture::kS1Emitted) {
+			m_native_s0->ArmS1Check();
+		}
+	}
 	if (m_native_s0->Begin(view)) {
 		m_native_s0_op = 0; // consumed: the op's later executor calls (an MRT split pass) are not its draw
 	}
@@ -3984,6 +4050,305 @@ void RenderExecutor::NativeS0EndOp(uint32_t op_flags) {
 	}
 	m_native_s0->EndOp(op_flags);
 	m_native_s0_op = 0;
+}
+
+// ---- Astro Bot PC: KYTY_NATIVE_MODE=s1, native emission of continuations (nativeLearn.h "S1") -----
+//
+// First subset. A native op of an S1 slot (KYTY_NATIVE_S1, default the Shadow thread) that is not
+// a segment head is emitted natively, from DrawIndex right after the render lock, when:
+//  - segment state (NativeS1State::Segment): the previous draw executed was a draw of this native
+//    segment (its slot) that completed (normal path or native), in this command buffer, tick and
+//    rendering instance; nothing else ran on the command processor since (DrawRun::ActivityEpoch,
+//    which needs KYTY_DRAW_RUN on) and no image state changed (ImageStateEpoch);
+//  - every context and user-config register but the index offset and object id equals that draw's
+//    (the DrawRun targets key): the target operations, the register checks, the targets, the
+//    rendering state, the depth state and the dynamic state are that draw's;
+//  - an indexed draw (16/32-bit), no primitive restart, no pixel stage, the record is the draw's;
+//  - NativeLearn::Session::PredictS1 rebuilt the vertex stage (learned, not conflicted, covered
+//    entry: see nativeLearn.h).
+// Emission, in the normal path's order: the stage's bindings through the emulator's own binding
+// functions on the rebuilt snapshot (PrepareBindings, PrepareGraphicsBindings with the targets
+// kept: FindBuffers / BDA preparation / RebindBuffers through the BufferCache, i.e. the cold
+// cache-buffer answers and the hot CPU-dirty copies exactly as the normal path makes them; the
+// mesh index range registered for BDA reads, or the index buffer), a late check (command buffer,
+// tick, rendering instance, image epoch, unregister count: any change falls back to the normal
+// path, which redoes the binding work), then DrawScope, CommitBindings (push descriptors / set,
+// push constants), the index buffer bind, the dynamic state when the bound pipeline is not the
+// shadow's (SetGraphicsDynamicParams with the segment's depth and rendering state),
+// BeginRendering with the segment's rendering state (the same instance continues; pending
+// barriers are sunk or split as on the normal path; a segment whose rendering state has a clear
+// falls back instead when barriers are pending), the pipeline bind (the newest object the normal
+// path selected for the key) and the draw (mesh dispatches split as the normal path splits them,
+// or the indexed draw). Skipped (pure recomputation for such a draw): program preparation and its
+// certificate (Validate), target resolution and acquisition, the pipeline lookup, the barrier
+// safety (false: pending barriers are flushed), the DrawRun bookkeeping and statistics.
+// After it the DrawRun record and kept records are dropped (BeginDrawRun), so the next normal draw
+// resolves its structure in full.
+struct RenderExecutor::NativeS1State {
+	struct Segment {
+		bool              valid   = false;
+		bool              pending = false; // set at the draw command, completed at the end of DrawIndex
+		uint32_t          slot    = 0;
+		vk::CommandBuffer command = nullptr;
+		uint64_t          tick = 0, rendering_serial = 0, activity = 0, image_epoch = 0, draw_counter = 0;
+		uint64_t          targets_key = 0, formats_hash = 0;
+		RenderState       rendering;
+		RenderDepthInfo   depth;
+		uint32_t          color_count    = 0;
+		bool              has_clear      = false;
+		bool              viewport_index = false;
+	};
+	Segment               seg;
+	PreparedBindings      bindings;
+	ShaderStageRuntime    runtime;
+	ShaderVertexInputInfo vs_info;
+};
+
+void RenderExecutor::NativeS1BreakSegment() {
+	if (m_native_s1 != nullptr) {
+		m_native_s1->seg.valid   = false;
+		m_native_s1->seg.pending = false;
+	}
+}
+
+void RenderExecutor::NativeS1SegmentDraw(const CommandBuffer& buffer, const DrawRenderState& state,
+                                         const RenderState& rendering) {
+	namespace GC = Loader::GameCapture;
+	if (m_native_s1 == nullptr) {
+		m_native_s1 = new NativeS1State; // never freed (one executor)
+	}
+	auto& seg            = m_native_s1->seg;
+	seg.valid            = false;
+	seg.pending          = true;
+	seg.slot             = (m_native_s0->ActiveOp() >> GC::kNativeOpSlotShift) & GC::kNativeSlotMask;
+	seg.command          = buffer.Identity();
+	seg.tick             = m_context.GetCommandScheduler().CurrentTick();
+	seg.rendering_serial = buffer.ActiveRenderingSerial();
+	seg.rendering        = rendering;
+	seg.depth            = state.depth_info;
+	seg.color_count      = state.color_count;
+	seg.has_clear        = rendering.depth_stencil_attachment.depth_clear || rendering.depth_stencil_attachment.stencil_clear;
+	for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+		seg.has_clear = seg.has_clear || rendering.color_attachments[i].is_clear;
+	}
+	seg.targets_key  = m_run_targets_key != 0 ? m_run_targets_key : NativeTargetsKey(buffer.GetRegisters(), buffer.GetUserConfig());
+	seg.formats_hash = m_native_s0->ActiveFormats();
+	const auto& outputs = state.vertex_info[0].stage.program->info.outputs;
+	seg.viewport_index  = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+        return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+    });
+}
+
+void RenderExecutor::NativeS1SegmentEnd(const CommandBuffer& buffer, bool valid) {
+	auto& seg = m_native_s1->seg;
+	if (!seg.pending) {
+		return;
+	}
+	seg.pending = false;
+	// The draw's own later work (write barriers, run record) is part of what the next one sees.
+	seg.valid = valid && !buffer.IsInvalid() && buffer.Identity() == seg.command &&
+	            m_context.GetCommandScheduler().CurrentTick() == seg.tick && buffer.ActiveRenderingSerial() != 0;
+	seg.rendering_serial = buffer.ActiveRenderingSerial();
+	seg.activity         = DrawRun::ActivityEpoch();
+	seg.image_epoch      = ImageStateEpoch();
+	seg.draw_counter     = m_native_draw_counter;
+}
+
+bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer, const DrawIndexArgs& args) {
+	namespace GC   = Loader::GameCapture;
+	const auto op  = m_native_s0_op;
+	const auto out = [op](uint32_t reason) {
+		GC::NoteNativeS1(op, {reason});
+		return false;
+	};
+	if (!GC::NativeS1SlotEnabled(op)) return out(GC::kS1Slot);
+	if ((op & GC::kNativeOpSegStart) != 0) return out(GC::kS1SegStart);
+	if (m_native_s0 == nullptr) {
+		m_native_s0 = new NativeLearn::Session;
+	}
+	if (m_native_s1 == nullptr) {
+		m_native_s1 = new NativeS1State;
+	}
+	auto&          st        = *m_native_s1;
+	auto&          seg       = st.seg;
+	auto&          scheduler = m_context.GetCommandScheduler();
+	const uint32_t slot      = (op >> GC::kNativeOpSlotShift) & GC::kNativeSlotMask;
+	if (!DrawRun::Enabled()) return out(GC::kS1Activity);
+	if (!seg.valid || seg.pending || seg.slot != slot) return out(GC::kS1NoSeg);
+	if (seg.draw_counter + 1u != m_native_draw_counter || DrawRun::ActivityEpoch() != seg.activity ||
+	    ImageStateEpoch() != seg.image_epoch) {
+		return out(GC::kS1Activity);
+	}
+	if (buffer.Identity() != seg.command || scheduler.CurrentTick() != seg.tick || buffer.ActiveRenderingSerial() == 0 ||
+	    buffer.ActiveRenderingSerial() != seg.rendering_serial) {
+		return out(GC::kS1Command);
+	}
+	if (args.index_count == 0 || args.instance_count == 0 || args.offset_source != DrawOffsetSource::DrawState ||
+	    args.index_addr == nullptr) {
+		return out(GC::kS1Kind);
+	}
+	DrawIndexBufferSource index_source {};
+	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
+	switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
+		case Prospero::IndexType::kIndex16:
+			index_source.type               = vk::IndexType::eUint16;
+			index_source.guest_element_size = 2;
+			break;
+		case Prospero::IndexType::kIndex32:
+			index_source.type               = vk::IndexType::eUint32;
+			index_source.guest_element_size = 4;
+			break;
+		default: return out(GC::kS1Kind);
+	}
+	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	auto& ucfg = buffer.GetUserConfig();
+	if (!DrawHasValidVertexShader(buffer.GetShaders())) return out(GC::kS1Kind);
+	if (DrawHasActivePixelShader(buffer)) return out(GC::kS1Pixel);
+	const uint64_t targets_key = m_run_targets_key != 0 ? m_run_targets_key : NativeTargetsKey(buffer.GetRegisters(), ucfg);
+	if (targets_key != seg.targets_key) return out(GC::kS1Regs);
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	if (!GetDrawTopology(ucfg, topology)) return out(GC::kS1Kind);
+	// The vertex stage, rebuilt.
+	const auto&          vs_regs = buffer.GetShaders().GetVs();
+	NativeLearn::S1Inputs in;
+	in.op_flags          = op;
+	in.regs_hash         = NativeRegsHash(buffer, targets_key, nullptr);
+	in.formats_hash      = seg.formats_hash;
+	in.index_count       = args.index_count;
+	in.es_addr           = vs_regs.es_regs.data_addr;
+	in.user_sgpr         = vs_regs.gs_user_sgpr.value;
+	in.user_sgpr_count   = vs_regs.gs_regs.rsrc2.user_sgpr;
+	in.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
+	if (const auto reason = m_native_s0->PredictS1(in); reason != GC::kS1Emitted) return out(reason);
+	const auto& pred  = m_native_s0->Prediction();
+	const auto& entry = *pred.entry;
+	if (GC::NativeVerifyEnabled() && m_native_s0->S1Sample()) {
+		m_native_s0->ArmS1Check(); // the normal path's Begin compares the prediction
+		return out(GC::kS1Sample);
+	}
+	const bool mesh = entry.mesh_active;
+	if (mesh != (entry.vs->stage == ShaderType::Mesh) || entry.current == nullptr) return out(GC::kS1Shape);
+	// A pipeline replaced since the normal path last selected the key's (its old handle may be
+	// destroyed): the normal path selects it again.
+	if (entry.current_generation != m_context.GetPipelineCache().PipelineGeneration()) return out(GC::kS1Miss);
+	if (ResolvePrimitiveRestart(buffer, index_source, mesh && MeshRestartEnabled())) return out(GC::kS1Kind);
+	const auto& limits      = m_context.GetGraphics().mesh_shader_properties;
+	uint32_t    mesh_groups = 0;
+	if (mesh) {
+		const auto primitives = entry.mesh.InputPrimitiveCount(args.index_count);
+		if (primitives == 0 || entry.mesh.primitives_per_group == 0) return out(GC::kS1Kind);
+		mesh_groups = (primitives - 1u) / entry.mesh.primitives_per_group + 1u;
+		if (MeshInstancesPerDispatch(MeshGroupsPerDispatch(mesh_groups, entry.mesh, limits), limits) == 0) {
+			return out(GC::kS1Kind);
+		}
+	}
+	if (seg.has_clear && buffer.HasPendingBarriers()) return out(GC::kS1Barriers);
+	const auto& pipeline = *entry.current;
+	// Bindings: the emulator's own binding work on the rebuilt snapshot.
+	st.runtime = {entry.vs, &pred.snapshot};
+	PrepareBindings(st.runtime, st.bindings, nullptr, false);
+	if (mesh) {
+		// The original guest indices, registered for shader reads (synchronized by the BDA
+		// preparation below), as the normal path does for a mesh draw.
+		(void)m_context.GetBufferCache().FindBuffer(index_source.address, index_source.size);
+	}
+	std::array<PreparedBindings*, 1> stages {&st.bindings};
+	PrepareGraphicsBindings(stages, {}, true);
+	PreparedIndexBuffer index_binding;
+	if (!mesh) {
+		index_binding = PrepareIndexBuffer(buffer, index_source);
+	}
+	// Late check: the binding work may submit, end rendering, change images or retire buffers.
+	if (buffer.Identity() != seg.command || scheduler.CurrentTick() != seg.tick ||
+	    buffer.ActiveRenderingSerial() != seg.rendering_serial || ImageStateEpoch() != seg.image_epoch ||
+	    m_context.GetBufferCache().UnregisterEpoch() != m_rebind_epoch ||
+	    (seg.has_clear && buffer.HasPendingBarriers())) {
+		return out(GC::kS1Late);
+	}
+	// Emission.
+	{
+		const CommandBuffer::DrawScope draw_scope(buffer, false);
+		const auto                     vk_buffer = buffer.EmissionSink();
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, false);
+		if (!mesh) CommitIndexBuffer(vk_buffer, index_binding);
+		// The dynamic state is a function of the segment's registers, targets and depth state and
+		// of the vertex program's viewport-index output: kept when the shadow describes it.
+		const bool feedback_ok = !m_context.GetGraphics().attachment_feedback_loop_enabled ||
+		                         (m_dynamic_state.feedback_valid && !m_dynamic_state.feedback);
+		const bool dynamic_kept = DynamicStateShadowEnabled() && m_dynamic_state.valid &&
+		                          m_dynamic_state.command == vk_buffer.Identity() && m_dynamic_state.pipeline != nullptr &&
+		                          buffer.BoundPipeline(vk::PipelineBindPoint::eGraphics) == m_dynamic_state.pipeline &&
+		                          feedback_ok && entry.viewport_index == seg.viewport_index;
+		if (!dynamic_kept) {
+			st.vs_info.stage = st.runtime;
+			SetGraphicsDynamicParams(buffer, vk_buffer, st.vs_info, seg.depth, seg.rendering, m_dynamic_state, nullptr);
+			if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
+				auto& shadow = m_dynamic_state;
+				if (!(DynamicStateShadowEnabled() && shadow.feedback_valid && !shadow.feedback)) {
+					vk_buffer.setAttachmentFeedbackLoopEnableEXT(vk::ImageAspectFlags {});
+					shadow.feedback       = vk::ImageAspectFlags {};
+					shadow.feedback_valid = true;
+					g_dynamic_state_emitted++;
+				}
+			}
+		}
+		scheduler.BeginRendering(seg.rendering);
+		buffer.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		m_dynamic_state.command  = vk_buffer.Identity();
+		m_dynamic_state.pipeline = pipeline.pipeline;
+		if (seg.color_count == 0) {
+			m_dynamic_state.color_write_valid = false;
+		}
+		const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count, args.first_instance};
+		DrawEmitInfo       emit {};
+		// ResolveDrawOffsets without embedded fetch (covered entries have none).
+		emit.vertex_offset  = static_cast<int32_t>(ucfg.GetIndexOffset()) + args.base_vertex;
+		emit.first_instance = 0;
+		if (mesh) {
+			const uint32_t mesh_draw_dwords    = ShaderRecompiler::IR::PushData::MeshDrawDwords(entry.mesh.split_groups != 0);
+			const auto     groups_per_dispatch = MeshGroupsPerDispatch(mesh_groups, entry.mesh, limits);
+			const auto     address             = index_source.address;
+			for (uint32_t first_group = 0; first_group < mesh_groups; first_group += groups_per_dispatch) {
+				const auto groups                 = std::min(groups_per_dispatch, mesh_groups - first_group);
+				const auto instances_per_dispatch = MeshInstancesPerDispatch(groups, limits);
+				for (uint32_t base = 0; base < draw.instance_count; base += instances_per_dispatch) {
+					const uint32_t draw_data[] {args.index_count,
+					                            static_cast<uint32_t>(emit.vertex_offset),
+					                            emit.first_instance + base,
+					                            index_source.guest_element_size,
+					                            static_cast<uint32_t>(address),
+					                            static_cast<uint32_t>(address >> 32u),
+					                            first_group};
+					static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwords(true));
+					vk_buffer.pushConstants(pipeline.pipeline_layout,
+					                        vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment, 0,
+					                        mesh_draw_dwords * sizeof(uint32_t), draw_data);
+					vk_buffer.drawMeshTasksEXT(groups, std::min(instances_per_dispatch, draw.instance_count - base), 1);
+				}
+			}
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		}
+	}
+	ResetBindings();
+	// The DrawRun records no longer describe the command buffer's descriptors and pipeline.
+	BeginDrawRun();
+	m_run_prev_valid = false;
+	m_run_keepable   = false;
+	for (auto& record: m_run_kept) {
+		record.valid = false;
+	}
+	seg.rendering_serial = buffer.ActiveRenderingSerial();
+	seg.activity         = DrawRun::ActivityEpoch();
+	seg.image_epoch      = ImageStateEpoch();
+	seg.draw_counter     = m_native_draw_counter;
+	seg.viewport_index   = entry.viewport_index;
+	seg.valid            = seg.rendering_serial != 0;
+	m_native_s0->NoteS1Emitted(op);
+	m_native_s0_op   = 0;
+	m_native_s1_done = true;
+	GC::NoteNativeS1(op, {GC::kS1Emitted});
+	return true;
 }
 
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
@@ -4356,6 +4721,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		NoteSkipTargets(m_context, state);
 	}
 	const auto* ps_input       = state.ps_active ? &state.ps_input_info : nullptr;
+	// S1 (nativeLearn.h): the pipeline generation before the selection; a pipeline replaced after
+	// it makes the learned object stale for native emission (fast-first handles are destroyed later).
+	m_native_pipeline_generation = m_native_s0_op != 0 ? pipeline_cache.PipelineGeneration() : 0;
 	const auto* planned_pipeline =
 	    plan_stages && plan->pipeline != nullptr
 	        ? DrawPrep::PlannedPipeline(pipeline_cache, *plan, colors_span, state.depth_info,
@@ -4397,7 +4765,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Astro Bot PC (KYTY_NATIVE_MODE=s0, nativeLearn.h): the learning hook of a native op's draw.
 	if (m_native_s0_op != 0) [[unlikely]] {
 		NativeS0Learn(state, pipeline, *programs, plain_pixel, mesh_active, static_cast<uint32_t>(vertex_stages.size()),
-		              draw.IsIndexed(), draw.index_count, buffer.GetShaders().GetVs().es_regs.data_addr);
+		              draw.IsIndexed(), draw.index_count, buffer);
 	}
 	if (mesh_indirect) {
 		// The conversion of the argument record into this draw's dispatches and draw dwords:
@@ -4739,6 +5107,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	draw_cmd_scope.Stop();
 	if (m_native_s0 != nullptr) [[unlikely]] {
+		// S1: the segment state this native op's normal-path draw leaves (its own draw only).
+		if (Loader::GameCapture::NativeS1() && m_native_s0->Active() && indirect == nullptr && !mesh_indirect) {
+			NativeS1SegmentDraw(buffer, state, rendering);
+		}
 		NativeS0Finish(); // S0: compares a verify sample's captures, reports the draw
 	}
 	CommitStats::StepMark(CommitStats::Step::DrawCmd);
@@ -5059,9 +5431,29 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	CommitStats::StepMark(CommitStats::Step::DebugInfo);
 	RenderLockGuard lock(m_context.GetMutex());
 	CommitStats::StepMark(CommitStats::Step::Lock);
+	// Astro Bot PC (KYTY_NATIVE_MODE=s1, nativeLearn.h "S1"): a native op's continuation emitted
+	// natively skips everything below. Any other draw ends the segment state it could rely on.
+	m_native_draw_counter++;
+	m_native_s1_done = false;
+	if (m_native_s0_op != 0 && Loader::GameCapture::NativeS1()) [[unlikely]] {
+		if (NativeS1Emit(submit_id, buffer, args)) {
+			return;
+		}
+	}
 	// KYTY_DRAW_RUN: only a draw that records through the eligible path seeds the next continuation.
 	BeginDrawRun();
 	CommitStats::StepMark(CommitStats::Step::BeginRun);
+	// S1: the segment state of this draw is completed (or dropped) when it returns.
+	struct NativeS1SegmentGuard {
+		RenderExecutor&      ex;
+		const CommandBuffer& buffer;
+		bool                 valid = true;
+		~NativeS1SegmentGuard() {
+			if (ex.m_native_s1 != nullptr) [[unlikely]] {
+				ex.NativeS1SegmentEnd(buffer, valid);
+			}
+		}
+	} native_s1_segment {*this, buffer};
 	// KYTY_NATIVE_MODE=n3b: the per-draw lean state (reset now and at every return).
 	const NativeLeanDrawGuard native_lean(*this);
 	if (args.index_count == 0 || args.instance_count == 0) {
@@ -5194,6 +5586,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	CommitStats::StepMark(CommitStats::Step::ResetBindings);
 	if (const auto split = std::exchange(m_mrt_split_slots, 0u); split != 0u) {
 		// KYTY_MRT_SPLIT: the second pass, with only the slots the first left out.
+		native_s1_segment.valid = false; // S1: not a single draw of the segment's state
 		NoteMrtSplit(split);
 		m_run.valid = false;
 		BeginDrawRun();
@@ -5235,6 +5628,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	CommitStats::StepMark(CommitStats::Step::DebugInfo);
 	RenderLockGuard lock(m_context.GetMutex());
 	CommitStats::StepMark(CommitStats::Step::Lock);
+	m_native_draw_counter++; // S1: another draw ran
+	m_native_s1_done = false;
+	NativeS1BreakSegment();
 	// KYTY_DRAW_RUN: only a draw that records through the eligible path seeds the next continuation.
 	BeginDrawRun();
 	CommitStats::StepMark(CommitStats::Step::BeginRun);
@@ -5420,6 +5816,8 @@ private:
 bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffer,
                                         const DrawIndirectSource& source) {
 	KYTY_PROFILER_FUNCTION();
+	m_native_draw_counter++; // S1: another draw ran
+	NativeS1BreakSegment();
 	EXIT_IF(buffer.IsInvalid() || source.args_addr == 0 || source.max_count == 0);
 	const auto& graphics = m_context.GetGraphics();
 	const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;

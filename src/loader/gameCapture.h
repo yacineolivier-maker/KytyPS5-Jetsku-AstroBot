@@ -59,7 +59,7 @@ void NoteNativeMarker(const uint32_t* body, uint32_t body_dw);
 // (the CP has not consumed far enough): no marker, the normal packet stays (counted). The CP's
 // CpOpNativeDraw looks the record up and runs the original packet's handler at the marker's
 // position, with the CP state of that position, so the image is the emulator's own.
-enum class NativeMode : uint8_t { Off, Drop, Splice, N2, N3, N3b, S0 };
+enum class NativeMode : uint8_t { Off, Drop, Splice, N2, N3, N3b, S0, S1 };
 extern std::atomic<uint8_t> g_native_mode; // NativeMode, set once the hooks are installed
 [[nodiscard]] inline NativeMode GetNativeMode() {
 	return static_cast<NativeMode>(g_native_mode.load(std::memory_order_relaxed));
@@ -71,16 +71,23 @@ extern std::atomic<uint8_t> g_native_mode; // NativeMode, set once the hooks are
 [[nodiscard]] inline bool NativeSplices() {
 	const auto mode = GetNativeMode();
 	return mode == NativeMode::Splice || mode == NativeMode::N2 || mode == NativeMode::N3 ||
-	       mode == NativeMode::N3b || mode == NativeMode::S0;
+	       mode == NativeMode::N3b || mode == NativeMode::S0 || mode == NativeMode::S1;
 }
-// N2, N3 and S0: game-thread records, op tags, record verification, resolver timing.
+// N2, N3, S0 and S1: game-thread records, op tags, record verification, resolver timing.
 [[nodiscard]] inline bool NativeRecords() {
 	const auto mode = GetNativeMode();
 	return mode == NativeMode::N2 || mode == NativeMode::N3 || mode == NativeMode::N3b ||
-	       mode == NativeMode::S0;
+	       mode == NativeMode::S0 || mode == NativeMode::S1;
 }
+// S0 learning (and serial op tags, segment lengths): s0, and s1 which adds native emission.
 [[nodiscard]] inline bool NativeS0() {
-	return GetNativeMode() == NativeMode::S0;
+	const auto mode = GetNativeMode();
+	return mode == NativeMode::S0 || mode == NativeMode::S1;
+}
+// S1 (KYTY_NATIVE_MODE=s1, stage S1, renderer/nativeLearn.h): S0 plus native emission of Shadow
+// continuation draws.
+[[nodiscard]] inline bool NativeS1() {
+	return GetNativeMode() == NativeMode::S1;
 }
 // N3b: lean continuations (renderer/renderDraw.cpp, RenderExecutor::NativeLeanPrecheck).
 [[nodiscard]] inline bool NativeLean() {
@@ -229,6 +236,7 @@ enum NativeRun : uint32_t {
 	kNrTargets,   // new structure, targets kept (KYTY_DRAW_RUN_TARGETS)
 	kNrStarted,   // new structure, resolved in full
 	kNrLean,      // n3b: a continuation committed on the lean path
+	kNrNative,    // s1: emitted natively (renderer/nativeLearn.h), not through the emulator's commit
 	kNrCount
 };
 // Resolver (Thread_Gpu): a native draw op ran from `start_tsc` to `end_tsc`.
@@ -355,6 +363,34 @@ struct NativeS0Draw {
 	uint32_t ud_shadow_unk = 0;  // shadow dword not known
 	uint32_t ud_copy_eq    = 0;  // engine slot copy == emulator
 	uint32_t ud_copy_ne    = 0;
+	// S0b: why a found key's programs differ (NativeS0Conflict; first differing component), and for
+	// a static-state difference the first differing word.
+	uint32_t conflict_cause = 0;
+	uint32_t conflict_word  = 0;
+	// S1 verify (KYTY_NATIVE_VERIFY=1): this normal-path draw also had a native prediction
+	// (sampled continuation or segment head), compared here.
+	bool     s1_checked    = false;
+	uint32_t s1_mismatches = 0;
+};
+// S0b: the first component in which a key conflict's two permutations differ.
+enum NativeS0Conflict : uint32_t {
+	kCfNone,      // no conflict
+	kCfLayout,    // same permutations, another pipeline layout
+	kCfVsHash,    // vertex stage: another source (code hash)
+	kCfVsUdc,     // vertex stage: user-data count
+	kCfVsCode,    // vertex stage: code size
+	kCfVsStatic,  // vertex stage: static state (conflict_word: first differing word)
+	kCfVsPush,    // vertex stage: push-data start
+	kCfVsSpec,    // vertex stage: specialization
+	kCfPsHash,
+	kCfPsUdc,
+	kCfPsCode,
+	kCfPsStatic,
+	kCfPsPush,
+	kCfPsSpec,
+	kCfPlain,     // plain pixel variant
+	kCfOther,     // same identities (a duplicate module?)
+	kCfCount
 };
 // Executor: one native draw's S0 outcome (after its draw command, or at an early stop).
 void NoteNativeS0(uint32_t op_flags, const NativeS0Draw& draw);
@@ -363,6 +399,39 @@ void NoteNativeS0Mismatch(uint32_t op_flags, const char* text);
 // Executor: the native pipeline table size (distinct NativeKeys, and distinct keys without the
 // specialization signature), for the report.
 void NoteNativeS0Table(uint32_t keys, uint32_t base_keys);
+
+// ---- KYTY_NATIVE_MODE=s1 (stage S1, first subset; renderer/nativeLearn.h "S1") ----------------------
+// Why a native op's draw was not emitted natively (kS1Emitted: it was), per slot in "Native 10s".
+enum NativeS1Reason : uint32_t {
+	kS1Emitted,   // emitted natively
+	kS1SegStart,  // the head of a native segment (always the normal path)
+	kS1Slot,      // not a Shadow-thread draw (first subset)
+	kS1NoSeg,     // no segment state: the previous draw of the segment did not complete here
+	kS1Activity,  // something else ran on the command processor, or another draw, since
+	kS1Command,   // command buffer, tick or rendering instance changed, or no rendering instance
+	kS1Regs,      // context / user-config registers differ from the segment's last normal draw
+	kS1Kind,      // not an indexed draw (DrawIndex), 8-bit indices, primitive restart
+	kS1Record,    // no record, or the executed draw is not the record's
+	kS1Pixel,     // a pixel stage is active (first subset: none)
+	kS1Miss,      // NativeKey not learned (or conflicted, table full)
+	kS1Shape,     // learned entry not covered: images/samplers, written buffers, flow, fetch, tess...
+	kS1Read,      // a recipe load refused (guest bytes not clean)
+	kS1Spec,      // specialization rejected a V#
+	kS1Late,      // the binding work changed command buffer / rendering / image state
+	kS1Sample,    // KYTY_NATIVE_VERIFY=1: sampled, normal path, prediction compared
+	kS1Barriers,  // barriers pending and the segment's rendering state has a clear
+	kS1Count
+};
+struct NativeS1Draw {
+	uint32_t reason = kS1Emitted;
+};
+// Executor: one native op's S1 outcome (emitted, or why not).
+void NoteNativeS1(uint32_t op_flags, const NativeS1Draw& draw);
+// Executor: a verify prediction differed (logged; verify mode then stops the emulator).
+void NoteNativeS1Mismatch(uint32_t op_flags, const char* text);
+// Whether S1 emits natively for the op's engine thread slot (KYTY_NATIVE_S1: slot keys or "all";
+// default "shadow", the first subset).
+[[nodiscard]] bool NativeS1SlotEnabled(uint32_t op_flags);
 
 // Guest flips (graphics/presentation/videoOut.cpp), for the per-frame averages.
 extern std::atomic<uint64_t> g_flips;

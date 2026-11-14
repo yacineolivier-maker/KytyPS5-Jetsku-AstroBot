@@ -3308,9 +3308,11 @@ struct NativeResolveTimer {
 
 void CommandProcessor::NoteNativeResolvedOp(uint32_t flags, uint64_t start) {
 	const uint64_t end = __rdtsc();
-	const auto&    ex  = m_renderer.GetRenderExecutor();
+	auto&          ex  = m_renderer.GetRenderExecutor();
 	namespace GC       = Loader::GameCapture;
-	const uint32_t run = ex.m_run_active ? (ex.m_run_recall     ? GC::kNrRecalled
+	// S1: the op's draw was emitted natively (read once: a later op may not reach DrawIndex).
+	const bool     s1  = std::exchange(ex.m_native_s1_done, false);
+	const uint32_t run = s1 ? GC::kNrNative : ex.m_run_active ? (ex.m_run_recall     ? GC::kNrRecalled
 	                                        : ex.m_run_pipeswap ? GC::kNrSwapped
 	                                                            : GC::kNrContinued)
 	                     : ex.m_run_targets_kept ? GC::kNrTargets

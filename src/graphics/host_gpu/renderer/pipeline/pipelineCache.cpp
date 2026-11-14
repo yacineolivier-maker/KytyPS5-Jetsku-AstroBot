@@ -1455,6 +1455,10 @@ struct PipelineCache::Permutation {
 	// Astro Bot PC (KYTY_NATIVE_MODE=s0, renderer/nativeLearn.h): the owning source's sealed
 	// resource plan (immutable, lives as long as the cache), set when the permutation is published.
 	const ShaderRecompiler::IR::ResourcePlan*    plan  = nullptr;
+	// Astro Bot PC (KYTY_NATIVE_MODE=s0, step S0b): the owning source's program key (a node of the
+	// programs map, never moved or erased), set when the permutation is published; read by the
+	// native key diagnosis (NativePermutationIdentity).
+	const void*                                  native_source_key = nullptr;
 };
 
 const ShaderRecompiler::IR::ResourcePlan* PipelineCache::PermutationResourcePlan(const StagePrep& prep) {
@@ -3143,6 +3147,9 @@ struct PipelineCache::ProgramCache {
 		                     : same_specialization            ? "push"
 		                                                      : "spec";
 		compiled->plan          = &source->resource_plan; // Astro Bot PC (KYTY_NATIVE_MODE=s0)
+		if (const auto node = programs.find(key); node != programs.end()) {
+			compiled->native_source_key = &node->first; // Astro Bot PC (S0b), under the lock
+		}
 		const auto& permutation = source->permutations.Append(std::move(*compiled));
 		FinishInFlight(record);
 		lock.unlock();
@@ -3788,6 +3795,24 @@ struct PipelineCache::ProgramCache {
 	// Background spirv-val; null when validation is off or synchronous.
 	std::unique_ptr<SpirvValidator> validator;
 };
+
+// Astro Bot PC (KYTY_NATIVE_MODE=s0, step S0b): the identity of a prepared stage's permutation.
+PipelineCache::NativeProgramIdentity PipelineCache::NativePermutationIdentity(const StagePrep& prep) {
+	NativeProgramIdentity id;
+	const auto* permutation = prep.permutation;
+	if (permutation == nullptr) return id;
+	id.permutation    = permutation;
+	id.specialization = &permutation->specialization;
+	id.push_start     = permutation->program.bindings.push_data_start_dword;
+	if (const auto* key = static_cast<const ProgramCache::ProgramKey*>(permutation->native_source_key)) {
+		id.stage           = static_cast<uint32_t>(key->stage);
+		id.hash            = key->hash;
+		id.user_data_count = key->user_data_count;
+		id.code_size       = key->code_size;
+		id.static_state    = &key->static_state;
+	}
+	return id;
+}
 
 void PipelineCache::ReportRamStats() {
 	if (!Common::RamStats::Enabled()) return;

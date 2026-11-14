@@ -671,6 +671,18 @@ static bool SpecializeBuffer(const BufferResource& buffer, DescriptorValue& desc
 	return true;
 }
 
+bool SpecializeBuffersForNative(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                ResourceSpecialization& specialization) {
+	specialization.images.clear();
+	specialization.buffers.clear();
+	specialization.buffers.reserve(program.info.buffers.size());
+	if (snapshot.buffers.size() != program.info.buffers.size()) return false;
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+		if (!SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
+	}
+	return true;
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization, bool buffers_ready) {
 	if (!buffers_ready) {

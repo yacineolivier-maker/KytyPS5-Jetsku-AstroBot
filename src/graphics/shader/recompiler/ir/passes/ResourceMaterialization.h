@@ -55,6 +55,13 @@ void SetUnmappedBufferProbe(SrtMappedRange probe);
 // V#s specialized as null by that rule so far.
 [[nodiscard]] uint64_t UnmappedBufferNulls();
 
+// Astro Bot PC (KYTY_NATIVE_MODE=s1, renderer/nativeLearn.h): the buffer part of
+// BuildResourceSpecialization for a snapshot whose V# dwords the native emitter rebuilt itself (a
+// null V# is zeroed in the snapshot, as materialization does); `specialization.images` is cleared
+// (the native emitter covers programs without images only). False: a V# the specialization rejects.
+bool SpecializeBuffersForNative(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                ResourceSpecialization& specialization);
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 

@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/renderer/nativeLearn.h"
 
+#include "common/assert.h"
 #include "common/logging/log.h"
 #include "kernel/memory.h"
 
@@ -213,6 +214,104 @@ bool Evaluate(const DwordRecipe& r, const uint32_t* ud, uint32_t& out) {
 	return false;
 }
 
+// S1: one dword from the bound user data (`ud`, `count` dwords after the plan's user SGPR base).
+// False: an index outside the bound user data, or guest bytes not clean for a backing read.
+bool EvaluateBound(const DwordRecipe& r, const uint32_t* ud, uint32_t count, uint32_t& out) {
+	switch (r.kind) {
+		case DwordRecipe::Kind::Const: out = r.value; return true;
+		case DwordRecipe::Kind::User:
+			if (r.value >= count) return false;
+			out = ud[r.value];
+			return true;
+		case DwordRecipe::Kind::Load: {
+			if (r.hi >= count || r.lo >= count) return false;
+			const uint64_t base    = (((static_cast<uint64_t>(ud[r.hi]) << 32u) | ud[r.lo]) & kAddressMask) & ~uint64_t {3};
+			const uint64_t address = base + static_cast<uint64_t>(r.offset);
+			if (IR::NeverMappedAddress(address, sizeof(uint32_t))) {
+				out = 0;
+				return true;
+			}
+			return LibKernel::Memory::TryReadGpuCleanBacking(address, &out, sizeof(out));
+		}
+	}
+	return false;
+}
+
+bool SameDword(const DwordRecipe& a, const DwordRecipe& b) {
+	return a.kind == b.kind && a.lo == b.lo && a.hi == b.hi && a.value == b.value && a.offset == b.offset;
+}
+
+bool SameResources(const std::vector<ResourceRecipe>& a, const std::vector<ResourceRecipe>& b) {
+	if (a.size() != b.size()) return false;
+	for (size_t i = 0; i < a.size(); i++) {
+		if (a[i].dword_count != b[i].dword_count) return false;
+		for (uint32_t k = 0; k < a[i].dword_count; k++) {
+			if (!SameDword(a[i].dwords[k], b[i].dwords[k])) return false;
+		}
+	}
+	return true;
+}
+
+bool SameRecipe(const StageRecipe& a, const StageRecipe& b) {
+	if (!SameResources(a.buffers, b.buffers) || !SameResources(a.images, b.images) || !SameResources(a.samplers, b.samplers) ||
+	    a.flat.size() != b.flat.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < a.flat.size(); i++) {
+		if (a.flat[i].flat_offset != b.flat[i].flat_offset || !SameDword(a.flat[i].recipe, b.flat[i].recipe)) return false;
+	}
+	return true;
+}
+
+// The NativeKey without the specialization signature, from the record and the draw's register
+// signature and resolved target formats.
+uint64_t BaseKey(const GC::NativeDraw& record, uint64_t formats_hash, uint64_t regs_hash) {
+	const bool     es_known = (record.known & GC::kNkPgmEs) != 0;
+	const uint64_t es_id    = es_known ? record.pgm_es : record.code_geom;
+	const uint64_t ps_id    = (record.known & GC::kNkPgmPs) != 0 ? record.pgm_ps : record.code_ps;
+	uint64_t       base     = 0xcbf29ce484222325ull;
+	base                    = Mix(base, es_id);
+	base                    = Mix(base, ps_id);
+	base                    = Mix(base, record.state_hash);
+	base                    = Mix(base, formats_hash);
+	base                    = Mix(base, record.prim);
+	base                    = Mix(base, regs_hash); // S0b
+	return base;
+}
+
+// S1 coverage of a learned entry (stage 0 = the vertex/mesh stage); 0: covered, else the first
+// uncovered property.
+uint32_t S1Shape(const Entry& e, const DrawView& view, const IR::ResourceSnapshot& snapshot) {
+	using Kind = IR::DescriptorBindingKind;
+	if (e.stage_count != 1 || view.vertex_stage_count != 1) return 1; // a pixel stage, or tessellation
+	if (e.reason != GC::kS0Simple) return 2;                          // control flow or deep recipes
+	const auto& program = *e.vs;
+	if (!program.info.images.empty() || !program.info.samplers.empty()) return 3;
+	if (program.has_address_writes || std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
+	                                               [](const auto& b) { return b.written; })) {
+		return 4;
+	}
+	for (const auto& binding: program.bindings.descriptors) {
+		switch (binding.kind) {
+			case Kind::Buffers:
+			case Kind::UniformBuffers:
+			case Kind::BdaPagetable:
+			case Kind::FaultBuffer:
+			case Kind::FlattenedSrt:
+			case Kind::ShaderData: break;
+			default: return 5;
+		}
+	}
+	if (e.plan0 == nullptr || e.plan0->uniform_fill.fill.words != 0 || !e.plan0->control_flow.empty()) return 6;
+	if (view.fetch_embedded || view.vertex_buffers != 0 || view.user_clip_planes != 0) return 7;
+	if (e.prefix_mode > 1 || e.ud_count < e.ud_base) return 8;
+	for (const auto& b: e.recipe[0].buffers) {
+		if (b.dword_count == 0) return 9;
+	}
+	if (snapshot.flattened_srt.size() != e.flat_size) return 10;
+	return 0;
+}
+
 } // namespace
 
 // Append-only open-addressing table (one writer, lock-free readers).
@@ -221,9 +320,20 @@ struct Session::Table {
 	static constexpr uint32_t MaxEntries = 8192;
 	std::array<std::atomic<Entry*>, Slots> slots {};
 	std::array<uint64_t, Slots>            base_keys {}; // writer only
+	std::array<const Entry*, Slots>        base_entries {}; // S1: the first entry of each base key (Thread_Gpu)
 	std::vector<std::unique_ptr<Entry>>    owned;
 	uint32_t                               base_count = 0;
 
+	// S1 (Thread_Gpu, the writer's thread): the first entry learned for a base key.
+	[[nodiscard]] const Entry* FindBase(uint64_t base) const {
+		base = base == 0 ? 1 : base;
+		for (uint32_t p = 0, b = static_cast<uint32_t>(base >> 20u); p < 64; p++) {
+			const auto k = base_keys[(b + p) & (Slots - 1u)];
+			if (k == 0) return nullptr;
+			if (k == base) return base_entries[(b + p) & (Slots - 1u)];
+		}
+		return nullptr;
+	}
 	[[nodiscard]] const Entry* Find(uint64_t key) const {
 		for (uint32_t probe = 0, h = static_cast<uint32_t>(key >> 20u); probe < 64; probe++) {
 			const Entry* e = slots[(h + probe) & (Slots - 1u)].load(std::memory_order_acquire);
@@ -245,7 +355,8 @@ struct Session::Table {
 					auto& k = base_keys[(b + p) & (Slots - 1u)];
 					if (k == base) break;
 					if (k == 0) {
-						k = base;
+						k                                    = base;
+						base_entries[(b + p) & (Slots - 1u)] = entry.get();
 						base_count++;
 						break;
 					}
@@ -361,15 +472,9 @@ bool Session::Begin(const DrawView& view) {
 			return true;
 		}
 	}
-	// NativeKey.
-	const uint64_t es_id = es_known ? m_record.pgm_es : m_record.code_geom;
-	const uint64_t ps_id = (m_record.known & GC::kNkPgmPs) != 0 ? m_record.pgm_ps : m_record.code_ps;
-	uint64_t       base  = 0xcbf29ce484222325ull;
-	base                 = Mix(base, es_id);
-	base                 = Mix(base, ps_id);
-	base                 = Mix(base, m_record.state_hash);
-	base                 = Mix(base, view.formats_hash);
-	base                 = Mix(base, m_record.prim);
+	// NativeKey (S0b: with the register signature).
+	m_formats            = view.formats_hash;
+	const uint64_t base  = BaseKey(m_record, view.formats_hash, view.regs_hash);
 	uint64_t spec        = Mix(0x84222325cbf29ce4ull, view.plain_pixel ? 1u : 0u);
 	for (uint32_t s = 0; s < view.stage_count; s++) {
 		spec = Mix(spec, view.stages[s].spec != nullptr ? SpecHash(*view.stages[s].spec) : 0u);
@@ -388,15 +493,13 @@ bool Session::Begin(const DrawView& view) {
 		                           entry->layout == view.pipeline->pipeline_layout;
 		if (!same_programs) {
 			m_result.conflict = true;
-			static std::atomic<uint32_t> logged {0};
-			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-				GC::NoteNativeS0Mismatch(view.op_flags, fmt::format("NativeKey conflict: key 0x{:x} learned vs 0x{:x}/0x{:x}, now 0x{:x}/0x{:x}", key,
-				                                                    entry->vs_id, entry->ps_id, view.stages[0].program_id,
-				                                                    pixel != nullptr ? pixel->program_id : 0u)
-				                                            .c_str());
+			Conflict(*entry, view);
+		} else {
+			if (entry->vk_pipeline != view.pipeline->pipeline) {
+				m_result.replaced = true; // e.g. a linked or fast-first pipeline swapped for its optimized build
 			}
-		} else if (entry->vk_pipeline != view.pipeline->pipeline) {
-			m_result.replaced = true; // e.g. a linked or fast-first pipeline swapped for its optimized build
+			entry->current            = view.pipeline; // S1 emits with the newest object the normal path chose
+			entry->current_generation = view.pipeline_generation;
 		}
 		m_result.reason      = entry->reason;
 		m_result.deep_opcode = entry->deep_opcode;
@@ -415,6 +518,10 @@ bool Session::Begin(const DrawView& view) {
 		e->ps               = pixel != nullptr ? pixel->program : nullptr;
 		e->ps_id            = pixel != nullptr ? pixel->program_id : 0u;
 		e->mesh_active      = view.mesh_active;
+		e->current          = view.pipeline;
+		e->current_generation = view.pipeline_generation;
+		e->identity         = view.identity;
+		e->plain_pixel      = view.plain_pixel;
 		if (view.mesh != nullptr) e->mesh = *view.mesh;
 		e->stage_count = view.stage_count;
 		uint32_t reason = GC::kS0Simple;
@@ -426,6 +533,26 @@ bool Session::Begin(const DrawView& view) {
 		}
 		e->reason      = reason;
 		e->deep_opcode = opcode;
+		// S1: the stage-0 inputs of a native rebuild, and its coverage.
+		{
+			const auto& vs_snapshot = *view.stages[0].snapshot;
+			e->plan0                = view.stages[0].plan;
+			e->ud_base              = e->plan0->user_data_base;
+			e->ud_count             = static_cast<uint32_t>(vs_snapshot.user_data.size());
+			e->flat_size            = static_cast<uint32_t>(vs_snapshot.flattened_srt.size());
+			bool zero = true;
+			for (uint32_t i = 0; i < e->ud_base && i < e->ud_count; i++) zero = zero && vs_snapshot.user_data[i] == 0;
+			bool front = e->ud_base >= 2 && e->ud_count >= 2 && vs_snapshot.user_data[0] == static_cast<uint32_t>(view.gs_user_data_addr) &&
+			             vs_snapshot.user_data[1] == static_cast<uint32_t>(view.gs_user_data_addr >> 32u);
+			for (uint32_t i = 2; front && i < e->ud_base && i < e->ud_count; i++) front = vs_snapshot.user_data[i] == 0;
+			e->prefix_mode = zero ? 0u : front ? 1u : 2u;
+			const auto& outputs = e->vs->info.outputs;
+			e->viewport_index   = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+                return output.kind == IR::StageOutputKind::ViewportIndex;
+            });
+			e->s1_shape   = S1Shape(*e, view, vs_snapshot);
+			e->s1_covered = e->s1_shape == 0;
+		}
 		m_result.reason      = reason;
 		m_result.deep_opcode = opcode;
 		fresh                = e->recipe;
@@ -437,6 +564,10 @@ bool Session::Begin(const DrawView& view) {
 		}
 		recipes = &fresh;
 		if (m_result.learned) recipes = &m_table->Find(key)->recipe;
+	}
+	// S1 verify: a native prediction made for this op is compared with the normal path's draw.
+	if (m_s1_armed) {
+		CheckS1(view, key, m_table->Find(key));
 	}
 	// Verify sample: 1 eligible draw in 64.
 	const bool eligible = m_result.reason == GC::kS0Simple || m_result.reason == GC::kS0Flow;
@@ -536,6 +667,185 @@ void Session::EndOp(uint32_t op_flags) {
 	m_wrong_seen = false;
 	m_consumed   = false;
 	m_op         = 0;
+	m_s1_armed   = false;
+}
+
+// S0b: why two permutations a key maps to differ (the first differing component).
+void Session::Conflict(const Entry& entry, const DrawView& view) {
+	entry.conflicted = true;
+	uint32_t cause   = GC::kCfOther;
+	uint32_t word    = 0;
+	uint64_t was = 0, now = 0;
+	for (uint32_t s = 0; s < 2 && cause == GC::kCfOther; s++) {
+		const auto& a = entry.identity[s];
+		const auto& b = view.identity[s];
+		if (a.permutation == b.permutation) continue;
+		const uint32_t first = s == 0 ? GC::kCfVsHash : GC::kCfPsHash;
+		if (a.hash != b.hash) {
+			cause = first, was = a.hash, now = b.hash;
+		} else if (a.user_data_count != b.user_data_count) {
+			cause = first + 1u, was = a.user_data_count, now = b.user_data_count;
+		} else if (a.code_size != b.code_size) {
+			cause = first + 2u, was = a.code_size, now = b.code_size;
+		} else if (a.static_state != b.static_state && (a.static_state == nullptr || b.static_state == nullptr ||
+		                                                *a.static_state != *b.static_state)) {
+			cause = first + 3u;
+			if (a.static_state != nullptr && b.static_state != nullptr) {
+				const auto& x = *a.static_state;
+				const auto& y = *b.static_state;
+				const auto  n = std::min(x.size(), y.size());
+				word          = static_cast<uint32_t>(n);
+				for (size_t k = 0; k < n; k++) {
+					if (x[k] != y[k]) {
+						word = static_cast<uint32_t>(k);
+						break;
+					}
+				}
+				was = word < x.size() ? x[word] : 0xffffffffu;
+				now = word < y.size() ? y[word] : 0xffffffffu;
+			}
+		} else if (a.push_start != b.push_start) {
+			cause = first + 4u, was = a.push_start, now = b.push_start;
+		} else if (a.specialization != nullptr && b.specialization != nullptr && !(*a.specialization == *b.specialization)) {
+			cause = first + 5u;
+		}
+	}
+	if (cause == GC::kCfOther && entry.plain_pixel != view.plain_pixel) cause = GC::kCfPlain;
+	if (cause == GC::kCfOther && entry.layout != view.pipeline->pipeline_layout && entry.identity[0].permutation == view.identity[0].permutation &&
+	    entry.identity[1].permutation == view.identity[1].permutation) {
+		cause = GC::kCfLayout;
+	}
+	m_result.conflict_cause = cause;
+	m_result.conflict_word  = word;
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		static constexpr const char* names[GC::kCfCount] = {"none",    "layout",  "vs-hash", "vs-udc",  "vs-code", "vs-static",
+		                                                    "vs-push", "vs-spec", "ps-hash", "ps-udc",  "ps-code", "ps-static",
+		                                                    "ps-push", "ps-spec", "plain",   "other"};
+		GC::NoteNativeS0Mismatch(view.op_flags,
+		                         fmt::format("NativeKey conflict: key 0x{:x} learned 0x{:x}/0x{:x}, now 0x{:x}/0x{:x}: {} word {} 0x{:x} -> 0x{:x}",
+		                                     entry.key, entry.vs_id, entry.ps_id, view.stages[0].program_id,
+		                                     view.stage_count > 1 ? view.stages[1].program_id : 0u, names[cause], word, was, now)
+		                             .c_str());
+	}
+}
+
+uint32_t Session::PredictS1(const S1Inputs& in) {
+	m_s1_op          = in.op_flags;
+	m_s1_armed       = false;
+	m_prediction.entry = nullptr;
+	if (!GC::LookupNativeRecordForOp(in.op_flags, m_record)) {
+		return GC::kS1Record;
+	}
+	if (m_record.count != in.index_count || ((m_record.known & GC::kNkPgmEs) != 0 && m_record.pgm_es != in.es_addr)) {
+		return GC::kS1Record;
+	}
+	const uint64_t base = BaseKey(m_record, in.formats_hash, in.regs_hash);
+	const Entry*   rep  = m_table->FindBase(base);
+	if (rep == nullptr) return GC::kS1Miss;
+	if (!rep->s1_covered) return GC::kS1Shape;
+	if (in.user_sgpr_count + rep->ud_base != rep->ud_count) return GC::kS1Shape;
+	auto& snap = m_prediction.snapshot;
+	snap.user_data.assign(rep->ud_count, 0u);
+	if (rep->prefix_mode == 1u) {
+		snap.user_data[0] = static_cast<uint32_t>(in.gs_user_data_addr);
+		snap.user_data[1] = static_cast<uint32_t>(in.gs_user_data_addr >> 32u);
+	}
+	std::copy_n(in.user_sgpr, in.user_sgpr_count, snap.user_data.begin() + rep->ud_base);
+	const uint32_t* ud     = snap.user_data.data() + rep->ud_base;
+	const uint32_t  ud_n   = in.user_sgpr_count;
+	const auto&     recipe = rep->recipe[0];
+	snap.buffers.resize(recipe.buffers.size());
+	for (size_t i = 0; i < recipe.buffers.size(); i++) {
+		const auto& r = recipe.buffers[i];
+		auto&       v = snap.buffers[i];
+		v             = {};
+		v.dword_count = r.dword_count;
+		for (uint32_t k = 0; k < r.dword_count; k++) {
+			if (!EvaluateBound(r.dwords[k], ud, ud_n, v.dwords[k])) return GC::kS1Read;
+		}
+	}
+	snap.images.clear();
+	snap.samplers.clear();
+	snap.uniform_fill = {};
+	snap.flattened_srt.assign(rep->flat_size, 0u);
+	for (const auto& flat: recipe.flat) {
+		if (flat.flat_offset >= rep->flat_size) return GC::kS1Shape;
+		if (!EvaluateBound(flat.recipe, ud, ud_n, snap.flattened_srt[flat.flat_offset])) return GC::kS1Read;
+	}
+	if (!IR::SpecializeBuffersForNative(*rep->plan0, snap, m_prediction.specialization)) return GC::kS1Spec;
+	uint64_t spec = Mix(0x84222325cbf29ce4ull, 0u); // no pixel stage: no plain variant
+	spec          = Mix(spec, SpecHash(m_prediction.specialization));
+	uint64_t key  = Mix(base, spec);
+	key           = key == 0 ? 1 : key;
+	const Entry* entry = m_table->Find(key);
+	if (entry == nullptr || entry->conflicted) return GC::kS1Miss;
+	if (!entry->s1_covered || entry->plan0 != rep->plan0 || entry->ud_count != rep->ud_count || entry->ud_base != rep->ud_base ||
+	    entry->prefix_mode != rep->prefix_mode || entry->flat_size != rep->flat_size || !SameRecipe(entry->recipe[0], recipe)) {
+		return GC::kS1Shape;
+	}
+	m_prediction.entry = entry;
+	m_prediction.key   = key;
+	return GC::kS1Emitted;
+}
+
+void Session::NoteS1Emitted(uint32_t op_flags) {
+	m_result         = {};
+	m_op             = op_flags;
+	m_result.found   = true;
+	m_result.reason  = m_prediction.entry != nullptr ? m_prediction.entry->reason : GC::kS0Simple;
+	Report();
+	m_consumed = true;
+}
+
+// S1 verify: the prediction made for this op against the normal path's preparation of its draw.
+void Session::CheckS1(const DrawView& view, uint64_t key, const Entry* entry) {
+	m_s1_armed = false;
+	if (m_s1_armed_op != view.op_flags) return;
+	const auto& pred = m_prediction;
+	uint32_t    bad  = 0;
+	std::string what;
+	const auto  fail = [&](const std::string& text) {
+        bad++;
+        if (what.size() < 400) what += (what.empty() ? "" : "; ") + text;
+	};
+	if (key != pred.key) fail(fmt::format("key 0x{:x} predicted 0x{:x}", key, pred.key));
+	if (entry != pred.entry) fail("entry");
+	if (view.stage_count != 1) fail(fmt::format("stages {}", view.stage_count));
+	if (pred.entry != nullptr && view.stages[0].program != pred.entry->vs) fail("program");
+	if (pred.entry != nullptr && view.pipeline->pipeline_layout != pred.entry->layout) fail("layout");
+	const auto* s = view.stages[0].snapshot;
+	if (s != nullptr) {
+		if (s->buffers.size() != pred.snapshot.buffers.size()) {
+			fail(fmt::format("buffers {} predicted {}", s->buffers.size(), pred.snapshot.buffers.size()));
+		} else {
+			for (size_t i = 0; i < s->buffers.size(); i++) {
+				const auto& a = s->buffers[i];
+				const auto& b = pred.snapshot.buffers[i];
+				bool        same = a.dword_count == b.dword_count;
+				for (uint32_t k = 0; same && k < a.dword_count && k < 8u; k++) same = a.dwords[k] == b.dwords[k];
+				if (!same) {
+					fail(fmt::format("V# {}: 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} predicted 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}", i, a.dwords[0],
+					                 a.dwords[1], a.dwords[2], a.dwords[3], b.dwords[0], b.dwords[1], b.dwords[2], b.dwords[3]));
+				}
+			}
+		}
+		if (!s->images.empty() || !s->samplers.empty()) fail("images/samplers");
+		if (s->flattened_srt != pred.snapshot.flattened_srt) fail(fmt::format("flat SRT ({} dwords)", s->flattened_srt.size()));
+		if (s->user_data != pred.snapshot.user_data) fail(fmt::format("user data ({} dwords)", s->user_data.size()));
+		if (!(s->uniform_fill == pred.snapshot.uniform_fill)) fail("uniform fill");
+	} else {
+		fail("no snapshot");
+	}
+	if (view.stages[0].spec == nullptr || !(*view.stages[0].spec == pred.specialization)) fail("specialization");
+	m_result.s1_checked    = true;
+	m_result.s1_mismatches = bad;
+	if (bad != 0) {
+		GC::NoteNativeS1Mismatch(view.op_flags, what.c_str());
+		if (GC::NativeVerifyEnabled()) {
+			EXIT("GameNative s1 verify: native prediction differs from the normal path: %s\n", what.c_str());
+		}
+	}
 }
 
 void Session::Report() {

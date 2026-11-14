@@ -124,6 +124,8 @@ struct NativeConfig {
 	bool        n3     = false;    // KYTY_NATIVE_MODE=n3 (stage N3a: N2 + segment resolution windows)
 	bool        n3b    = false;    // KYTY_NATIVE_MODE=n3b (stage N3b: N2 + lean native continuations)
 	bool        s0     = false;    // KYTY_NATIVE_MODE=s0 (stage S0: N2 + native learning, recipes, verify)
+	bool        s1     = false;    // KYTY_NATIVE_MODE=s1 (stage S1: S0 + native emission of continuations)
+	uint32_t    s1_mask = 1u << 2u; // KYTY_NATIVE_S1: engine thread slots S1 emits for (default shadow)
 	bool        verify = false;    // KYTY_NATIVE_VERIFY=1: a splice record miss exits
 };
 
@@ -174,7 +176,15 @@ NativeConfig ParseNative() {
 	}
 	config.n3     = config.mode == "n3";
 	config.n3b    = config.mode == "n3b";
-	config.s0     = config.mode == "s0";
+	config.s1     = config.mode == "s1";
+	config.s0     = config.mode == "s0" || config.s1;
+	if (const char* s1 = std::getenv("KYTY_NATIVE_S1"); s1 != nullptr && s1[0] != '\0') {
+		const auto list = Lower(Trim(s1));
+		config.s1_mask  = 0;
+		for (uint32_t s = 0; s < kEngineThreads; s++) {
+			if (list == "all" || list.find(kEngineThreadKeys[s]) != std::string::npos) config.s1_mask |= 1u << s;
+		}
+	}
 	config.n2     = config.mode == "n2" || config.n3 || config.n3b || config.s0;
 	config.splice = config.mode == "splice" || config.n2;
 	config.valid  = (config.mode == "drop" || config.splice) && config.mask != 0;
@@ -521,7 +531,7 @@ constexpr const char* kNvNames[GameCapture::kNvCount] = {
     "color-ctl", "target-mask", "blend", "poly-offset", "viewport", "scissor", "index-base", "index-type"};
 // Resolver side (Thread_Gpu): native draw ops by draw-run treatment, their TSC cycles, segments
 // (first op start to last op end of a run of ops of one segment) and their draws.
-constexpr const char* kNrNames[GameCapture::kNrCount] = {"cont", "recall", "swap", "targets", "start", "lean"};
+constexpr const char* kNrNames[GameCapture::kNrCount] = {"cont", "recall", "swap", "targets", "start", "lean", "s1-native"};
 // n3b (resolver): why each native draw took the lean or the normal path, and the verify samples.
 constexpr const char* kNlNames[GameCapture::kNlCount] = {"lean", "seg-start", "chain", "off", "regs", "not-cont", "recall",
                                                          "swap", "writes", "shape", "late", "sample", "early"};
@@ -602,6 +612,32 @@ struct S0ResolveLast {
 };
 std::array<S0ResolveLast, kEngineThreads> g_s0_last {}; // reporter only
 std::atomic<uint32_t> g_s0_keys {0}, g_s0_base_keys {0};
+// S0b: key conflicts by cause (NativeS0Conflict) and, for static-state causes, by word (0..63).
+constexpr const char* kS0ConflictNames[GameCapture::kCfCount] = {"none",     "layout",    "vs-hash",  "vs-udc",   "vs-code",  "vs-static",
+                                                                 "vs-push",  "vs-spec",   "ps-hash",  "ps-udc",   "ps-code",  "ps-static",
+                                                                 "ps-push",  "ps-spec",   "plain",    "other"};
+struct S0Conflicts {
+	std::array<std::atomic<uint64_t>, GameCapture::kCfCount> cause {};
+	std::array<std::atomic<uint64_t>, 64>                    vs_word {};
+	std::array<std::atomic<uint64_t>, 64>                    ps_word {};
+};
+std::array<S0Conflicts, kEngineThreads> g_s0_conflicts {};
+std::array<std::array<uint64_t, GameCapture::kCfCount>, kEngineThreads> g_s0_conflicts_last {};
+// S1 (executor): native emission outcomes per slot.
+constexpr const char* kS1ReasonNames[GameCapture::kS1Count] = {"emitted", "seg-start", "slot",  "no-seg", "activity", "command",
+                                                               "regs",    "kind",      "record", "pixel", "miss",     "shape",
+                                                               "read",    "spec",      "late",  "sample", "barriers"};
+struct S1Resolve {
+	std::array<std::atomic<uint64_t>, GameCapture::kS1Count> reasons {};
+	std::atomic<uint64_t>                                    checked {0}, mismatched {0};
+};
+std::array<S1Resolve, kEngineThreads> g_s1 {};
+struct S1ResolveLast {
+	std::array<uint64_t, GameCapture::kS1Count> reasons {};
+	uint64_t                                    checked = 0, mismatched = 0;
+};
+std::array<S1ResolveLast, kEngineThreads> g_s1_last {};
+std::atomic<uint32_t> g_s1_logged {0};
 std::atomic<uint32_t> g_s0_logged {0};
 std::atomic<uint32_t> g_s0_seg_logged {0};
 std::array<uint64_t, kEngineThreads + 1> g_n2_rec_ok_last {}, g_n2_rec_miss_last {}, g_n2_verified_last {},
@@ -1628,6 +1664,48 @@ std::string S0SlotReport(uint32_t s) {
 	out += fmt::format(" | segment length (CP, head records): heads {} draws/segment {:.1f} (len 1:{} 2-4:{} 5-16:{} 17-64:{} 65+:{}) marker check ok {} bad {} open {} orphan {}",
 	                   seg[0], seg[0] == 0 ? 0.0 : static_cast<double>(seg[1]) / static_cast<double>(seg[0]), hist[0], hist[1], hist[2], hist[3],
 	                   hist[4], seg[2], seg[3], seg[4], seg[5]);
+	// S0b: the key conflicts' causes (first differing component of the two permutations).
+	{
+		auto&       c    = g_s0_conflicts[s];
+		auto&       cl   = g_s0_conflicts_last[s];
+		std::string text;
+		for (uint32_t k = 1; k < GameCapture::kCfCount; k++) {
+			const auto now = c.cause[k].load(std::memory_order_relaxed);
+			const auto d   = now - cl[k];
+			cl[k]          = now;
+			if (d != 0) text += fmt::format(" {} {}", kS0ConflictNames[k], d);
+		}
+		std::string words;
+		for (uint32_t w = 0; w < 64; w++) {
+			const auto v = c.vs_word[w].load(std::memory_order_relaxed);
+			const auto p = c.ps_word[w].load(std::memory_order_relaxed);
+			if (v != 0) words += fmt::format(" vs{}x{}", w, v);
+			if (p != 0) words += fmt::format(" ps{}x{}", w, p);
+		}
+		out += fmt::format(" | s0b conflict causes:{}{}", text.empty() ? " none" : text,
+		                   words.empty() ? "" : " (static words, cumulative:" + words + ")");
+	}
+	if (Native().s1) {
+		auto&                                     r    = g_s1[s];
+		auto&                                     last = g_s1_last[s];
+		std::array<uint64_t, GameCapture::kS1Count> n {};
+		uint64_t                                  all  = 0;
+		for (uint32_t k = 0; k < GameCapture::kS1Count; k++) {
+			n[k] = take(r.reasons[k], last.reasons[k]);
+			all += n[k];
+		}
+		const auto checked    = take(r.checked, last.checked);
+		const auto mismatched = take(r.mismatched, last.mismatched);
+		out += fmt::format(" | s1: {} {} native-emitted {} ({:.1f}%) fallback:", ((Native().s1_mask >> s) & 1u) != 0 ? "on" : "off", all,
+		                   n[GameCapture::kS1Emitted],
+		                   all == 0 ? 0.0 : 100.0 * static_cast<double>(n[GameCapture::kS1Emitted]) / static_cast<double>(all));
+		for (uint32_t k = 1; k < GameCapture::kS1Count; k++) {
+			if (n[k] != 0) out += fmt::format(" {} {}", kS1ReasonNames[k], n[k]);
+		}
+		out += fmt::format(" | s1 verify: predictions checked {} mismatched {}{}", checked, mismatched,
+		                   Native().verify ? "" : " (off: KYTY_NATIVE_VERIFY=1)");
+		out += " | s1 HOT copies: through the emulator's BufferCache (ObtainBuffer) in this subset, not counted separately";
+	}
 	return out;
 }
 
@@ -2053,13 +2131,14 @@ void OnInstalled() {
 		}
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "GameNative: KYTY_NATIVE {} | mode {}{}{} | threads:{}{}{}\n",
-		    !native.valid ? "ignored" : !ok ? "inactive (capture hooks not installed)" : native.n3 ? "active (stage N3a)" : native.n3b ? "active (stage N3b)" : native.s0 ? "active (stage S0)" : native.n2 ? "active (stage N2)" : native.splice ? "active (stage N1)" : "active (stage N0)",
-		    native.mode, native.mode == "drop" || native.splice ? "" : " (unsupported: drop, splice, n2, n3, n3b or s0)",
+		    !native.valid ? "ignored" : !ok ? "inactive (capture hooks not installed)" : native.n3 ? "active (stage N3a)" : native.n3b ? "active (stage N3b)" : native.s1 ? "active (stage S1)" : native.s0 ? "active (stage S0)" : native.n2 ? "active (stage N2)" : native.splice ? "active (stage N1)" : "active (stage N0)",
+		    native.mode, native.mode == "drop" || native.splice ? "" :  " (unsupported: drop, splice, n2, n3, n3b, s0 or s1)",
 		    native.splice ? fmt::format(" (ring {} entries{})", kNativeRingSize, native.verify ? ", verify" : "") : std::string {},
 		    threads.empty() ? " none" : threads, native.unknown.empty() ? "" : " | unknown:", native.unknown));
 		if (native.valid && ok) {
 			GameCapture::g_native_mode.store(static_cast<uint8_t>(native.n3       ? GameCapture::NativeMode::N3
 			                                                      : native.n3b    ? GameCapture::NativeMode::N3b
+			                                                      : native.s1     ? GameCapture::NativeMode::S1
 			                                                      : native.s0     ? GameCapture::NativeMode::S0
 			                                                      : native.n2     ? GameCapture::NativeMode::N2
 			                                                      : native.splice ? GameCapture::NativeMode::Splice
@@ -2457,7 +2536,17 @@ void NoteNativeS0(uint32_t op_flags, const NativeS0Draw& d) {
 	Inc(r.reasons[std::min<uint32_t>(d.reason, kS0ReasonCount - 1u)]);
 	if (d.found) Inc(r.fields[kS0fFound]);
 	if (d.learned) Inc(r.fields[kS0fLearned]);
-	if (d.conflict) Inc(r.fields[kS0fConflict]);
+	if (d.conflict) {
+		Inc(r.fields[kS0fConflict]);
+		auto& c = g_s0_conflicts[slot];
+		Inc(c.cause[std::min<uint32_t>(d.conflict_cause, kCfCount - 1u)]);
+		if (d.conflict_cause == kCfVsStatic) Inc(c.vs_word[std::min<uint32_t>(d.conflict_word, 63u)]);
+		if (d.conflict_cause == kCfPsStatic) Inc(c.ps_word[std::min<uint32_t>(d.conflict_word, 63u)]);
+	}
+	if (d.s1_checked) {
+		Inc(g_s1[slot].checked);
+		if (d.s1_mismatches != 0) Inc(g_s1[slot].mismatched);
+	}
 	if (d.replaced) Inc(r.fields[kS0fReplaced]);
 	if (d.verified) {
 		Inc(r.fields[kS0fVerified]);
@@ -2491,6 +2580,28 @@ void NoteNativeS0Mismatch(uint32_t op_flags, const char* text) {
 		                                      slot < kEngineThreads ? kEngineThreadNames[slot] : "?", op_flags >> kNativeOpSerialShift,
 		                                      text != nullptr ? text : ""));
 	}
+}
+
+void NoteNativeS1(uint32_t op_flags, const NativeS1Draw& d) {
+	const uint32_t slot = (op_flags >> kNativeOpSlotShift) & kNativeSlotMask;
+	if (slot >= kEngineThreads) {
+		return;
+	}
+	Inc(g_s1[slot].reasons[std::min<uint32_t>(d.reason, kS1Count - 1u)]);
+}
+
+void NoteNativeS1Mismatch(uint32_t op_flags, const char* text) {
+	const uint32_t slot = (op_flags >> kNativeOpSlotShift) & kNativeSlotMask;
+	if (g_s1_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		Log::WriteToConsoleAndLog(fmt::format("GameNative s1 verify: \"{}\" serial(lo16) {}: {}\n",
+		                                      slot < kEngineThreads ? kEngineThreadNames[slot] : "?", op_flags >> kNativeOpSerialShift,
+		                                      text != nullptr ? text : ""));
+	}
+}
+
+bool NativeS1SlotEnabled(uint32_t op_flags) {
+	const uint32_t slot = (op_flags >> kNativeOpSlotShift) & kNativeSlotMask;
+	return slot < kEngineThreads && ((Native().s1_mask >> slot) & 1u) != 0;
 }
 
 void NoteNativeS0Table(uint32_t keys, uint32_t base_keys) {

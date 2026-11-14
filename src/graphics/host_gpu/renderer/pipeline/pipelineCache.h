@@ -170,6 +170,20 @@ public:
 	// Astro Bot PC (KYTY_NATIVE_MODE=s0): the sealed resource plan of the prepared permutation's
 	// source (descriptor-source graph), or null. Valid for the cache lifetime.
 	[[nodiscard]] static const ShaderRecompiler::IR::ResourcePlan* PermutationResourcePlan(const StagePrep& prep);
+	// Astro Bot PC (KYTY_NATIVE_MODE=s0, step S0b): what identifies the prepared permutation: its
+	// source's program key (stage, code hash, user-data count, code size, static-state words), its
+	// push-data start and specialization. All pointers live as long as the cache; null when absent.
+	struct NativeProgramIdentity {
+		const void*                                         permutation     = nullptr;
+		const ShaderRecompiler::IR::ResourceSpecialization* specialization  = nullptr;
+		const std::vector<uint32_t>*                        static_state    = nullptr;
+		uint64_t                                            hash            = 0;
+		uint32_t                                            stage           = 0;
+		uint32_t                                            user_data_count = 0;
+		uint32_t                                            code_size       = 0;
+		uint32_t                                            push_start      = 0;
+	};
+	[[nodiscard]] static NativeProgramIdentity NativePermutationIdentity(const StagePrep& prep);
 
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,

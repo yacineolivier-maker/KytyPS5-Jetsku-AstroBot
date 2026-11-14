@@ -1115,14 +1115,29 @@ public:
 	// learning hook of the op's own draw (ExecutePreparedDraw). The op's end is reported.
 	uint32_t m_native_s0_op = 0;
 	void     NativeS0EndOp(uint32_t op_flags);
+	// Astro Bot PC (KYTY_NATIVE_MODE=s1, nativeLearn.h "S1"): the last native op's draw was emitted
+	// natively (the command processor's timing class), set by DrawIndex.
+	bool     m_native_s1_done = false;
 
 private:
 	NativeLearn::Session* m_native_s0 = nullptr; // created on the first S0 draw, never freed
 	// S0: the learning hook after the pipeline selection (renderDraw.cpp), and the end of the draw.
 	void NativeS0Learn(const DrawRenderState& state, const PipelineCache::Pipeline& pipeline,
 	                   const PipelineCache::GraphicsPrograms& programs, bool plain_pixel, bool mesh_active,
-	                   uint32_t vertex_stage_count, bool indexed, uint32_t index_count, uint64_t cp_es_addr);
+	                   uint32_t vertex_stage_count, bool indexed, uint32_t index_count, const CommandBuffer& buffer);
 	void NativeS0Finish();
+	// S1 (renderDraw.cpp): native emission of a native op's indexed draw (true: emitted, the normal
+	// path is skipped), the segment state a native op's normal-path draw leaves (at its draw
+	// command, then completed at the end of DrawIndex), and the draw counter that tells whether
+	// another draw ran since.
+	struct NativeS1State;
+	NativeS1State* m_native_s1           = nullptr; // created on the first S1 draw, never freed
+	uint64_t       m_native_draw_counter = 0;
+	uint64_t       m_native_pipeline_generation = 0; // read before a native op's pipeline selection
+	bool           NativeS1Emit(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	void           NativeS1SegmentDraw(const CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering);
+	void           NativeS1SegmentEnd(const CommandBuffer& buffer, bool valid);
+	void           NativeS1BreakSegment();
 	// N3b state (GPU thread, under the render mutex).
 	// The register test that decides the generic checks passed: they were skipped (DrawIndex/DrawAuto).
 	bool     m_native_lean_pre    = false;
