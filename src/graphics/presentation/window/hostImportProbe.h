@@ -50,6 +50,16 @@ namespace Libs::Graphics::HostImport {
 [[nodiscard]] bool CensusEnabled();
 // Any thread. 0: not available now.
 [[nodiscard]] uint64_t Lookup(uint64_t vaddr, uint64_t size);
+// Step B2 (KYTY_HOST_IMPORT=bind): read-only storage-buffer bindings of at most BindMaxBytes()
+// (KYTY_HOST_IMPORT_BIND_MAX, default 65536) that no GPU write or GPU-modified image covers are
+// bound to the imported chunk itself (NativeStorageBuffer): no cache buffer, no upload.
+[[nodiscard]] bool     BindEnabled();
+[[nodiscard]] uint64_t BindMaxBytes();
+// The imported chunk's buffer and the range's offset in it (false: not available now).
+[[nodiscard]] bool LookupBinding(uint64_t vaddr, uint64_t size, VkBuffer* buffer, uint64_t* offset);
+// Bind-mode accounting (GPU thread): served, or the reason it fell back.
+enum class BindFallback : uint8_t { Served, Written, Large, GpuModified, ImageModified, NotImported, Count };
+void NoteBind(BindFallback outcome);
 void Start(GraphicContext& ctx);
 void Stop();
 

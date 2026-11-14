@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/cbRanges.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/nativeLearn.h" // Astro Bot PC (KYTY_NATIVE_MODE=s0)
+#include "graphics/presentation/window/hostImportProbe.h" // Astro Bot PC (KYTY_HOST_IMPORT=bind)
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
 
@@ -239,6 +240,41 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	// (upstream 743fdc699 / 470669c67).
 	const bool sync_images =
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+	// Astro Bot PC (KYTY_HOST_IMPORT=bind, step B2, hostImportProbe.h): a small read-only binding
+	// that no GPU write or GPU-modified image covers reads the guest's memory in place, through the
+	// imported chunk: no cache buffer, no upload, no memo. Its descriptor follows the same alignment
+	// and range rules as below.
+	if (HostImport::BindEnabled()) {
+		using HostImport::BindFallback;
+		auto why = BindFallback::Served;
+		if (resource.written) {
+			why = BindFallback::Written;
+		} else if (size > HostImport::BindMaxBytes()) {
+			why = BindFallback::Large;
+		} else if (context.GetBufferCache().IsRegionGpuModified(address, size)) {
+			why = BindFallback::GpuModified;
+		} else if (sync_images && context.GetTextureCache().IsRegionGpuModified(address, size)) {
+			why = BindFallback::ImageModified;
+		} else {
+			VkBuffer chunk        = VK_NULL_HANDLE;
+			uint64_t chunk_offset = 0;
+			if (HostImport::LookupBinding(address, size, &chunk, &chunk_offset)) {
+				const auto aligned_chunk = Common::AlignDown(chunk_offset, alignment);
+				const auto adjust        = chunk_offset - aligned_chunk;
+				const auto limit         = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+				if (adjust < 256 && size <= limit - adjust) {
+					buffer_offset = static_cast<uint32_t>(adjust);
+					const auto bound =
+					    std::min(size + adjust >= 4u ? Common::AlignDown(size + adjust, uint64_t {4}) : size + adjust,
+					             StorageRangeCap(graphics));
+					HostImport::NoteBind(BindFallback::Served);
+					return {vk::Buffer(chunk), aligned_chunk, bound};
+				}
+			}
+			why = BindFallback::NotImported;
+		}
+		HostImport::NoteBind(why);
+	}
 	const auto lookup_start = BufferLookupStats::Now();
 	auto [buffer, offset] =
 	    narrowed ? context.GetBufferCache().ObtainWrittenBuffer(address, size, *written_ranges, id)

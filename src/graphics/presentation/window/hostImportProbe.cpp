@@ -5,6 +5,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdarg>
 #include <chrono>
@@ -487,6 +488,7 @@ struct Manager {
 	std::atomic<uint64_t>             cross {0};
 	std::atomic<uint64_t>             pending {0};
 	std::atomic<uint64_t>             failed_lookups {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(BindFallback::Count)> bind {};
 	uint64_t                          imported  = 0; // worker only
 	uint64_t                          failures  = 0; // worker only
 	double                            import_us = 0; // worker only
@@ -501,7 +503,8 @@ int64_t Mode() {
 	static const int64_t mode = [] {
 		const auto* value = std::getenv("KYTY_HOST_IMPORT");
 		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) return int64_t {0};
-		return std::strcmp(value, "census") == 0 ? int64_t {2} : int64_t {1};
+		if (std::strcmp(value, "census") == 0) return int64_t {2};
+		return std::strcmp(value, "bind") == 0 ? int64_t {3} : int64_t {1};
 	}();
 	return mode;
 }
@@ -608,6 +611,15 @@ void Report(Manager& m) {
 	const auto lookups = m.lookups.exchange(0, std::memory_order_relaxed);
 	const auto hits    = m.hits.exchange(0, std::memory_order_relaxed);
 	if (lookups == 0 && m.imported == 0) return;
+	if (Mode() == 3) {
+		static constexpr const char* names[] = {"served", "written", "large", "gpu-modified", "image-modified",
+		                                        "not-imported"};
+		std::string line = "10s bind:";
+		for (size_t i = 0; i < m.bind.size(); i++) {
+			line += Format(" %s %" PRIu64, names[i], m.bind[i].exchange(0, std::memory_order_relaxed));
+		}
+		Log(line);
+	}
 	char text[512];
 	std::snprintf(text, sizeof(text),
 	              "10s: lookups %" PRIu64 " served %" PRIu64 " (%.1f%%), not one guest view %" PRIu64
@@ -666,6 +678,35 @@ bool Enabled() {
 
 bool CensusEnabled() {
 	return Mode() == 2;
+}
+
+bool BindEnabled() {
+	return Mode() == 3;
+}
+
+uint64_t BindMaxBytes() {
+	static const uint64_t bytes = [] {
+		const auto* value = std::getenv("KYTY_HOST_IMPORT_BIND_MAX");
+		return value != nullptr && value[0] != 0 ? std::strtoull(value, nullptr, 0) : uint64_t {65536};
+	}();
+	return bytes;
+}
+
+void NoteBind(BindFallback outcome) {
+	GetManager().bind[static_cast<size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool LookupBinding(uint64_t vaddr, uint64_t size, VkBuffer* buffer, uint64_t* offset) {
+	const auto address = Lookup(vaddr, size);
+	if (address == 0) return false;
+	auto&          m = GetManager();
+	uint64_t       backing_offset = 0;
+	// Lookup succeeded: the same translation (mappings do not change on the GPU thread's draw).
+	if (!LibKernel::Memory::GuestToBacking(vaddr, size, &backing_offset)) return false;
+	const auto& chunk = m.chunks[static_cast<uint32_t>(backing_offset >> ChunkBits)];
+	*buffer           = chunk.buffer;
+	*offset           = backing_offset & (ChunkSize - 1);
+	return *buffer != VK_NULL_HANDLE;
 }
 
 uint64_t Lookup(uint64_t vaddr, uint64_t size) {
