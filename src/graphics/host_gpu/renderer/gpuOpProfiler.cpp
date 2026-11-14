@@ -1899,13 +1899,32 @@ void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount) noexcept {
 	}
 }
 
-void CountEndRendering() noexcept {
+std::mutex                              g_unknown_callers_mutex;
+std::unordered_map<uintptr_t, uint64_t> g_unknown_callers;
+std::array<std::atomic<uint64_t>, 12>   g_split_origins {};
+std::array<std::atomic<uint64_t>, 3>    g_split_flags {};
+
+void CountEndRendering(const void* caller) noexcept {
 	g_counters.rendering_ends.fetch_add(1, std::memory_order_relaxed);
 	auto* site = t_site != nullptr ? t_site : &g_unknown_site;
 	site->end_renderings.fetch_add(1, std::memory_order_relaxed);
+	if (t_site == nullptr && caller != nullptr) {
+		std::lock_guard lock(g_unknown_callers_mutex);
+		g_unknown_callers[reinterpret_cast<uintptr_t>(caller)]++;
+	}
 }
 
 } // namespace Detail
+
+void NoteSplitOrigins(uint32_t origins, uint32_t flags) noexcept {
+	if (!Detail::g_active) return;
+	for (uint32_t i = 0; i < Detail::g_split_origins.size(); i++) {
+		if ((origins & (1u << i)) != 0) Detail::g_split_origins[i].fetch_add(1, std::memory_order_relaxed);
+	}
+	for (uint32_t i = 0; i < Detail::g_split_flags.size(); i++) {
+		if ((flags & (1u << i)) != 0) Detail::g_split_flags[i].fetch_add(1, std::memory_order_relaxed);
+	}
+}
 
 bool Enabled() {
 	const auto& config = GetConfig();
@@ -2136,6 +2155,31 @@ void OnGuestFlip() {
 			for (size_t i = 0; i < deltas.size() && i < 16; i++) {
 				line += fmt::format(" {}={:.1f}", deltas[i].second->name,
 				                    flips != 0 ? static_cast<double>(deltas[i].first) / static_cast<double>(flips) : 0.0);
+			}
+			{
+				static constexpr const char* origin_names[] = {"guest", "shader-access", "shader-write", "write-hazard",
+				                                               "indirect", "gds", "image", "upload"};
+				line += " | split origins:";
+				for (size_t i = 0; i < std::size(origin_names); i++) {
+					line += fmt::format(" {}={}", origin_names[i],
+					                    Detail::g_split_origins[i].exchange(0, std::memory_order_relaxed));
+				}
+				line += fmt::format(" (with images {}, buffers {}, uploads {})",
+				                    Detail::g_split_flags[0].exchange(0, std::memory_order_relaxed),
+				                    Detail::g_split_flags[1].exchange(0, std::memory_order_relaxed),
+				                    Detail::g_split_flags[2].exchange(0, std::memory_order_relaxed));
+				std::vector<std::pair<uint64_t, uintptr_t>> callers;
+				{
+					std::lock_guard lock(Detail::g_unknown_callers_mutex);
+					for (const auto& [address, count]: Detail::g_unknown_callers) callers.emplace_back(count, address);
+					Detail::g_unknown_callers.clear();
+				}
+				std::sort(callers.begin(), callers.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+				const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+				line += " | unknown-site callers (module offset):";
+				for (size_t i = 0; i < callers.size() && i < 8; i++) {
+					line += fmt::format(" 0x{:x}={}", callers[i].second - base, callers[i].first);
+				}
 			}
 			flips = 0;
 			std::printf("%s\n", line.c_str());

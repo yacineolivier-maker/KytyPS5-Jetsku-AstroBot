@@ -249,7 +249,9 @@ public:
 	// Begins (or continues) the rendering instance for the draw recorded next. Pending batched
 	// barriers are recorded outside rendering first, unless they can be sunk (see above).
 	void BeginRendering(const RenderState& state) const;
-	void EndRendering() const;
+	// Astro Bot PC: never inlined, so that its return address names the caller
+	// (KYTY_RENDER_END_STATS).
+	__declspec(noinline) void EndRendering() const;
 
 	// Recorder-aware recording (KYTY_CP_RECORDER, commandRecorder.h). A CommandSink has
 	// vk::CommandBuffer's method names; with the recorder off it records natively, exactly as the

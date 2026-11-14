@@ -1004,6 +1004,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		// Attribution of the end (GpuOps.EndRendering.<site>): a pending barrier that could not
 		// be sunk, or different targets/state/occlusion control.
 		if (barrier_split) {
+			GpuOpProfiler::NoteSplitOrigins(m_pending.origins, (m_pending.images.empty() ? 0u : 1u) |
+			                                                       (m_pending.buffers.empty() ? 0u : 2u) |
+			                                                       (m_pending.uploads.empty() ? 0u : 4u));
 			KYTY_GPU_OP_SITE("render.barrier_split");
 			EndRendering();
 		} else if (SameRendering(m_render_state, state)) {
@@ -1110,7 +1113,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	GpuOpProfiler::CountEndRendering();
+	GpuOpProfiler::CountEndRendering(_ReturnAddress());
 	// The occlusion counter may also record a query reduction here (Accumulate): foreign work.
 	++m_internal_recording;
 	m_context.GetOcclusionCounter().End();

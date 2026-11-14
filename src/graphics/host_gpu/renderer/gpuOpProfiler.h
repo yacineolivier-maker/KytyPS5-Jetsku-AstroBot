@@ -186,7 +186,7 @@ enum class BarrierBatchEvent : uint32_t {
 };
 namespace Detail {
 void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount) noexcept;
-void CountEndRendering() noexcept;
+void CountEndRendering(const void* caller) noexcept;
 } // namespace Detail
 inline void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount = 1) noexcept {
 	if (Detail::g_active) [[unlikely]] {
@@ -196,11 +196,16 @@ inline void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount = 1) noex
 // One guest rendering instance ended (CommandBuffer::EndRendering), attributed to the innermost
 // KYTY_GPU_OP_SITE: published as the summary.csv column gpu_rendering_ends, the FrameEvent
 // GpuRenderingEnds and cumulative Tracy plots GpuOps.EndRendering.<site>.
-inline void CountEndRendering() noexcept {
+// caller (Astro Bot PC, KYTY_RENDER_END_STATS): EndRendering's return address, kept for ends
+// without a site (printed as module offsets, resolved with the PDB).
+inline void CountEndRendering(const void* caller = nullptr) noexcept {
 	if (Detail::g_active) [[unlikely]] {
-		Detail::CountEndRendering();
+		Detail::CountEndRendering(caller);
 	}
 }
+// Astro Bot PC (KYTY_RENDER_END_STATS): a render split's pending batch (BarrierOrigin bits; flags:
+// 1 images, 2 buffers, 4 uploads).
+void NoteSplitOrigins(uint32_t origins, uint32_t flags) noexcept;
 
 // Shader/pipeline identity for per-pipeline attribution. Cheap no-ops unless CaptureEnabled().
 void RegisterShader(uint64_t program_id, const char* stage, uint64_t guest_hash);
