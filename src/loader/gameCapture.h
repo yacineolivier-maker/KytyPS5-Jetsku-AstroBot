@@ -422,6 +422,7 @@ enum NativeS1Reason : uint32_t {
 	kS1Barriers,  // barriers pending and the segment's rendering state has a clear
 	kS1Feedback,  // S1b: a texture of the draw is one of the segment's attachments
 	kS1Plain,     // S1b: the pixel stage records mip statistics (the plain variant does not apply)
+	kS1Unsafe,    // S1g (KYTY_NATIVE_S1_SAFE=1): a descriptor or binding the emission would write failed validation
 	kS1Count
 };
 // S1b: why a learned entry is not covered (first uncovered property; diagnostic breakdown of

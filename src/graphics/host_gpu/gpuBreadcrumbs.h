@@ -30,6 +30,9 @@ inline constexpr uint32_t OpSideReadback     = 101;
 inline constexpr uint32_t OpSideReadbackEnd  = 102;
 inline constexpr uint32_t OpUploadDma        = 103;
 inline constexpr uint32_t OpUploadDmaEnd     = 104;
+// Astro Bot PC (KYTY_NATIVE_MODE=s1): a draw emitted by RenderExecutor::NativeS1Emit (renderDraw.cpp),
+// after its DrawIndex checkpoint; arg1 = 0x51000000 | slot << 8 | pixel stage, arg4 = index address.
+inline constexpr uint32_t OpNativeS1Draw     = 105;
 
 // Whether the switch asks for breadcrumbs on a device with these extensions (device creation).
 [[nodiscard]] bool Requested(bool has_amd_buffer_marker, bool has_nv_checkpoints);

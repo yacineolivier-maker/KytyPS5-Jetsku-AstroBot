@@ -159,6 +159,9 @@ public:
 	// Budgeted per frame (KYTY_READBACK_EAGER_FLUSHES, default 8; 0 disables).
 	[[nodiscard]] bool TakeEagerFlushRequest(bool in_rendering);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
+	// Astro Bot PC (KYTY_NATIVE_S1_SAFE): the cache buffer of an id, null when the slot is free (an
+	// unregistered buffer still in its slot has is_deleted set). Read-only, GPU thread.
+	[[nodiscard]] const Buffer* TryGetBuffer(BufferId id) const { return m_slot_buffers.try_get(id); }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,

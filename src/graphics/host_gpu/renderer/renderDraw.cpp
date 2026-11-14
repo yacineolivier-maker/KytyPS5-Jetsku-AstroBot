@@ -21,6 +21,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -52,6 +53,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -63,6 +66,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -4492,7 +4496,201 @@ void RenderExecutor::NativeS1Abandon(CommandBuffer& buffer) {
 	}
 }
 
-bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer, const DrawIndexArgs& args) {
+// ---- S1g: KYTY_NATIVE_S1_SAFE=1 (diagnostic safety net, default off) -------------------------------
+// Before a native emission records anything, every descriptor and binding it is about to write is
+// validated: the pipeline and its layout (the learned entry's), each stage's program (the entry's),
+// buffer descriptors (non-null handle, non-zero range, the cache buffer the lookup named still live
+// and the range inside it), textures (live image, non-null views), samplers, the shader-data /
+// flattened-SRT tables, the mip-statistics counters, the BDA page table (and, for a mesh draw, the
+// index range registered for BDA reads), the vertex buffers and the index buffer. Any failure falls
+// back to the normal path (reason "unsafe", NativeS1Abandon: nothing was recorded) and is counted by
+// cause in "GameNative s1 safe" every 10 s; the first 32 are logged with their stage and index.
+static bool NativeS1SafeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_SAFE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+enum NativeS1SafeReason : uint32_t {
+	kSafeOk,
+	kSafePipeline,    // null pipeline / layout, or a layout other than the learned entry's
+	kSafeProgram,     // a stage's prepared program is not the entry's (or no runtime)
+	kSafeCounts,      // binding vectors do not match the program's resources
+	kSafeBufferNull,  // a buffer descriptor with a null handle or a zero range
+	kSafeBufferDead,  // the cache buffer a binding resolved to was unregistered
+	kSafeBufferRange, // offset + range past the end of the cache buffer
+	kSafeImage,       // a texture's image is not in the texture cache
+	kSafeView,        // a null image view (or mip view)
+	kSafeSampler,     // a null sampler
+	kSafeTable,       // shader data / flattened SRT / mip-statistics buffer missing, or shader data size
+	kSafeBda,         // BDA page table missing, or the mesh index range not registered
+	kSafeVertex,      // a vertex buffer binding with a null handle
+	kSafeIndex,       // no index buffer for an indexed draw
+	kSafeCount
+};
+static constexpr const char* kNativeS1SafeNames[kSafeCount] = {
+    "ok", "pipeline", "program", "counts", "buffer-null", "buffer-dead", "buffer-range",
+    "image", "view", "sampler", "table", "bda", "vertex", "index"};
+
+struct NativeS1SafeTotals {
+	uint64_t                              checks = 0;
+	std::array<uint64_t, kSafeCount>      fails {};
+	std::chrono::steady_clock::time_point since {};
+	uint32_t                              logged = 0;
+};
+
+// GPU thread only (under the render lock): plain counters.
+static NativeS1SafeTotals& NativeS1Safe() {
+	static NativeS1SafeTotals totals;
+	return totals;
+}
+
+static void NativeS1SafeReport(NativeS1SafeTotals& t) {
+	const auto now = std::chrono::steady_clock::now();
+	if (t.since == std::chrono::steady_clock::time_point {}) {
+		t.since = now;
+		return;
+	}
+	const double elapsed = std::chrono::duration<double>(now - t.since).count();
+	if (elapsed < 10.0) {
+		return;
+	}
+	uint64_t    failed = 0;
+	std::string causes;
+	for (uint32_t k = 1; k < kSafeCount; k++) {
+		failed += t.fails[k];
+		if (t.fails[k] != 0) causes += fmt::format(" {} {}", kNativeS1SafeNames[k], t.fails[k]);
+	}
+	std::printf("GameNative s1 safe (%.1f s, KYTY_NATIVE_S1_SAFE=1): %" PRIu64 " emissions checked, %" PRIu64
+	            " passed, %" PRIu64 " fell back:%s\n",
+	            elapsed, t.checks, t.checks - failed, failed, causes.empty() ? " none" : causes.c_str());
+	std::fflush(stdout);
+	t.checks = 0;
+	t.fails  = {};
+	t.since  = now;
+}
+
+struct NativeS1SafeDetail {
+	uint32_t stage = 0;
+	uint32_t index = 0;
+	uint64_t value = 0;
+};
+
+static uint32_t NativeS1Validate(RenderContext& context, const PipelineCache::Pipeline& pipeline,
+                                 const NativeLearn::Entry& entry, std::span<PreparedBindings* const> stages, bool mesh,
+                                 const PreparedVertexBuffers& vertex, const PreparedIndexBuffer& index,
+                                 const DrawIndexBufferSource& index_source, NativeS1SafeDetail& detail) {
+	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+	if (pipeline.pipeline == nullptr || pipeline.pipeline_layout == nullptr ||
+	    (entry.layout != nullptr && entry.layout != pipeline.pipeline_layout)) {
+		return kSafePipeline;
+	}
+	auto&      cache          = context.GetBufferCache();
+	auto&      textures       = context.GetTextureCache();
+	const auto valid_view     = [](const vk::DescriptorBufferInfo& view) { return view.buffer != nullptr && view.range != 0; };
+	bool       has_descriptor = false;
+	bool       uses_dma       = false;
+	for (uint32_t s = 0; s < stages.size(); s++) {
+		detail.stage         = s;
+		const auto* prepared = stages[s];
+		const auto* expected = s == 0 ? entry.vs : entry.ps;
+		if (prepared == nullptr || prepared->runtime == nullptr || prepared->runtime->program == nullptr ||
+		    prepared->runtime->program != expected || prepared->runtime->resources == nullptr) {
+			return kSafeProgram;
+		}
+		const auto& program = *prepared->runtime->program;
+		uses_dma |= program.info.uses_dma;
+		has_descriptor |= !program.bindings.descriptors.empty();
+		if (prepared->buffers.size() != program.info.buffers.size() ||
+		    prepared->buffer_sources.size() != program.info.buffers.size() ||
+		    prepared->images.size() != program.info.images.size() ||
+		    prepared->samplers.size() != program.info.samplers.size()) {
+			return kSafeCounts;
+		}
+		if (prepared->shader_data.size() != program.bindings.ShaderDataDwords()) {
+			return kSafeTable;
+		}
+		for (uint32_t i = 0; i < prepared->buffers.size(); i++) {
+			detail.index     = i;
+			const auto& view = prepared->buffers[i];
+			const auto& src  = prepared->buffer_sources[i];
+			detail.value     = src.address;
+			if (!valid_view(view)) return kSafeBufferNull;
+			if (src.address == 0 || src.size == 0) continue; // the null buffer (NativeStorageBuffer)
+			// The cache buffer the lookup named: when the descriptor is that buffer, it must be live
+			// and the range inside it (a merged or stream answer has another handle).
+			if (const auto* named = cache.TryGetBuffer(src.id); named != nullptr && named->Handle() == view.buffer) {
+				if (named->is_deleted) return kSafeBufferDead;
+				if (view.range != VK_WHOLE_SIZE && (view.offset > named->Size() || view.range > named->Size() - view.offset)) {
+					detail.value = view.offset + view.range;
+					return kSafeBufferRange;
+				}
+			}
+		}
+		for (uint32_t i = 0; i < prepared->images.size(); i++) {
+			detail.index        = i;
+			const auto& binding = prepared->images[i];
+			if (!binding.image_id || textures.TryGetImage(binding.image_id) == nullptr) return kSafeImage;
+			if (binding.mip_views.empty() ? binding.image_view == nullptr
+			                              : std::any_of(binding.mip_views.begin(), binding.mip_views.end(),
+			                                            [](vk::ImageView v) { return v == nullptr; })) {
+				return kSafeView;
+			}
+		}
+		for (uint32_t i = 0; i < prepared->samplers.size(); i++) {
+			detail.index = i;
+			if (prepared->samplers[i] == nullptr) return kSafeSampler;
+		}
+		for (const auto& binding: program.bindings.descriptors) {
+			detail.index = static_cast<uint32_t>(binding.kind);
+			switch (binding.kind) {
+				case Kind::FlattenedSrt:
+					if (!valid_view(prepared->flattened_srt)) return kSafeTable;
+					break;
+				case Kind::ShaderData:
+					if (!valid_view(prepared->shader_data_buffer)) return kSafeTable;
+					break;
+				case Kind::MipStats: {
+					auto& lod = context.GetLodStats();
+					if ((prepared->mip_stats_canary ? lod.CanaryBuffer() : lod.CounterBuffer()).Handle() == nullptr) return kSafeTable;
+					break;
+				}
+				case Kind::BdaPagetable: {
+					const auto* table = cache.GetBdaPageTableBuffer();
+					if (table == nullptr || table->Handle() == nullptr) return kSafeBda;
+					break;
+				}
+				case Kind::FaultBuffer: {
+					const auto* fault = cache.GetFaultBuffer();
+					if (fault == nullptr || fault->Handle() == nullptr) return kSafeBda;
+					break;
+				}
+				default: break;
+			}
+		}
+	}
+	detail.stage = 0;
+	detail.index = 0;
+	if (has_descriptor && pipeline.descriptor_set_layout == nullptr) return kSafePipeline;
+	detail.value = index_source.address;
+	if (mesh) {
+		// The mesh program reads the guest indices by address: their pages must be registered.
+		if (uses_dma && index_source.size != 0 && !cache.IsRegionRegistered(index_source.address, index_source.size)) {
+			return kSafeBda;
+		}
+	} else {
+		for (uint32_t i = 0; i < vertex.count; i++) {
+			detail.index = i;
+			if (vertex.buffers[i] == nullptr) return kSafeVertex;
+		}
+		if (index.buffer == nullptr) return kSafeIndex;
+	}
+	return kSafeOk;
+}
+
+bool RenderExecutor::NativeS1Emit(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args) {
 	namespace GC  = Loader::GameCapture;
 	namespace NP  = NativeLearn::Prof;
 	const auto op = m_native_s0_op;
@@ -4717,14 +4915,52 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	    (seg.has_clear && buffer.HasPendingBarriers())) {
 		return abandon(GC::kS1Late);
 	}
+	// S1g (KYTY_NATIVE_S1_SAFE=1): every descriptor and binding the emission writes, validated before
+	// anything is recorded; a failure falls back (reason "unsafe", counted by cause).
+	if (NativeS1SafeEnabled()) [[unlikely]] {
+		auto&              safe = NativeS1Safe();
+		NativeS1SafeDetail detail;
+		const auto         safe_reason = NativeS1Validate(m_context, pipeline, entry, stages, mesh, vertex_bindings,
+		                                                  index_binding, index_source, detail);
+		safe.checks++;
+		if (safe_reason != kSafeOk) {
+			safe.fails[safe_reason]++;
+			if (safe.logged < 32) {
+				safe.logged++;
+				std::printf("GameNative s1 safe: fallback %s (slot %u%s, %s, stage %u index %u value 0x%016" PRIx64
+				            ", count %u)\n",
+				            kNativeS1SafeNames[safe_reason], slot, pixel ? ", pixel" : "", mesh ? "mesh" : "indexed",
+				            detail.stage, detail.index, detail.value, args.index_count);
+				std::fflush(stdout);
+			}
+		}
+		NativeS1SafeReport(safe);
+		if (safe_reason != kSafeOk) return abandon(GC::kS1Unsafe);
+	}
 	mark(NP::kEVertex);
 	bool dynamic_recorded = false; // S1e: the emission recorded dynamic state (KYTY_NATIVE_S1_KEEP_RUN)
-	// Emission.
-	{
+	// S1g: the native draw's own checkpoint (NV checkpoints with KYTY_DEVICE_FAULT_DIAGNOSTICS=1,
+	// VK_AMD_buffer_marker breadcrumbs with KYTY_GPU_BREADCRUMBS): after a device loss the dump shows
+	// "op=NativeS1Draw" for a natively emitted draw (DrawIndex alone: a normal-path draw). Recorded
+	// only when one of them is on; with NV checkpoints it is recorded through Handle(), which records
+	// pending barriers first (no pending barrier with a clearing rendering state: checked above).
+	buffer.SetDebugInfo(GpuBreadcrumbs::OpNativeS1Draw, submit_id, args.index_count,
+	                    0x51000000u | (slot << 8u) | (pixel ? 1u : 0u), 1, args.instance_count, index_source.address);
+	bool clear_split = false; // S1g: CommitBindings queued barriers under a clearing rendering state
+	// Emission (S1g: a do-while(false) block, left early by clear_split).
+	do {
 		const CommandBuffer::DrawScope draw_scope(buffer, false);
 		const auto                     vk_buffer = buffer.EmissionSink();
 		if (!mesh) CommitVertexBuffers(vk_buffer, vertex_bindings); // S1c (count 0 without fetch)
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, false);
+		// S1g: CommitBindings' texture transitions are queued barriers. BeginRendering cannot sink them
+		// past this draw (DrawScope not safe): it would end the instance and begin the segment's
+		// rendering state again, whose clear load ops would erase what the instance drew. Only state
+		// commands were recorded (their shadows are invalidated by NativeS1Abandon): fall back.
+		if (seg.has_clear && buffer.HasPendingBarriers()) {
+			clear_split = true;
+			break;
+		}
 		if (!mesh) CommitIndexBuffer(vk_buffer, index_binding);
 		// The dynamic state is a function of the segment's registers, targets and depth state and
 		// of the vertex program's viewport-index output: kept when the shadow describes it.
@@ -4734,7 +4970,12 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		const bool dynamic_kept = !relaxed && DynamicStateShadowEnabled() && m_dynamic_state.valid &&
 		                          m_dynamic_state.command == vk_buffer.Identity() && m_dynamic_state.pipeline != nullptr &&
 		                          buffer.BoundPipeline(vk::PipelineBindPoint::eGraphics) == m_dynamic_state.pipeline &&
-		                          feedback_ok && entry.viewport_index == seg.viewport_index;
+		                          feedback_ok && entry.viewport_index == seg.viewport_index &&
+		                          // S1g: and the pipeline about to be bound is the bound one, as the normal
+		                          // path keeps a continuation's dynamic state only without a pipeline swap
+		                          // (!m_run_pipeswap); otherwise it is recorded again (the shadow emits only
+		                          // what differs).
+		                          m_dynamic_state.pipeline == pipeline.pipeline;
 		dynamic_recorded = !dynamic_kept;
 		if (!dynamic_kept) {
 			st.vs_info.stage = st.runtime;
@@ -4806,7 +5047,8 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 				ShaderWriteBarrier(buffer, shader_write_stages);
 			}
 		}
-	}
+	} while (false);
+	if (clear_split) return abandon(GC::kS1Barriers); // S1g
 	ResetBindings();
 	mark(NP::kECommit);
 	if (NativeS1KeepRun()) {

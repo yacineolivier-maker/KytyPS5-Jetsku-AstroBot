@@ -47,6 +47,7 @@ const char* OpName(uint32_t op) {
 		case GpuBreadcrumbs::OpSideReadbackEnd: return "SideReadbackEnd";
 		case GpuBreadcrumbs::OpUploadDma: return "UploadDma";
 		case GpuBreadcrumbs::OpUploadDmaEnd: return "UploadDmaEnd";
+		case GpuBreadcrumbs::OpNativeS1Draw: return "NativeS1Draw";
 		default: return "Unknown";
 	}
 }

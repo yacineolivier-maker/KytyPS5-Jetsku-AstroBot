@@ -627,7 +627,7 @@ std::array<std::array<uint64_t, GameCapture::kCfCount>, kEngineThreads> g_s0_con
 constexpr const char* kS1ReasonNames[GameCapture::kS1Count] = {"emitted", "seg-start", "slot",  "no-seg", "activity", "command",
                                                                "regs",    "kind",      "record", "pixel", "miss",     "shape",
                                                                "read",    "spec",      "late",  "sample", "barriers",
-                                                               "feedback", "plain"};
+                                                               "feedback", "plain",    "unsafe"};
 // S1b: kS1Shape broken down by first uncovered property, per stage (vertex/mesh, pixel).
 constexpr const char* kS1ShapeNames[GameCapture::kShCount] = {"covered", "tess",    "flow",     "deep",     "writes",   "binding",
                                                               "uniform", "fetch",   "clip",     "prefix",   "indirect", "flat",
