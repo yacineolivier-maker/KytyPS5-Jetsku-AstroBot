@@ -256,6 +256,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 			uint64_t    size;
 			uint64_t    hash;
 			bool        dirty;
+			bool        stable;
 		};
 		struct RaceBatch {
 			std::mutex            mutex;
@@ -265,8 +266,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		static uint64_t                   batch_tick = 0;
 		const void*                       bytes      = nullptr;
 		uint64_t                          hash       = 0;
+		auto&                             race_scheduler = context.GetCommandScheduler();
+		const bool race_dirty  = context.GetBufferCache().IsRegionCpuModified(address, size);
+		const bool race_stable = HostImport::NoteRange(address, size, race_dirty, race_scheduler.CurrentTick());
 		if (HostImport::RaceSample(address, size, &bytes, &hash)) {
-			auto&      scheduler = context.GetCommandScheduler();
+			auto&      scheduler = race_scheduler;
 			const auto tick      = scheduler.CurrentTick();
 			if (batch == nullptr || batch_tick != tick) {
 				batch      = std::make_shared<RaceBatch>();
@@ -275,13 +279,12 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 					std::lock_guard lock(pending->mutex);
 					for (const auto& item: pending->items) {
 						HostImport::RaceNote(HostImport::RaceHash(item.bytes, item.size) != item.hash, item.dirty,
-						                     item.size);
+						                     item.stable, item.size);
 					}
 				});
 			}
-			const bool dirty = context.GetBufferCache().IsRegionCpuModified(address, size);
 			std::lock_guard lock(batch->mutex);
-			batch->items.push_back({bytes, size, hash, dirty});
+			batch->items.push_back({bytes, size, hash, race_dirty, race_stable});
 		}
 	}
 	if (HostImport::BindEnabled()) {
@@ -295,8 +298,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 			why = BindFallback::GpuModified;
 		} else if (sync_images && context.GetTextureCache().IsRegionGpuModified(address, size)) {
 			why = BindFallback::ImageModified;
-		} else if (context.GetBufferCache().IsRegionCpuModified(address, size)) {
-			why = BindFallback::CpuModified;
+		} else if (const bool dirty = context.GetBufferCache().IsRegionCpuModified(address, size);
+		           !HostImport::NoteRange(address, size, dirty, context.GetCommandScheduler().CurrentTick())) {
+			why = dirty ? BindFallback::CpuModified : BindFallback::Unstable;
 		} else {
 			VkBuffer chunk        = VK_NULL_HANDLE;
 			uint64_t chunk_offset = 0;

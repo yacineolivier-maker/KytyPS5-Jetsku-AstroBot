@@ -61,7 +61,11 @@ namespace Libs::Graphics::HostImport {
 // CpuModified (B2 fix, device losses of 14/11 during loading): a range the guest CPU wrote since its
 // last synchronization is likely rewritten again before the host GPU reads it (end-of-pipe labels
 // are written at record time, KYTY_LABEL_MODE=record): it keeps the copy.
-enum class BindFallback : uint8_t { Served, Written, Large, GpuModified, ImageModified, NotImported, CpuModified, Count };
+enum class BindFallback : uint8_t { Served, Written, Large, GpuModified, ImageModified, NotImported, CpuModified, Unstable, Count };
+// Stability (KYTY_HOST_IMPORT_STABLE_TICKS, default 1000 submission ticks): a range is stable when no
+// page of it was seen CPU-modified at a binding during the last that many ticks. NoteRange records
+// the binding's observation (cpu_dirty) and answers whether the range is stable (GPU thread).
+[[nodiscard]] bool NoteRange(uint64_t vaddr, uint64_t size, bool cpu_dirty, uint64_t tick);
 void NoteBind(BindFallback outcome);
 // KYTY_HOST_IMPORT=race (diagnostic, no GPU read of imported memory): one in 16 bindings that bind
 // mode would serve has its guest bytes hashed at bind time (submission tick `tick`); once that tick
@@ -75,7 +79,7 @@ void               RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick, bool
 // not sampled); RaceNote counts one check.
 [[nodiscard]] bool RaceSample(uint64_t vaddr, uint64_t size, const void** bytes, uint64_t* hash);
 [[nodiscard]] uint64_t RaceHash(const void* bytes, uint64_t size);
-void                   RaceNote(bool changed, bool cpu_dirty, uint64_t size);
+void                   RaceNote(bool changed, bool cpu_dirty, bool stable, uint64_t size);
 // The oldest recorded tick still to check (0: none); RaceCheckFront rehashes that entry.
 [[nodiscard]] uint64_t RaceFrontTick();
 void                   RaceCheckFront();

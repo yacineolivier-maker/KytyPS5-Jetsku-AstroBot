@@ -502,6 +502,8 @@ struct Manager {
 	uint64_t                          race_calls = 0, race_recorded = 0, race_dropped = 0;
 	std::atomic<uint64_t>             race_checked {0}, race_changed {0}, race_changed_bytes {0};
 	std::atomic<uint64_t>             race_checked_clean {0}, race_changed_clean {0};
+	std::atomic<uint64_t>             race_checked_stable {0}, race_changed_stable {0};
+	std::unique_ptr<uint32_t[]>       last_dirty; // per 4 KiB backing page: low 32 bits of the tick + 1 (0: never)
 	uint64_t                          imported  = 0; // worker only
 	uint64_t                          reserved_found = 0; // worker only: reserved bytes committed before import
 	uint64_t                          failures  = 0; // worker only
@@ -665,10 +667,13 @@ void Report(Manager& m) {
 		           checked != 0 ? 100.0 * static_cast<double>(changed) / static_cast<double>(checked) : 0.0,
 		           m.race_changed_bytes.exchange(0, std::memory_order_relaxed) >> 10u, checked_clean, changed_clean,
 		           checked - checked_clean, changed - changed_clean));
+		Log(Format("10s race stable: checked %" PRIu64 " changed %" PRIu64,
+		           m.race_checked_stable.exchange(0, std::memory_order_relaxed),
+		           m.race_changed_stable.exchange(0, std::memory_order_relaxed)));
 	}
 	if (Mode() == 3) {
 		static constexpr const char* names[] = {"served", "written", "large", "gpu-modified", "image-modified",
-		                                        "not-imported", "cpu-modified"};
+		                                        "not-imported", "cpu-modified", "unstable"};
 		std::string line = "10s bind:";
 		for (size_t i = 0; i < m.bind.size(); i++) {
 			line += Format(" %s %" PRIu64, names[i], m.bind[i].exchange(0, std::memory_order_relaxed));
@@ -779,8 +784,40 @@ uint64_t RaceHash(const void* bytes, uint64_t size) {
 	return XXH3_64bits(bytes, static_cast<size_t>(size));
 }
 
-void RaceNote(bool changed, bool cpu_dirty, uint64_t size) {
+bool NoteRange(uint64_t vaddr, uint64_t size, bool cpu_dirty, uint64_t tick) {
 	auto& m = GetManager();
+	static const uint64_t window = [] {
+		const auto* value = std::getenv("KYTY_HOST_IMPORT_STABLE_TICKS");
+		return value != nullptr && value[0] != 0 ? std::strtoull(value, nullptr, 0) : uint64_t {1000};
+	}();
+	if (m.last_dirty == nullptr || size == 0) return false;
+	uint64_t offset = 0;
+	if (!LibKernel::Memory::GuestToBacking(vaddr, size, &offset) || offset >= m.backing_size ||
+	    m.backing_size - offset < size) {
+		return false;
+	}
+	const auto first = offset >> 12u;
+	const auto last  = (offset + size - 1) >> 12u;
+	const auto now   = static_cast<uint32_t>(tick) + 1u;
+	bool       stable = !cpu_dirty;
+	for (auto page = first; page <= last; page++) {
+		auto& seen = m.last_dirty[page];
+		if (cpu_dirty) {
+			seen = now;
+		} else if (seen == 0 || static_cast<uint32_t>(now - seen) <= window) {
+			// Never observed (a first binding is CPU-dirty in the tracker anyway) or written recently.
+			stable = false;
+		}
+	}
+	return stable;
+}
+
+void RaceNote(bool changed, bool cpu_dirty, bool stable, uint64_t size) {
+	auto& m = GetManager();
+	if (stable) {
+		m.race_checked_stable.fetch_add(1, std::memory_order_relaxed);
+		if (changed) m.race_changed_stable.fetch_add(1, std::memory_order_relaxed);
+	}
 	m.race_checked.fetch_add(1, std::memory_order_relaxed);
 	if (!cpu_dirty) m.race_checked_clean.fetch_add(1, std::memory_order_relaxed);
 	if (changed) {
@@ -903,6 +940,7 @@ void Start(GraphicContext& ctx) {
 	}
 	m.chunk_count = static_cast<uint32_t>((m.backing_size + ChunkSize - 1) >> ChunkBits);
 	m.chunks      = std::make_unique<Chunk[]>(m.chunk_count);
+	m.last_dirty  = std::make_unique<uint32_t[]>(static_cast<size_t>(m.backing_size >> 12u));
 	m.stop        = false;
 	m.worker      = std::thread(WorkerLoop);
 	m.ready.store(true, std::memory_order_release);
