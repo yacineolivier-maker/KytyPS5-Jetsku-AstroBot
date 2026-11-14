@@ -60,6 +60,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -244,16 +245,43 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	// that no GPU write or GPU-modified image covers reads the guest's memory in place, through the
 	// imported chunk: no cache buffer, no upload, no memo. Its descriptor follows the same alignment
 	// and range rules as below.
-	if (HostImport::RaceEnabled() && !resource.written && size <= HostImport::BindMaxBytes()) {
-		auto& scheduler = context.GetCommandScheduler();
-		for (auto tick = HostImport::RaceFrontTick(); tick != 0 && scheduler.IsFree(tick);
-		     tick = HostImport::RaceFrontTick()) {
-			HostImport::RaceCheckFront();
-		}
-		if (!context.GetBufferCache().IsRegionGpuModified(address, size) &&
-		    !(sync_images && context.GetTextureCache().IsRegionGpuModified(address, size))) {
-			HostImport::RaceRecord(address, size, scheduler.CurrentTick(),
-			                       context.GetBufferCache().IsRegionCpuModified(address, size));
+	if (HostImport::RaceEnabled() && !resource.written && size <= HostImport::BindMaxBytes() &&
+	    !context.GetBufferCache().IsRegionGpuModified(address, size) &&
+	    !(sync_images && context.GetTextureCache().IsRegionGpuModified(address, size))) {
+		// The sampled bindings of one submission tick are checked by one priority operation, which
+		// the completion runner runs as soon as that tick completes (before the guest can see the
+		// tick's deferred labels; in record mode the guest saw them at record time).
+		struct RaceItem {
+			const void* bytes;
+			uint64_t    size;
+			uint64_t    hash;
+			bool        dirty;
+		};
+		struct RaceBatch {
+			std::mutex            mutex;
+			std::vector<RaceItem> items;
+		};
+		static std::shared_ptr<RaceBatch> batch;
+		static uint64_t                   batch_tick = 0;
+		const void*                       bytes      = nullptr;
+		uint64_t                          hash       = 0;
+		if (HostImport::RaceSample(address, size, &bytes, &hash)) {
+			auto&      scheduler = context.GetCommandScheduler();
+			const auto tick      = scheduler.CurrentTick();
+			if (batch == nullptr || batch_tick != tick) {
+				batch      = std::make_shared<RaceBatch>();
+				batch_tick = tick;
+				scheduler.DeferPriorityOperation([pending = batch] {
+					std::lock_guard lock(pending->mutex);
+					for (const auto& item: pending->items) {
+						HostImport::RaceNote(HostImport::RaceHash(item.bytes, item.size) != item.hash, item.dirty,
+						                     item.size);
+					}
+				});
+			}
+			const bool dirty = context.GetBufferCache().IsRegionCpuModified(address, size);
+			std::lock_guard lock(batch->mutex);
+			batch->items.push_back({bytes, size, hash, dirty});
 		}
 	}
 	if (HostImport::BindEnabled()) {

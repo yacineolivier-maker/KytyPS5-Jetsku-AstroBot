@@ -761,6 +761,35 @@ void RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick, bool cpu_dirty) {
 	m.race_recorded++;
 }
 
+bool RaceSample(uint64_t vaddr, uint64_t size, const void** bytes, uint64_t* hash) {
+	auto& m = GetManager();
+	if (!m.ready.load(std::memory_order_acquire) || (m.race_calls++ & 15u) != 0) return false;
+	uint64_t offset = 0;
+	if (!LibKernel::Memory::GuestToBacking(vaddr, size, &offset) || offset >= m.backing_size ||
+	    m.backing_size - offset < size) {
+		return false;
+	}
+	*bytes = reinterpret_cast<const void*>(m.backing + offset);
+	*hash  = XXH3_64bits(*bytes, static_cast<size_t>(size));
+	m.race_recorded++;
+	return true;
+}
+
+uint64_t RaceHash(const void* bytes, uint64_t size) {
+	return XXH3_64bits(bytes, static_cast<size_t>(size));
+}
+
+void RaceNote(bool changed, bool cpu_dirty, uint64_t size) {
+	auto& m = GetManager();
+	m.race_checked.fetch_add(1, std::memory_order_relaxed);
+	if (!cpu_dirty) m.race_checked_clean.fetch_add(1, std::memory_order_relaxed);
+	if (changed) {
+		if (!cpu_dirty) m.race_changed_clean.fetch_add(1, std::memory_order_relaxed);
+		m.race_changed.fetch_add(1, std::memory_order_relaxed);
+		m.race_changed_bytes.fetch_add(size, std::memory_order_relaxed);
+	}
+}
+
 uint64_t RaceFrontTick() {
 	auto& m = GetManager();
 	return m.race.empty() ? 0 : m.race.front().tick;

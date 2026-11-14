@@ -70,6 +70,12 @@ void NoteBind(BindFallback outcome);
 [[nodiscard]] bool RaceEnabled();
 // cpu_dirty: the range was CPU-modified at bind time (counted apart).
 void               RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick, bool cpu_dirty);
+// Precise variant (the check runs on the completion runner the moment the tick completes, before
+// the guest can see that tick's deferred labels): RaceSample hashes one in 16 calls' bytes (false:
+// not sampled); RaceNote counts one check.
+[[nodiscard]] bool RaceSample(uint64_t vaddr, uint64_t size, const void** bytes, uint64_t* hash);
+[[nodiscard]] uint64_t RaceHash(const void* bytes, uint64_t size);
+void                   RaceNote(bool changed, bool cpu_dirty, uint64_t size);
 // The oldest recorded tick still to check (0: none); RaceCheckFront rehashes that entry.
 [[nodiscard]] uint64_t RaceFrontTick();
 void                   RaceCheckFront();
