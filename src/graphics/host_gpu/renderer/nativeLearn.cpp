@@ -2,6 +2,7 @@
 // (nativeLearn.h).
 
 #include "graphics/host_gpu/renderer/nativeLearn.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include "common/assert.h"
@@ -1243,6 +1244,8 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 	bool tried_rep = model == rep;
 	bool found     = false;
 	for (uint32_t pass = 0; pass < 3 && !found; pass++) {
+		// S1f: wanted here; BuildS1 drops it when a rebuilt pixel T# has a mip-statistics counter (the
+		// normal path then runs the instrumented program, whose entry is another key of the base).
 		plain = in.pixel && in.lod_plain == 1u && model->plain_available;
 		if (const auto reason = BuildS1(*model, in, base, plain, key); reason != GC::kS1Emitted) return reason;
 		Prof::Marker key_mark;
@@ -1289,7 +1292,7 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 
 // S1e: PredictS1's rebuild of the stages and the embedded fetch with `model`'s stages (user data,
 // active sources, recipes through the load groups, specialization, fetch), and the full key.
-uint32_t Session::BuildS1(const Entry& model, const S1Inputs& in, uint64_t base, bool plain, uint64_t& key) {
+uint32_t Session::BuildS1(const Entry& model, const S1Inputs& in, uint64_t base, bool& plain, uint64_t& key) {
 	Prof::Marker mark;
 	const auto   shape = [&](uint32_t code, uint32_t stage) {
         m_s1_shape       = code;
@@ -1298,7 +1301,8 @@ uint32_t Session::BuildS1(const Entry& model, const S1Inputs& in, uint64_t base,
         return GC::kS1Shape;
 	};
 	const uint32_t stages = model.stage_count;
-	uint64_t       spec   = Mix(0x84222325cbf29ce4ull, plain ? 1u : 0u);
+	// S1f: the stages' specialization hashes, mixed after the plain choice (decided by the pixel T#s).
+	std::array<uint64_t, 2> spec_hash {};
 	for (uint32_t s = 0; s < stages; s++) {
 		const auto&     st     = model.s1[s];
 		const uint32_t* sgpr   = s == 0 ? in.user_sgpr : in.ps_user_sgpr;
@@ -1375,9 +1379,17 @@ uint32_t Session::BuildS1(const Entry& model, const S1Inputs& in, uint64_t base,
 			mark(Prof::kPSpec);
 			return GC::kS1Spec;
 		}
-		spec = Mix(spec, SpecHash(m_prediction.specialization[s]));
+		spec_hash[s] = SpecHash(m_prediction.specialization[s]);
+		// S1f: the plain variant is the normal path's choice only while no pixel T# records mip
+		// statistics (RebindBuffers' WriteMipStatsFields on the stage's snapshot, the specialized one).
+		if (s == 1 && plain && model.ps != nullptr && model.ps->bindings.mip_stats_count != 0) {
+			m_s1_mip_scratch.assign(model.ps->bindings.ShaderDataDwords(), 0u);
+			if (WriteMipStatsFields(*model.ps, snap, m_s1_mip_scratch)) plain = false;
+		}
 		mark(Prof::kPSpec);
 	}
+	uint64_t spec = Mix(0x84222325cbf29ce4ull, plain ? 1u : 0u);
+	for (uint32_t s = 0; s < stages; s++) spec = Mix(spec, spec_hash[s]);
 	// S1c: the embedded fetch, rebuilt from the bound SGPRs and the guest tables.
 	m_prediction.fetch      = model.fetch != nullptr;
 	m_prediction.fetch_hash = 0;

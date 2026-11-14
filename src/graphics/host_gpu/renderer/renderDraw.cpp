@@ -4132,8 +4132,12 @@ void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineC
 	}
 	// S1 verify: the native prediction of this normal-path native draw (a segment head, or a draw
 	// that fell back), compared by Begin with what the normal path prepared.
+	// S1f: 1 in 64 such draws, and none whose DrawIndex already predicted (S1e predicted every
+	// normal-path draw here: the "learn" cost of the profile, ~7 us).
+	const bool s1_predicted = std::exchange(m_native_s1_predicted, false);
 	if (Loader::GameCapture::NativeS1() && Loader::GameCapture::NativeVerifyEnabled() && !m_native_s0->S1Armed() &&
-	    (!state.ps_active || NativeS1PixelEnabled()) && Loader::GameCapture::NativeS1SlotEnabled(m_native_s0_op)) {
+	    !s1_predicted && (!state.ps_active || NativeS1PixelEnabled()) &&
+	    Loader::GameCapture::NativeS1SlotEnabled(m_native_s0_op) && m_native_s0->S1Sample()) {
 		NativeLearn::S1Inputs in;
 		in.op_flags          = m_native_s0_op;
 		in.regs_hash         = view.regs_hash;
@@ -4469,6 +4473,25 @@ void RenderExecutor::NativeS1SegmentEnd(const CommandBuffer& buffer, bool valid)
 	seg.draw_counter     = m_native_draw_counter;
 }
 
+// S1f: see render.h. The emission's binding work (PrepareBindings, PrepareGraphicsBindings, vertex
+// and index acquisition) records no state command, but it marks images bound (BindImage), may
+// record uploads and barriers, and leaves its own PreparedBindings; nothing of it may be taken by
+// the normal path for its own. Rare (feedback, late, plain-choice mismatch): the cost of a full
+// resolution of the normal draw is accepted.
+void RenderExecutor::NativeS1Abandon(CommandBuffer& buffer) {
+	ResetBindings();
+	buffer.InvalidatePushConstants();
+	buffer.InvalidateDescriptors(vk::PipelineBindPoint::eGraphics);
+	m_dynamic_state.valid     = false;
+	m_native_s1_dynamic_dirty = true;
+	m_run.valid               = false; // BeginDrawRun: no continuation of the record
+	m_run_prev_valid          = false;
+	m_run_keepable            = false;
+	for (auto& record: m_run_kept) {
+		record.valid = false;
+	}
+}
+
 bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer, const DrawIndexArgs& args) {
 	namespace GC  = Loader::GameCapture;
 	namespace NP  = NativeLearn::Prof;
@@ -4476,8 +4499,15 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	GC::NativeS1Draw note;
 	bool             predicted = false; // S1d: PredictS1 ran (its census applies)
 	NP::Marker       mark;              // S1e (KYTY_NATIVE_S1_PROFILE)
+	bool             predicted_ok = false; // S1f: PredictS1 returned kS1Emitted (Prediction() is this draw's)
 	const auto out = [&](uint32_t reason) {
 		note.reason = reason;
+		// S1f (verify): a prediction made for this draw and not emitted is compared by the normal
+		// path's Begin (no second prediction there); not for a plain-choice mismatch (the normal path
+		// runs the other pixel program: counted as "plain", not compared).
+		if (predicted_ok && reason != GC::kS1Sample && reason != GC::kS1Plain && GC::NativeVerifyEnabled()) {
+			m_native_s0->ArmS1Check();
+		}
 		if (reason == GC::kS1Shape && m_native_s0 != nullptr) {
 			note.shape       = m_native_s0->S1ShapeCode();
 			note.shape_stage = m_native_s0->S1ShapeStage();
@@ -4489,6 +4519,11 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		}
 		GC::NoteNativeS1(op, note);
 		return false;
+	};
+	// S1f: a fallback once the binding work began.
+	const auto abandon = [&](uint32_t reason) {
+		NativeS1Abandon(buffer);
+		return out(reason);
 	};
 	if (!GC::NativeS1SlotEnabled(op)) return out(GC::kS1Slot);
 	if ((op & GC::kNativeOpSegStart) != 0) return out(GC::kS1SegStart);
@@ -4551,6 +4586,8 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	}
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) return out(GC::kS1Kind);
+	// S1f: known before the prediction (checked again after the binding work).
+	if (seg.has_clear && buffer.HasPendingBarriers()) return out(GC::kS1Barriers);
 	// The vertex stage, rebuilt.
 	const auto&          vs_regs = buffer.GetShaders().GetVs();
 	NativeLearn::S1Inputs in;
@@ -4572,7 +4609,9 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	mark(NP::kChecks);
 	const auto predict_reason = m_native_s0->PredictS1(in);
 	mark(NP::kPredict);
+	m_native_s1_predicted = true;
 	if (predict_reason != GC::kS1Emitted) return out(predict_reason);
+	predicted_ok = true;
 	const auto& pred  = m_native_s0->Prediction();
 	const auto& entry = *pred.entry;
 	if (GC::NativeVerifyEnabled() && m_native_s0->S1Sample()) {
@@ -4618,8 +4657,8 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	if (pixel) {
 		st.ps_runtime = {entry.ps, &pred.snapshot[1]};
 		PrepareBindings(st.ps_runtime, st.ps_bindings, nullptr, false);
-		// The plain variant is the normal path's choice only while no image records mip statistics.
-		if (pred.plain && st.ps_bindings.mip_stats_active) return out(GC::kS1Plain);
+		// S1f: the plain-variant check needs mip_stats_active, which RebindBuffers (in
+		// PrepareGraphicsBindings, below) computes: S1e read the previous emission's value here.
 	}
 	bool has_images = false;
 	for (uint32_t s = 0; s < stage_count; s++) {
@@ -4630,7 +4669,7 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 			const bool attachment = (seg.depth.image_id && binding.image_id == seg.depth.image_id) ||
 			                        std::any_of(seg.color_ids.begin(), seg.color_ids.begin() + std::min<uint32_t>(seg.color_count, RENDER_COLOR_ATTACHMENTS_MAX),
 			                                    [&](const ImageId& id) { return id && id == binding.image_id; });
-			if (attachment) return out(GC::kS1Feedback);
+			if (attachment) return abandon(GC::kS1Feedback);
 		}
 	}
 	if (mesh) {
@@ -4643,6 +4682,13 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	// Texture views (RebindImages) when a stage samples; the targets are the segment's.
 	PrepareGraphicsBindings(stages, {}, !has_images);
 	mark(NP::kEGfx);
+	// S1f: the plain pixel variant is the normal path's choice exactly when it is on, the program
+	// has one and no pixel T# records mip statistics (ExecutePreparedDraw); the prediction decided it
+	// from the rebuilt T#s (BuildS1), RebindBuffers has just computed it from the same snapshot.
+	if (pixel) {
+		const bool plain_expected = in.lod_plain == 1u && entry.plain_available && !st.ps_bindings.mip_stats_active;
+		if (plain_expected != pred.plain || st.ps_bindings.mip_stats_canary) return abandon(GC::kS1Plain);
+	}
 	// S1c: the embedded fetch's vertex buffers (AcquireVertexBuffers on the rebuilt input info, as
 	// the normal path acquires them after the stage bindings), then the index buffer.
 	auto&                 pred_mut = m_native_s0->MutablePrediction();
@@ -4669,7 +4715,7 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	    buffer.ActiveRenderingSerial() != seg.rendering_serial || ImageStateEpoch() != seg.image_epoch ||
 	    m_context.GetBufferCache().UnregisterEpoch() != m_rebind_epoch ||
 	    (seg.has_clear && buffer.HasPendingBarriers())) {
-		return out(GC::kS1Late);
+		return abandon(GC::kS1Late);
 	}
 	mark(NP::kEVertex);
 	bool dynamic_recorded = false; // S1e: the emission recorded dynamic state (KYTY_NATIVE_S1_KEEP_RUN)
@@ -5916,7 +5962,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	// Astro Bot PC (KYTY_NATIVE_MODE=s1, nativeLearn.h "S1"): a native op's continuation emitted
 	// natively skips everything below. Any other draw ends the segment state it could rely on.
 	m_native_draw_counter++;
-	m_native_s1_done = false;
+	m_native_s1_done      = false;
+	m_native_s1_predicted = false;
 	if (m_native_s0_op != 0 && Loader::GameCapture::NativeS1()) [[unlikely]] {
 		const uint64_t attempt_start = native_s1_profile.on ? NativeLearn::Prof::Marker::Now() : 0u;
 		if (NativeS1Emit(submit_id, buffer, args)) {

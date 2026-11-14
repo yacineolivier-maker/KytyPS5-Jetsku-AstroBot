@@ -506,6 +506,7 @@ private:
 	// S1e: the stage's load group bytes and states (0 unread, 1 read, 2 refused: per-dword reads).
 	std::vector<uint8_t> m_s1_group_data;
 	std::vector<uint8_t> m_s1_group_state;
+	std::vector<uint32_t> m_s1_mip_scratch; // S1f: WriteMipStatsFields' shader data (plain choice)
 	// S1e ("vs:variant"): per base key, the entry the last successful prediction found; the next
 	// prediction of the base rebuilds with its stages first (one pass when the permutation repeats).
 	struct S1Hint {
@@ -515,7 +516,10 @@ private:
 	static constexpr uint32_t kS1HintSize = 1024; // power of two
 	std::unique_ptr<std::array<S1Hint, kS1HintSize>> m_s1_hints;
 	// S1e: the stage rebuild of PredictS1 with a model entry's stages (key out; reason on failure).
-	uint32_t BuildS1(const Entry& model, const S1Inputs& in, uint64_t base, bool plain, uint64_t& key);
+	// S1f: `plain` in: the plain pixel variant is wanted and available (KYTY_LOD_STATS_PLAIN_VARIANT
+	// on); out: the normal path's choice, i.e. also no mip-statistics counter on the rebuilt pixel
+	// T#s (WriteMipStatsFields on the rebuilt snapshot, as RebindBuffers computes it).
+	uint32_t BuildS1(const Entry& model, const S1Inputs& in, uint64_t base, bool& plain, uint64_t& key);
 	// Verify sample: what the native path would push (expected) and what the commit pushed.
 	std::array<uint32_t, 32> m_push_expected {};
 	uint32_t                 m_push_mask = 0; // dwords of m_push_expected to compare

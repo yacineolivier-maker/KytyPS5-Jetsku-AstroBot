@@ -1144,6 +1144,14 @@ private:
 	// S1e (KYTY_NATIVE_S1_PROFILE): the current DrawIndex's S1 attempt ticks (normal path after a fallback).
 	uint64_t       m_native_s1_attempt_ticks = 0;
 	bool           m_native_s1_attempted     = false;
+	// S1f: the current DrawIndex's NativeS1Emit ran PredictS1 (NativeS0Learn then makes no verify
+	// prediction of its own), consumed by NativeS0Learn.
+	bool           m_native_s1_predicted     = false;
+	// S1f: a fallback after the emission's binding work began (PrepareBindings onwards): the image
+	// binding marks are dropped, the command buffer's descriptor, push-constant and dynamic-state
+	// shadows and the DrawRun records are invalidated, so the normal path resolves and records
+	// everything again.
+	void           NativeS1Abandon(CommandBuffer& buffer);
 	bool           NativeS1Emit(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void           NativeS1SegmentDraw(const CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering);
 	void           NativeS1SegmentEnd(const CommandBuffer& buffer, bool valid);
