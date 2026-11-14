@@ -203,6 +203,24 @@
 // promotions are logged ("Kyty CpPar 1b5: ...") with the address, the last CP writer (submission,
 // its rank among the queue-0 submissions of its frame fence, op kind) and whether memory still
 // holds that value (if not, it was written outside the CP since: guest CPU or GPU).
+//
+// Astro Bot PC (KYTY_CP_PAR=2a, 14/11/2026, docs\CONCEPTION-MULTICOEUR.md step P1 "decoupled lanes,
+// in turn"; needs what 1b2 needs, otherwise runs as 1b1): 1b2 (the token, strictly in turn), and
+// each context ("lane": A = Thread_Gpu, B = CP resolver #2) also has
+//  - its own native command buffers, from its own command pool (CommandScheduler::EnableLanes):
+//    the two CommandBuffer wrappers no longer name one shared native buffer;
+//  - its own RenderExecutor (RenderContext::GetRenderExecutor picks the calling thread's lane;
+//    context B's draw-prep workers read B's texture binding memo);
+//  - (as 1b2) its own DynamicState, recorder ring and encoder; one recorder thread still replays
+//    both rings, following the Switch packets.
+// Submission in list order: at every token hand-off the giver's segment ends with a Submit of its
+// own native buffer (the "merge"; its tick is allocated then, CommandScheduler::Submit), then the
+// Switch packet; the taker's segment begins a new native buffer of its own pool. So at most one
+// native buffer is open at any time (checked at every Submit), ticks stay monotonic in queue order
+// and a younger lane never submits while an older one has unsubmitted work. Cost: one extra
+// submit per hand-off (empty when the segment recorded nothing: counted). Image layouts: 1b2's
+// bookkeeping (fix-ups must be no-ops). A "CpPar 10s: 2a lanes ..." line reports the hand-off
+// submits per lane and the empty ones.
 
 #include <cstdint>
 
@@ -216,6 +234,7 @@ enum class Mode : uint8_t {
 	Concurrent1b3,
 	Concurrent1b4,
 	Concurrent1b5, // Astro Bot PC (KYTY_CP_PAR=1b5)
+	Lanes2a,       // Astro Bot PC (KYTY_CP_PAR=2a, P1: decoupled lanes, in turn)
 };
 
 // KYTY_CP_PAR, read once.
@@ -228,14 +247,16 @@ enum class Mode : uint8_t {
 [[nodiscard]] inline bool SeparateWindows() {
 	return GetMode() == Mode::Serial1b1 || GetMode() == Mode::Serial1b2 ||
 	       GetMode() == Mode::Concurrent1b3 || GetMode() == Mode::Concurrent1b4 ||
-	       GetMode() == Mode::Concurrent1b5; // Astro Bot PC (KYTY_CP_PAR=1b4, 1b5)
+	       GetMode() == Mode::Concurrent1b5 || // Astro Bot PC (KYTY_CP_PAR=1b4, 1b5)
+	       GetMode() == Mode::Lanes2a;         // Astro Bot PC (KYTY_CP_PAR=2a)
 }
 // KYTY_CP_PAR=1b2 (and 1b3) requested: context B records into its own target (see above).
 // Whether it is active (recorder requirements met) is StreamsActive().
 [[nodiscard]] inline bool SeparateStreams() {
 	return GetMode() == Mode::Serial1b2 || GetMode() == Mode::Concurrent1b3 ||
 	       GetMode() == Mode::Concurrent1b4 ||
-	       GetMode() == Mode::Concurrent1b5; // Astro Bot PC (KYTY_CP_PAR=1b4, 1b5)
+	       GetMode() == Mode::Concurrent1b5 || // Astro Bot PC (KYTY_CP_PAR=1b4, 1b5)
+	       GetMode() == Mode::Lanes2a;         // Astro Bot PC (KYTY_CP_PAR=2a)
 }
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): set once at start-up, before resolver #2 runs, when the two
@@ -265,6 +286,13 @@ inline bool g_wide = false;
 inline bool g_deferred = false;
 [[nodiscard]] inline bool Deferred() noexcept {
 	return g_deferred;
+}
+// Astro Bot PC (KYTY_CP_PAR=2a, P1): set once at start-up, with g_streams_active, when each
+// lane also has its own native command buffers (pool), RenderExecutor and hand-off submits
+// (CommandScheduler::EnableLanes). Read on the recording paths without a call.
+inline bool g_lanes = false;
+[[nodiscard]] inline bool Lanes() noexcept {
+	return g_lanes;
 }
 // "1b5", "1b4" or "1b3" (the concurrent mode's name in the console lines).
 [[nodiscard]] inline const char* ConcurrentName() noexcept {
@@ -403,6 +431,9 @@ void ForgetImage(const void* image);
 // packets among them, whether it shared a native command buffer not seen before).
 void BeginSegment(uint32_t context);
 void EndSegment(uint32_t context, uint64_t packets, uint64_t submits, bool new_command_buffer);
+// Astro Bot PC (KYTY_CP_PAR=2a): a lane's segment ended with its hand-off submit (its own native
+// command buffer handed to the queue, in list order); `empty`: nothing was recorded in it.
+void NoteLaneHandoff(uint32_t context, bool empty);
 
 enum class Fallback : uint32_t {
 	NoSequencer, // KYTY_CP_SEQ is not 1 (or the sequencer is off): no op ring to split

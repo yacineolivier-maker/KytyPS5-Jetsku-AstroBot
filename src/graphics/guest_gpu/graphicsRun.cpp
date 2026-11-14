@@ -752,12 +752,26 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					            "and recorder ring (%s)\n",
 					            CpPar::g_concurrent ? "segments per submission, replayed in admission order"
 					                                : "segments at every token hand-off");
+					if (CpPar::GetMode() == CpPar::Mode::Lanes2a) {
+						// Astro Bot PC (KYTY_CP_PAR=2a, cpParallel.h): each lane's own native command
+						// buffers (pool) and RenderExecutor, submitted at every hand-off.
+						if (m_renderer.HasLaneExecutor() &&
+						    m_renderer.GetCommandScheduler().EnableLanes()) {
+							CpPar::g_lanes = true;
+							std::printf("Kyty CpPar: 2a lanes: each lane has its own command pool, "
+							            "native command buffers and RenderExecutor; a lane's buffer is "
+							            "submitted at every hand-off (list order)\n");
+						} else {
+							std::printf("Kyty CpPar: 2a lanes unavailable; running as 1b2\n");
+						}
+					}
 				} else {
 					std::printf("Kyty CpPar: KYTY_CP_PAR=%s needs KYTY_CP_RECORDER=1 without "
 					            "KYTY_CP_RECORDER_VERIFY; running as 1b1\n",
 					            CpPar::GetMode() == CpPar::Mode::Concurrent1b3   ? "1b3"
 					            : CpPar::GetMode() == CpPar::Mode::Concurrent1b4 ? "1b4" // Astro Bot PC
 					            : CpPar::GetMode() == CpPar::Mode::Concurrent1b5 ? "1b5"
+					            : CpPar::GetMode() == CpPar::Mode::Lanes2a       ? "2a" // Astro Bot PC
 					                                                             : "1b2");
 				}
 			}
@@ -791,7 +805,8 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 				}
 				gpu->m_renderer.GetMutex().BecomeOwner();
 				if (CpPar::StreamsActive()) {
-					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context begins a segment.
+					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context begins a segment (2a: in
+					// a new native buffer of its own pool; GetRenderExecutor is then the lane's).
 					const uint32_t stream = CpPar::OnResolver2() ? 1u : 0u;
 					CommandRecorder::SetThreadStream(stream);
 					gpu->m_renderer.GetCommandScheduler().BeginContextSegment();
@@ -809,6 +824,10 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					const auto counts = gpu->m_renderer.GetCommandScheduler().EndContextSegment();
 					CpPar::EndSegment(stream, counts.packets, counts.submits,
 					                  counts.new_command_buffer);
+					if (counts.lane_submitted) {
+						// Astro Bot PC (KYTY_CP_PAR=2a): the lane's buffer went to the queue.
+						CpPar::NoteLaneHandoff(stream, counts.lane_empty);
+					}
 				}
 				gpu->m_renderer.GetMutex().ResignOwner();
 				if (CpPar::OnResolver2()) {

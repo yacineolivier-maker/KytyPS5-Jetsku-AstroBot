@@ -229,7 +229,8 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 		m_command_b.Bind(registers, user_config, shaders); // Astro Bot PC (KYTY_CP_PAR=1b2)
 	}
 
-	if (m_command.IsInvalid()) {
+	// Astro Bot PC (KYTY_CP_PAR=2a): the calling thread's lane (the other lane names no buffer).
+	if ((m_lanes ? Cmd() : m_command).IsInvalid()) {
 		BeginNext();
 	}
 }
@@ -269,7 +270,7 @@ void CommandScheduler::FlushAndWait() {
 
 void CommandScheduler::Finish() {
 	CheckActive();
-	if (!m_command.IsInvalid()) {
+	if (!(m_lanes ? Cmd() : m_command).IsInvalid()) { // Astro Bot PC (KYTY_CP_PAR=2a)
 		Submit({}, true);
 	}
 	m_master.Wait(CurrentTick() - 1);
@@ -668,10 +669,55 @@ bool CommandScheduler::EnableContextB() {
 	return true;
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2a, commandScheduler.h).
+bool CommandScheduler::EnableLanes() {
+	if (m_lanes) {
+		return true;
+	}
+	if (!m_dual || m_recorder == nullptr) {
+		return false;
+	}
+	m_command_pool_b = std::make_unique<CommandPool>(m_graphics, m_master);
+	m_command_pool_b->SetRecorder(m_recorder.get());
+	// Context B names no native buffer until its first segment begins one of its own.
+	EXIT_IF(m_command_b.m_rendering || m_command_b.m_direct_window || !m_command_b.m_pending.Empty());
+	m_command_b.m_buffer = nullptr;
+	m_lanes              = true;
+	return true;
+}
+
+CommandBuffer& CommandScheduler::BeginLaneCommand() {
+	EXIT_IF(!m_lanes || m_recorder == nullptr);
+	auto& command = Cmd();
+	EXIT_IF(!command.IsInvalid());
+	auto& pool       = ThreadContext() != 0 ? *m_command_pool_b : m_command_pool;
+	command.m_buffer = pool.Commit();
+	command.Begin();
+	GetDynamicState().Invalidate();
+	// As BeginCommand with the recorder: the recorder begins the native buffer (in this lane's
+	// ring) and stamps KYTY_GPU_TIMING / GpuOpProfiler with this recording's tick. In turn, no
+	// other lane submits before this buffer does, so the tick is the one Submit allocates.
+	m_recorder->Begin(command.m_buffer, m_master.CurrentTick(), m_gpu_timing ? GpuTiming::NowNs() : 0);
+	if (m_eop_timestamps) {
+		m_eop_timestamps->BeginCommand(command.StateSink());
+	}
+	return command;
+}
+
 void CommandScheduler::BeginContextSegment() {
 	EXIT_IF(!m_dual);
 	const auto context = ThreadContext() != 0 ? 1u : 0u;
 	auto&      command = Cmd();
+	if (m_lanes) {
+		// Astro Bot PC (KYTY_CP_PAR=2a): the lane's previous segment submitted its buffer; this one
+		// begins a new native buffer of the lane's own pool (Begin resets the wrapper's shadows).
+		EXIT_IF(!command.IsInvalid() || command.m_rendering || command.m_direct_window ||
+		        !command.m_pending.Empty());
+		m_segment_submits[context] = m_submits[context];
+		BeginLaneCommand();
+		m_segment_packets[context] = m_recorder->StreamPackets(context);
+		return;
+	}
 	// The other context may have submitted and begun a native buffer meanwhile.
 	command.m_buffer = m_command.m_buffer;
 	EXIT_IF(command.m_rendering || command.m_direct_window || !command.m_pending.Empty());
@@ -695,6 +741,26 @@ CommandScheduler::SegmentCounts CommandScheduler::EndContextSegment() {
 	EXIT_IF(!m_dual);
 	const auto context = ThreadContext() != 0 ? 1u : 0u;
 	auto&      command = Cmd();
+	if (m_lanes) {
+		// Astro Bot PC (KYTY_CP_PAR=2a): the merge. The lane's own native buffer is submitted now,
+		// in list order (Submit ends rendering, flushes the barrier batch, closes the direct window
+		// and allocates the tick), then the Switch packet ends the ring segment.
+		SegmentCounts counts;
+		const bool    empty = m_recorder->StreamPackets(context) == m_segment_packets[context];
+		if (!command.IsInvalid()) {
+			Submit({}, false);
+			counts.lane_submitted     = true;
+			counts.lane_empty         = empty;
+			counts.new_command_buffer = true;
+		} else {
+			command.CloseDirectWindow();
+		}
+		m_recorder->EndStreamSegment();
+		counts.packets          = m_recorder->StreamPackets(context) - m_segment_packets[context];
+		counts.submits          = m_submits[context] - m_segment_submits[context];
+		m_segment_tick[context] = CurrentTick();
+		return counts;
+	}
 	if (Active() && !command.IsInvalid()) {
 		// As Submit does before its packet: the segment's stream ends outside rendering, with no
 		// batched barrier, upload copy or kept depth ordering left in this wrapper.
@@ -714,6 +780,9 @@ CommandScheduler::SegmentCounts CommandScheduler::EndContextSegment() {
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {
+	if (m_lanes) {
+		return BeginLaneCommand(); // Astro Bot PC (KYTY_CP_PAR=2a): the calling thread's lane
+	}
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	auto& command      = Cmd(); // Astro Bot PC (KYTY_CP_PAR=1b2): the calling thread's context
@@ -765,6 +834,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	}
 	auto& command = Cmd(); // Astro Bot PC (KYTY_CP_PAR=1b2): the calling thread's context
 	EXIT_IF(command.IsInvalid());
+	// Astro Bot PC (KYTY_CP_PAR=2a): in turn, only the submitting lane names a native buffer; a
+	// younger lane's unsubmitted work would otherwise be overtaken by this tick.
+	EXIT_IF(m_lanes && !(&command == &m_command ? m_command_b : m_command).IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 	if (m_pre_submit_hook != nullptr && !m_in_pre_submit && Active()) {
@@ -856,9 +928,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		m_recorder->Submit(packet);
 		command.m_buffer = nullptr;
 		if (m_dual) {
-			// Astro Bot PC (KYTY_CP_PAR=1b2): the other wrapper named the same native buffer.
-			m_command.m_buffer   = nullptr;
-			m_command_b.m_buffer = nullptr;
+			// Astro Bot PC (KYTY_CP_PAR=1b2): the other wrapper named the same native buffer
+			// (2a: each lane names its own; the other one names none).
+			if (!m_lanes) {
+				m_command.m_buffer   = nullptr;
+				m_command_b.m_buffer = nullptr;
+			}
 			m_submits[ThreadContext() != 0 ? 1u : 0u]++;
 		}
 		return packet.tick;

@@ -134,7 +134,19 @@ public:
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
-	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
+	// Astro Bot PC (KYTY_CP_PAR=2a, cpParallel.h): the calling thread's lane's executor (lane B:
+	// the thread records into recorder stream 1, CP resolver #2); lane A's otherwise and in every
+	// other mode (no lane executor).
+	RenderExecutor& GetRenderExecutor() {
+		if (m_render_executor_b != nullptr && CommandScheduler::ThreadContext() != 0) {
+			return *m_render_executor_b;
+		}
+		return m_render_executor;
+	}
+	RenderExecutor& GetRenderExecutor(uint32_t lane) {
+		return lane != 0 && m_render_executor_b != nullptr ? *m_render_executor_b : m_render_executor;
+	}
+	[[nodiscard]] bool HasLaneExecutor() const noexcept { return m_render_executor_b != nullptr; }
 	OcclusionCounter&   GetOcclusionCounter() { return m_occlusion_counter; }
 	LodStatsCounter&    GetLodStats() { return m_lod_stats; }
 
@@ -194,6 +206,8 @@ private:
 	GraphicContext&           m_graphics;
 	RenderMutex               m_mutex;
 	RenderExecutor            m_render_executor;
+	// Astro Bot PC (KYTY_CP_PAR=2a): lane B's executor (null in every other mode).
+	std::unique_ptr<RenderExecutor> m_render_executor_b;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
 	PipelineCache             m_pipeline_cache;

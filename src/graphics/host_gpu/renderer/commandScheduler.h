@@ -170,9 +170,21 @@ public:
 		uint64_t packets            = 0; // packets encoded in the context's ring during the segment
 		uint64_t submits            = 0; // Submit packets among them
 		bool     new_command_buffer = false; // first segment of the context in its native buffer
+		// Astro Bot PC (KYTY_CP_PAR=2a): the segment ended with the hand-off submit of the lane's
+		// own native buffer; nothing had been recorded into it since the segment began.
+		bool     lane_submitted = false;
+		bool     lane_empty     = false;
 	};
 	void          BeginContextSegment();
 	SegmentCounts EndContextSegment();
+	// Astro Bot PC (KYTY_CP_PAR=2a, cpParallel.h): "lanes". Needs EnableContextB; once, before the
+	// second context records. Context B's wrapper then names native buffers of its own command
+	// pool (never context A's): each segment begins a native buffer of its lane's pool
+	// (BeginContextSegment) and ends by submitting it (EndContextSegment, the merge in list order,
+	// where its tick is allocated). Execution stays in turn: at most one wrapper names a native
+	// buffer at any time (Submit checks it).
+	bool               EnableLanes();
+	[[nodiscard]] bool Lanes() const noexcept { return m_lanes; }
 	// The calling thread's context (0 unless it records into stream 1).
 	[[nodiscard]] static uint32_t ThreadContext() noexcept;
 
@@ -216,6 +228,8 @@ private:
 	};
 
 	void BeginNext();
+	// Astro Bot PC (KYTY_CP_PAR=2a): BeginCommand of the calling thread's lane (its own pool).
+	CommandBuffer& BeginLaneCommand();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	// Pops normal operations (see PopPendingOperations/PopReadyOperations).
@@ -238,6 +252,9 @@ private:
 	std::array<uint64_t, 2>      m_segment_submits {};
 	std::array<uint64_t, 2>      m_submits {};
 	std::array<uint64_t, 2>      m_segment_tick {};
+	// Astro Bot PC (KYTY_CP_PAR=2a): lane B's command pool (null unless EnableLanes), lanes on.
+	std::unique_ptr<CommandPool> m_command_pool_b;
+	bool                         m_lanes = false;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

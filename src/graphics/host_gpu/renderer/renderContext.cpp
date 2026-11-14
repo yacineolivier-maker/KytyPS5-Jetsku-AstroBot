@@ -5,7 +5,9 @@
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR=2a)
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"      // Astro Bot PC (KYTY_CP_PAR=2a)
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/memoryStats.h"
@@ -119,6 +121,15 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_occlusion_counter(*this), m_lod_stats(*this) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (CpPar::GetMode() == CpPar::Mode::Lanes2a &&
+	    CommandRecorder::ConfiguredMode() == CommandRecorder::Mode::Thread &&
+	    !CommandRecorder::VerifyEnabled()) {
+		// Astro Bot PC (KYTY_CP_PAR=2a, cpParallel.h): lane B's own RenderExecutor, created before
+		// the command processor makes context B's draw-prep engine (its workers read B's memo).
+		// Lanes need the recorder in thread mode without verify (CommandRecorder::
+		// EnableSecondStream); otherwise 2a runs as 1b1 and nothing selects this executor.
+		m_render_executor_b = std::make_unique<RenderExecutor>(*this);
+	}
 	// What guest write tracking costs on this PC (faultCost.h), measured before the GPU caches
 	// take their first fault.
 	FaultCost::SetThreadDescriber([](char* name, uint64_t size) -> int {

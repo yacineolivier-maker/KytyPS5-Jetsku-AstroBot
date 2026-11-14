@@ -55,6 +55,9 @@ struct Stats {
 	std::array<std::atomic<uint64_t>, 2> fixups_checked {};
 	std::array<std::atomic<uint64_t>, 2> fixups_needed {};
 	std::atomic<uint64_t>                image_outside {0};
+	// Astro Bot PC (KYTY_CP_PAR=2a): per lane, hand-off submits and the empty ones among them.
+	std::array<std::atomic<uint64_t>, 2> lane_submits {};
+	std::array<std::atomic<uint64_t>, 2> lane_empty {};
 	std::atomic<uint64_t>                fixups_needed_total {0};
 	// KYTY_CP_PAR=1b3: run-ahead starts and ops, promotions by reason, merges and insertions with
 	// their fix-ups, op lock waits per thread, time both threads were busy (overlap).
@@ -479,7 +482,14 @@ Mode GetMode() {
 			            "oldest submission's last op)\n");
 			return Mode::Concurrent1b5;
 		}
-		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2, 1b3, 1b4, 1b5); "
+		if (std::strcmp(value, "2a") == 0) {
+			// Astro Bot PC (KYTY_CP_PAR=2a, cpParallel.h).
+			std::printf("Kyty CpPar: KYTY_CP_PAR=2a (as 1b2, and each lane records into its own native "
+			            "command buffers with its own RenderExecutor; submitted in list order at "
+			            "every hand-off, executed in turn)\n");
+			return Mode::Lanes2a;
+		}
+		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2, 1b3, 1b4, 1b5, 2a); "
 		            "off\n",
 		            value);
 		return Mode::Off;
@@ -967,6 +977,15 @@ void EndSegment(uint32_t context, uint64_t packets, uint64_t submits, bool new_c
 	t_segment    = -1;
 }
 
+void NoteLaneHandoff(uint32_t context, bool empty) {
+	const size_t index = context != 0 ? 1 : 0;
+	auto&        stats = GetStats();
+	stats.lane_submits[index].fetch_add(1, std::memory_order_relaxed);
+	if (empty) {
+		stats.lane_empty[index].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 void MaybeReport() {
 	static uint64_t last_ns = 0; // Thread_Gpu only
 	const auto      now     = NowNs();
@@ -1182,6 +1201,16 @@ void MaybeReport() {
 		            " (expected 0); image accesses outside segments %" PRIu64 "\n",
 		            s[1][0], s[1][1], s[1][2], s[1][3], s[0][0], s[0][1], s[0][2], s[0][3], s[0][4],
 		            s[1][4], s[0][5], s[1][5], outside);
+	}
+	if (Lanes()) {
+		// Astro Bot PC (KYTY_CP_PAR=2a): the hand-off submits of each lane over the last 10 s.
+		const auto sub_a   = take(stats.lane_submits[0]);
+		const auto sub_b   = take(stats.lane_submits[1]);
+		const auto empty_a = take(stats.lane_empty[0]);
+		const auto empty_b = take(stats.lane_empty[1]);
+		std::printf("CpPar 10s: 2a lanes: hand-off submits A %" PRIu64 " (empty %" PRIu64 "), B %" PRIu64
+		            " (empty %" PRIu64 ")\n",
+		            sub_a, empty_a, sub_b, empty_b);
 	}
 	std::fflush(stdout);
 }
