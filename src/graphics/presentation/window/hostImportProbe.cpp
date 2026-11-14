@@ -496,10 +496,12 @@ struct Manager {
 		uint64_t size   = 0;
 		uint64_t hash   = 0;
 		uint64_t tick   = 0;
+		bool     dirty  = false;
 	};
 	std::deque<RaceEntry>             race; // GPU thread only
 	uint64_t                          race_calls = 0, race_recorded = 0, race_dropped = 0;
 	std::atomic<uint64_t>             race_checked {0}, race_changed {0}, race_changed_bytes {0};
+	std::atomic<uint64_t>             race_checked_clean {0}, race_changed_clean {0};
 	uint64_t                          imported  = 0; // worker only
 	uint64_t                          reserved_found = 0; // worker only: reserved bytes committed before import
 	uint64_t                          failures  = 0; // worker only
@@ -654,15 +656,19 @@ void Report(Manager& m) {
 	if (Mode() == 4) {
 		const auto checked = m.race_checked.exchange(0, std::memory_order_relaxed);
 		const auto changed = m.race_changed.exchange(0, std::memory_order_relaxed);
+		const auto checked_clean = m.race_checked_clean.exchange(0, std::memory_order_relaxed);
+		const auto changed_clean = m.race_changed_clean.exchange(0, std::memory_order_relaxed);
 		Log(Format("10s race: recorded %" PRIu64 " (dropped %" PRIu64 "), checked after GPU completion %" PRIu64
-		           ", changed %" PRIu64 " (%.2f%%, %" PRIu64 " KiB)",
+		           ", changed %" PRIu64 " (%.2f%%, %" PRIu64 " KiB); CPU-clean at bind: checked %" PRIu64
+		           " changed %" PRIu64 "; CPU-dirty at bind: checked %" PRIu64 " changed %" PRIu64,
 		           m.race_recorded, m.race_dropped, checked, changed,
 		           checked != 0 ? 100.0 * static_cast<double>(changed) / static_cast<double>(checked) : 0.0,
-		           m.race_changed_bytes.exchange(0, std::memory_order_relaxed) >> 10u));
+		           m.race_changed_bytes.exchange(0, std::memory_order_relaxed) >> 10u, checked_clean, changed_clean,
+		           checked - checked_clean, changed - changed_clean));
 	}
 	if (Mode() == 3) {
 		static constexpr const char* names[] = {"served", "written", "large", "gpu-modified", "image-modified",
-		                                        "not-imported"};
+		                                        "not-imported", "cpu-modified"};
 		std::string line = "10s bind:";
 		for (size_t i = 0; i < m.bind.size(); i++) {
 			line += Format(" %s %" PRIu64, names[i], m.bind[i].exchange(0, std::memory_order_relaxed));
@@ -738,7 +744,7 @@ bool RaceEnabled() {
 	return Mode() == 4;
 }
 
-void RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick) {
+void RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick, bool cpu_dirty) {
 	auto& m = GetManager();
 	if (!m.ready.load(std::memory_order_acquire) || (m.race_calls++ & 15u) != 0) return;
 	uint64_t offset = 0;
@@ -751,7 +757,7 @@ void RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick) {
 		return;
 	}
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(m.backing + offset), static_cast<size_t>(size));
-	m.race.push_back({offset, size, hash, tick});
+	m.race.push_back({offset, size, hash, tick, cpu_dirty});
 	m.race_recorded++;
 }
 
@@ -767,7 +773,9 @@ void RaceCheckFront() {
 	m.race.pop_front();
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(m.backing + entry.offset), static_cast<size_t>(entry.size));
 	m.race_checked.fetch_add(1, std::memory_order_relaxed);
+	if (!entry.dirty) m.race_checked_clean.fetch_add(1, std::memory_order_relaxed);
 	if (hash != entry.hash) {
+		if (!entry.dirty) m.race_changed_clean.fetch_add(1, std::memory_order_relaxed);
 		m.race_changed.fetch_add(1, std::memory_order_relaxed);
 		m.race_changed_bytes.fetch_add(entry.size, std::memory_order_relaxed);
 	}

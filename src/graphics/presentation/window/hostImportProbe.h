@@ -58,14 +58,18 @@ namespace Libs::Graphics::HostImport {
 // The imported chunk's buffer and the range's offset in it (false: not available now).
 [[nodiscard]] bool LookupBinding(uint64_t vaddr, uint64_t size, VkBuffer* buffer, uint64_t* offset);
 // Bind-mode accounting (GPU thread): served, or the reason it fell back.
-enum class BindFallback : uint8_t { Served, Written, Large, GpuModified, ImageModified, NotImported, Count };
+// CpuModified (B2 fix, device losses of 14/11 during loading): a range the guest CPU wrote since its
+// last synchronization is likely rewritten again before the host GPU reads it (end-of-pipe labels
+// are written at record time, KYTY_LABEL_MODE=record): it keeps the copy.
+enum class BindFallback : uint8_t { Served, Written, Large, GpuModified, ImageModified, NotImported, CpuModified, Count };
 void NoteBind(BindFallback outcome);
 // KYTY_HOST_IMPORT=race (diagnostic, no GPU read of imported memory): one in 16 bindings that bind
 // mode would serve has its guest bytes hashed at bind time (submission tick `tick`); once that tick
 // completed on the GPU the bytes are hashed again. A changed hash is a buffer the guest rewrote
 // before the host GPU read it: what an in-place read would have seen differently from the copy.
 [[nodiscard]] bool RaceEnabled();
-void               RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick);
+// cpu_dirty: the range was CPU-modified at bind time (counted apart).
+void               RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick, bool cpu_dirty);
 // The oldest recorded tick still to check (0: none); RaceCheckFront rehashes that entry.
 [[nodiscard]] uint64_t RaceFrontTick();
 void                   RaceCheckFront();

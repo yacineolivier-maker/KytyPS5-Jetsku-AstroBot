@@ -252,7 +252,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		}
 		if (!context.GetBufferCache().IsRegionGpuModified(address, size) &&
 		    !(sync_images && context.GetTextureCache().IsRegionGpuModified(address, size))) {
-			HostImport::RaceRecord(address, size, scheduler.CurrentTick());
+			HostImport::RaceRecord(address, size, scheduler.CurrentTick(),
+			                       context.GetBufferCache().IsRegionCpuModified(address, size));
 		}
 	}
 	if (HostImport::BindEnabled()) {
@@ -266,6 +267,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 			why = BindFallback::GpuModified;
 		} else if (sync_images && context.GetTextureCache().IsRegionGpuModified(address, size)) {
 			why = BindFallback::ImageModified;
+		} else if (context.GetBufferCache().IsRegionCpuModified(address, size)) {
+			why = BindFallback::CpuModified;
 		} else {
 			VkBuffer chunk        = VK_NULL_HANDLE;
 			uint64_t chunk_offset = 0;
