@@ -244,6 +244,17 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	// that no GPU write or GPU-modified image covers reads the guest's memory in place, through the
 	// imported chunk: no cache buffer, no upload, no memo. Its descriptor follows the same alignment
 	// and range rules as below.
+	if (HostImport::RaceEnabled() && !resource.written && size <= HostImport::BindMaxBytes()) {
+		auto& scheduler = context.GetCommandScheduler();
+		for (auto tick = HostImport::RaceFrontTick(); tick != 0 && scheduler.IsFree(tick);
+		     tick = HostImport::RaceFrontTick()) {
+			HostImport::RaceCheckFront();
+		}
+		if (!context.GetBufferCache().IsRegionGpuModified(address, size) &&
+		    !(sync_images && context.GetTextureCache().IsRegionGpuModified(address, size))) {
+			HostImport::RaceRecord(address, size, scheduler.CurrentTick());
+		}
+	}
 	if (HostImport::BindEnabled()) {
 		using HostImport::BindFallback;
 		auto why = BindFallback::Served;

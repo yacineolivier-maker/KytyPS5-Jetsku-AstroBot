@@ -11,7 +11,9 @@
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
+#include <deque>
 #include <memory>
+#include <xxhash.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -489,6 +491,15 @@ struct Manager {
 	std::atomic<uint64_t>             pending {0};
 	std::atomic<uint64_t>             failed_lookups {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(BindFallback::Count)> bind {};
+	struct RaceEntry {
+		uint64_t offset = 0;
+		uint64_t size   = 0;
+		uint64_t hash   = 0;
+		uint64_t tick   = 0;
+	};
+	std::deque<RaceEntry>             race; // GPU thread only
+	uint64_t                          race_calls = 0, race_recorded = 0, race_dropped = 0;
+	std::atomic<uint64_t>             race_checked {0}, race_changed {0}, race_changed_bytes {0};
 	uint64_t                          imported  = 0; // worker only
 	uint64_t                          reserved_found = 0; // worker only: reserved bytes committed before import
 	uint64_t                          failures  = 0; // worker only
@@ -505,6 +516,7 @@ int64_t Mode() {
 		const auto* value = std::getenv("KYTY_HOST_IMPORT");
 		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) return int64_t {0};
 		if (std::strcmp(value, "census") == 0) return int64_t {2};
+		if (std::strcmp(value, "race") == 0) return int64_t {4};
 		return std::strcmp(value, "bind") == 0 ? int64_t {3} : int64_t {1};
 	}();
 	return mode;
@@ -639,6 +651,15 @@ void Report(Manager& m) {
 	const auto lookups = m.lookups.exchange(0, std::memory_order_relaxed);
 	const auto hits    = m.hits.exchange(0, std::memory_order_relaxed);
 	if (lookups == 0 && m.imported == 0) return;
+	if (Mode() == 4) {
+		const auto checked = m.race_checked.exchange(0, std::memory_order_relaxed);
+		const auto changed = m.race_changed.exchange(0, std::memory_order_relaxed);
+		Log(Format("10s race: recorded %" PRIu64 " (dropped %" PRIu64 "), checked after GPU completion %" PRIu64
+		           ", changed %" PRIu64 " (%.2f%%, %" PRIu64 " KiB)",
+		           m.race_recorded, m.race_dropped, checked, changed,
+		           checked != 0 ? 100.0 * static_cast<double>(changed) / static_cast<double>(checked) : 0.0,
+		           m.race_changed_bytes.exchange(0, std::memory_order_relaxed) >> 10u));
+	}
 	if (Mode() == 3) {
 		static constexpr const char* names[] = {"served", "written", "large", "gpu-modified", "image-modified",
 		                                        "not-imported"};
@@ -711,6 +732,45 @@ bool CensusEnabled() {
 
 bool BindEnabled() {
 	return Mode() == 3;
+}
+
+bool RaceEnabled() {
+	return Mode() == 4;
+}
+
+void RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick) {
+	auto& m = GetManager();
+	if (!m.ready.load(std::memory_order_acquire) || (m.race_calls++ & 15u) != 0) return;
+	uint64_t offset = 0;
+	if (!LibKernel::Memory::GuestToBacking(vaddr, size, &offset) || offset >= m.backing_size ||
+	    m.backing_size - offset < size) {
+		return;
+	}
+	if (m.race.size() >= 65536) {
+		m.race_dropped++;
+		return;
+	}
+	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(m.backing + offset), static_cast<size_t>(size));
+	m.race.push_back({offset, size, hash, tick});
+	m.race_recorded++;
+}
+
+uint64_t RaceFrontTick() {
+	auto& m = GetManager();
+	return m.race.empty() ? 0 : m.race.front().tick;
+}
+
+void RaceCheckFront() {
+	auto& m = GetManager();
+	if (m.race.empty()) return;
+	const auto entry = m.race.front();
+	m.race.pop_front();
+	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(m.backing + entry.offset), static_cast<size_t>(entry.size));
+	m.race_checked.fetch_add(1, std::memory_order_relaxed);
+	if (hash != entry.hash) {
+		m.race_changed.fetch_add(1, std::memory_order_relaxed);
+		m.race_changed_bytes.fetch_add(entry.size, std::memory_order_relaxed);
+	}
 }
 
 uint64_t BindMaxBytes() {
@@ -810,7 +870,7 @@ void Start(GraphicContext& ctx) {
 	m.worker      = std::thread(WorkerLoop);
 	m.ready.store(true, std::memory_order_release);
 	Log(Format("on (%s): backing 0x%016" PRIx64 " size 0x%" PRIx64 ", %u chunks of 64 MiB imported on demand",
-	           BindEnabled() ? "bind: small read-only buffer bindings read in place" : CensusEnabled() ? "census of the buffer read bindings" : "no consumer yet", m.backing,
+	           RaceEnabled() ? "race: guest rewrites before GPU completion measured" : BindEnabled() ? "bind: small read-only buffer bindings read in place" : CensusEnabled() ? "census of the buffer read bindings" : "no consumer yet", m.backing,
 	           m.backing_size, m.chunk_count));
 }
 

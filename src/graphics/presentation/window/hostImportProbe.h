@@ -60,6 +60,15 @@ namespace Libs::Graphics::HostImport {
 // Bind-mode accounting (GPU thread): served, or the reason it fell back.
 enum class BindFallback : uint8_t { Served, Written, Large, GpuModified, ImageModified, NotImported, Count };
 void NoteBind(BindFallback outcome);
+// KYTY_HOST_IMPORT=race (diagnostic, no GPU read of imported memory): one in 16 bindings that bind
+// mode would serve has its guest bytes hashed at bind time (submission tick `tick`); once that tick
+// completed on the GPU the bytes are hashed again. A changed hash is a buffer the guest rewrote
+// before the host GPU read it: what an in-place read would have seen differently from the copy.
+[[nodiscard]] bool RaceEnabled();
+void               RaceRecord(uint64_t vaddr, uint64_t size, uint64_t tick);
+// The oldest recorded tick still to check (0: none); RaceCheckFront rehashes that entry.
+[[nodiscard]] uint64_t RaceFrontTick();
+void                   RaceCheckFront();
 void Start(GraphicContext& ctx);
 void Stop();
 
