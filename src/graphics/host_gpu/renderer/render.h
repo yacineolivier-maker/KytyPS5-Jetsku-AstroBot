@@ -1138,6 +1138,12 @@ private:
 	// (NativeS0Learn), kept by NativeS1SegmentDraw for the segment's continuations.
 	uint64_t       m_native_context_hash = 0;
 	uint64_t       m_native_export_hash  = 0;
+	// S1e (KYTY_NATIVE_S1_KEEP_RUN, renderDraw.cpp): a native emission recorded dynamic state, so the
+	// next DrawRun continuation records its own (not the record's, skipped as unchanged).
+	bool           m_native_s1_dynamic_dirty = false;
+	// S1e (KYTY_NATIVE_S1_PROFILE): the current DrawIndex's S1 attempt ticks (normal path after a fallback).
+	uint64_t       m_native_s1_attempt_ticks = 0;
+	bool           m_native_s1_attempted     = false;
 	bool           NativeS1Emit(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void           NativeS1SegmentDraw(const CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering);
 	void           NativeS1SegmentEnd(const CommandBuffer& buffer, bool valid);

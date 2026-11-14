@@ -10,6 +10,8 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
+#include <intrin.h>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -239,6 +241,76 @@ bool EvaluateBound(const DwordRecipe& r, const uint32_t* ud, uint32_t count, uin
 		}
 	}
 	return false;
+}
+
+// S1e: the stage's loads grouped by pointer halves (LoadGroup): each Load dword gets its group and
+// byte offset in it. Groups span at most kGroupMaxBytes.
+constexpr int64_t kGroupMaxBytes = 256;
+void BuildLoadGroups(StageRecipe& recipe, Entry::S1Stage& st) {
+	struct Ref {
+		uint8_t      lo, hi;
+		int64_t      offset;
+		DwordRecipe* dword;
+	};
+	std::vector<Ref> refs;
+	const auto       collect = [&](DwordRecipe& d) {
+        if (d.kind == DwordRecipe::Kind::Load) refs.push_back({d.lo, d.hi, d.offset, &d});
+	};
+	for (auto* list: {&recipe.buffers, &recipe.images, &recipe.samplers}) {
+		for (auto& r: *list) {
+			for (uint32_t k = 0; k < r.dword_count && k < r.dwords.size(); k++) collect(r.dwords[k]);
+		}
+	}
+	for (auto& flat: recipe.flat) collect(flat.recipe);
+	std::sort(refs.begin(), refs.end(), [](const Ref& a, const Ref& b) {
+		return a.lo != b.lo ? a.lo < b.lo : a.hi != b.hi ? a.hi < b.hi : a.offset < b.offset;
+	});
+	st.groups.clear();
+	st.group_bytes = 0;
+	for (const auto& ref: refs) {
+		if (st.groups.empty() || st.groups.back().lo != ref.lo || st.groups.back().hi != ref.hi ||
+		    ref.offset + 4 - st.groups.back().offset > kGroupMaxBytes) {
+			if (st.groups.size() >= 0xfffeu) {
+				ref.dword->group = 0xffffu; // per-dword read
+				continue;
+			}
+			st.groups.push_back({ref.lo, ref.hi, ref.offset, 4u, 0u});
+		}
+		auto& g             = st.groups.back();
+		g.bytes             = std::max<uint32_t>(g.bytes, static_cast<uint32_t>(ref.offset + 4 - g.offset));
+		ref.dword->group      = static_cast<uint16_t>(st.groups.size() - 1u);
+		ref.dword->group_byte = static_cast<uint16_t>(ref.offset - g.offset);
+	}
+	for (auto& g: st.groups) {
+		g.at = st.group_bytes;
+		st.group_bytes += (g.bytes + 3u) & ~3u;
+	}
+}
+
+// S1e: EvaluateBound through the stage's load groups: a group is read once (on its first use), in
+// one clean backing read; a group read that is refused, or whose range touches a never-mapped
+// address or crosses the GPU address limit, leaves its dwords to EvaluateBound (the same answers).
+bool EvaluateGrouped(const DwordRecipe& r, const uint32_t* ud, uint32_t count, const Entry::S1Stage& st, uint8_t* data,
+                     uint8_t* state, uint32_t& out) {
+	if (r.kind != DwordRecipe::Kind::Load || r.group >= st.groups.size()) return EvaluateBound(r, ud, count, out);
+	if (r.hi >= count || r.lo >= count) return false;
+	const auto& g = st.groups[r.group];
+	auto&       s = state[r.group];
+	if (s == 0) {
+		constexpr uint64_t kGpuLimit = uint64_t {1} << 40u; // kernel/memory.cpp IsGpuAddressRange
+		const uint64_t base    = (((static_cast<uint64_t>(ud[g.hi]) << 32u) | ud[g.lo]) & kAddressMask) & ~uint64_t {3};
+		const uint64_t address = base + static_cast<uint64_t>(g.offset);
+		s                      = 2;
+		if (!IR::NeverMappedAddress(address, g.bytes) && (address < kGpuLimit) == (address + g.bytes - 1u < kGpuLimit) &&
+		    LibKernel::Memory::TryReadGpuCleanBacking(address, data + g.at, g.bytes)) {
+			s = 1;
+		}
+	}
+	if (s == 1) {
+		std::memcpy(&out, data + g.at + r.group_byte, sizeof(out));
+		return true;
+	}
+	return EvaluateBound(r, ud, count, out);
 }
 
 bool SameDword(const DwordRecipe& a, const DwordRecipe& b) {
@@ -479,6 +551,130 @@ bool S1WritesEnabled() {
 	}();
 	return enabled;
 }
+
+// S1e: KYTY_NATIVE_S1_VARIANT (default 1): a full key whose entry has other stages than the model
+// is rebuilt with that entry's stages (nativeLearn.h "S1e"); 0: "vs:variant" fallback (S1d).
+static bool S1VariantEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_VARIANT");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// S1e: KYTY_NATIVE_S1_GROUPED (default 1): recipe loads read by group (LoadGroup); 0: per dword (S1d).
+static bool S1GroupedReads() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_GROUPED");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// ---- S1e: KYTY_NATIVE_S1_PROFILE (nativeLearn.h Prof) ----------------------------------------------
+namespace Prof {
+namespace {
+constexpr uint32_t    kSlots                  = 6; // engine thread slots + "other"
+constexpr const char* kSlotNames[kSlots]      = {"Geometry", "Extra", "Shadow", "Decal", "DrawThread", "other"};
+constexpr const char* kStepNames[kStepCount] = {"checks", "predict", "lookup", "user-data", "flow", "eval", "spec", "fetch", "key",
+                                                "pre", "bind-vs", "bind-ps", "gfx-bind", "vertex+late", "commit", "tail",
+                                                "learn", "segment", "finish"};
+struct Bucket {
+	uint64_t                            draws = 0, ticks = 0;
+	std::array<uint64_t, kStepCount>    step {};
+};
+struct SlotData {
+	Bucket   native, normal;
+	uint64_t attempted = 0, attempt_ticks = 0, continued = 0, continued_ticks = 0;
+};
+std::array<SlotData, kSlots>     g_slots {};
+std::array<uint64_t, kStepCount> g_pending {};
+uint32_t                         g_slot     = kSlots - 1u;
+uint64_t                         g_tsc_last = 0;
+int64_t                          g_ns_last  = 0;
+uint32_t                         g_calls    = 0;
+
+int64_t NowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
+uint64_t Marker::Now() {
+	return __rdtsc();
+}
+
+bool Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_PROFILE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+void SetSlot(uint32_t op_flags) {
+	g_slot = std::min<uint32_t>((op_flags >> GC::kNativeOpSlotShift) & GC::kNativeSlotMask, kSlots - 1u);
+	g_pending.fill(0);
+}
+
+void Add(uint32_t step, uint64_t ticks) {
+	if (step < kStepCount) g_pending[step] += ticks;
+}
+
+void Draw(bool native, bool attempted, bool continued, uint64_t ticks, uint64_t attempt_ticks) {
+	auto& slot   = g_slots[g_slot];
+	auto& bucket = native ? slot.native : slot.normal;
+	bucket.draws++;
+	bucket.ticks += ticks;
+	for (uint32_t i = 0; i < kStepCount; i++) bucket.step[i] += g_pending[i];
+	g_pending.fill(0);
+	if (!native && attempted) {
+		slot.attempted++;
+		slot.attempt_ticks += attempt_ticks;
+	}
+	if (!native && continued) {
+		slot.continued++;
+		slot.continued_ticks += ticks;
+	}
+	Tick();
+}
+
+void Tick() {
+	if ((++g_calls & 255u) != 0) return;
+	const int64_t  ns  = NowNs();
+	const uint64_t tsc = __rdtsc();
+	if (g_ns_last == 0) {
+		g_ns_last  = ns;
+		g_tsc_last = tsc;
+		g_slots    = {};
+		return;
+	}
+	if (ns - g_ns_last < 10'000'000'000ll) return;
+	const double tpu     = static_cast<double>(tsc - g_tsc_last) * 1000.0 / static_cast<double>(ns - g_ns_last);
+	const double seconds = static_cast<double>(ns - g_ns_last) * 1e-9;
+	g_ns_last            = ns;
+	g_tsc_last           = tsc;
+	const auto us        = [&](uint64_t t, uint64_t n) { return tpu <= 0.0 || n == 0 ? 0.0 : static_cast<double>(t) / tpu / static_cast<double>(n); };
+	std::string out      = fmt::format("GameNative s1 profile ({:.1f} s, us per draw of the class):", seconds);
+	for (uint32_t s = 0; s < kSlots; s++) {
+		const auto& d = g_slots[s];
+		if (d.native.draws == 0 && d.normal.draws == 0) continue;
+		const auto steps = [&](const Bucket& b) {
+			std::string text;
+			for (uint32_t i = 0; i < kStepCount; i++) {
+				if (b.step[i] != 0) text += fmt::format(" {} {:.2f}", kStepNames[i], us(b.step[i], b.draws));
+			}
+			return text;
+		};
+		out += fmt::format("\n  \"{}\": native {} draws {:.2f} us [{} ] | normal path {} draws {:.2f} us (DrawRun continued {} at {:.2f} us; "
+		                   "attempted {} at {:.2f} us of attempt) [{} ]",
+		                   kSlotNames[s], d.native.draws, us(d.native.ticks, d.native.draws), steps(d.native), d.normal.draws,
+		                   us(d.normal.ticks, d.normal.draws), d.continued, us(d.continued_ticks, d.continued), d.attempted,
+		                   us(d.attempt_ticks, d.attempted), steps(d.normal));
+	}
+	g_slots = {};
+	Log::WriteToConsoleAndLog(out + "\n");
+}
+} // namespace Prof
 
 // S1b/S1c (nativeLearn.h): one XXH3 over the packed words (was one call per buffer and attribute
 // list): the embedded fetch inputs of the vertex program key (per resource the destination
@@ -783,6 +979,7 @@ bool Session::Begin(const DrawView& view) {
             });
 			S1Shape(*e, view);
 		}
+		for (uint32_t s = 0; s < e->stage_count; s++) BuildLoadGroups(e->recipe[s], e->s1[s]); // S1e
 		m_result.reason      = reason;
 		m_result.deep_opcode = opcode;
 		fresh                = e->recipe;
@@ -961,6 +1158,7 @@ void Session::Conflict(const Entry& entry, const DrawView& view) {
 }
 
 uint32_t Session::PredictS1(const S1Inputs& in) {
+	Prof::Marker mark;
 	m_s1_op            = in.op_flags;
 	m_s1_armed         = false;
 	m_s1_shape         = GC::kShCovered;
@@ -988,18 +1186,24 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 		m_s1_shape       = cached.shape;
 		m_s1_shape_stage = cached.stage;
 		m_s1_write_kinds = cached.write_kinds;
+		mark(Prof::kPLookup);
 		return GC::kS1Shape;
 	}
 	if (!GC::LookupNativeRecordForOp(in.op_flags, m_record)) {
+		mark(Prof::kPLookup);
 		return GC::kS1Record;
 	}
 	if (m_record.count != in.index_count || ((m_record.known & GC::kNkPgmEs) != 0 && m_record.pgm_es != in.es_addr) ||
 	    (in.pixel && (m_record.known & GC::kNkPgmPs) != 0 && m_record.pgm_ps != in.ps_addr)) {
+		mark(Prof::kPLookup);
 		return GC::kS1Record;
 	}
 	const uint64_t base = BaseKey(m_record, in.formats_hash, in.regs_hash);
 	const Entry*   rep  = m_table->FindBase(base);
-	if (rep == nullptr) return GC::kS1Miss;
+	if (rep == nullptr) {
+		mark(Prof::kPLookup);
+		return GC::kS1Miss;
+	}
 	m_s1_census      = true;
 	m_s1_write_kinds = rep->write_kinds;
 	if (!rep->s1_covered) {
@@ -1007,19 +1211,96 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 		m_s1_mask = rep->s1_mask;
 		m_s1_shape       = rep->s1_shape;
 		m_s1_shape_stage = rep->s1_shape_stage;
+		mark(Prof::kPLookup);
 		return GC::kS1Shape;
 	}
 	if (cached.tag == tag) cached.tag = 0;
 	const uint32_t stages = in.pixel ? 2u : 1u;
-	if (rep->stage_count != stages) return shape(GC::kShVariant, stages - 1u);
 	// The plain pixel variant (KYTY_LOD_STATS_PLAIN_VARIANT): verify mode binds a canary the native
 	// path does not handle; on, the variant is taken unless the bindings record mip statistics,
 	// which the emission checks after resolving them (kS1Plain).
 	if (in.pixel && in.lod_plain == 2u) return shape(GC::kShLodVerify, 1);
-	const bool plain = in.pixel && in.lod_plain == 1u && rep->plain_available;
-	uint64_t   spec  = Mix(0x84222325cbf29ce4ull, plain ? 1u : 0u);
+	// S1e ("vs:variant", nativeLearn.h "S1e"): the stages are rebuilt with a model entry's recipes and
+	// plans: the base's last found entry (hint) when it is covered, else the representative. A full
+	// key whose entry has other stages (another source of the same base: an embedded fetch with other
+	// formats compiles another program, whose plan and recipes are its own) is rebuilt once more with
+	// that entry as the model; the prediction stands only when the rebuilt key finds the model itself
+	// (or an entry with the same stages): the plan, recipes and fetch template are then those of the
+	// program the normal path selects for these inputs.
+	if (m_s1_hints == nullptr) m_s1_hints = std::make_unique<std::array<S1Hint, kS1HintSize>>();
+	auto&        hint  = (*m_s1_hints)[static_cast<uint32_t>(base >> 32u) & (kS1HintSize - 1u)];
+	const Entry* model = rep;
+	if (S1VariantEnabled() && hint.base == base && hint.entry != nullptr && hint.entry->s1_covered &&
+	    hint.entry->stage_count == stages && !hint.entry->conflicted) {
+		model = hint.entry;
+	}
+	if (model->stage_count != stages) return shape(GC::kShVariant, stages - 1u);
+	mark(Prof::kPLookup);
+	const Entry* entry = nullptr;
+	uint64_t     key   = 0;
+	bool         plain = false;
+	bool switched  = false; // rebuilt with the found entry's stages
+	bool tried_rep = model == rep;
+	bool found     = false;
+	for (uint32_t pass = 0; pass < 3 && !found; pass++) {
+		plain = in.pixel && in.lod_plain == 1u && model->plain_available;
+		if (const auto reason = BuildS1(*model, in, base, plain, key); reason != GC::kS1Emitted) return reason;
+		Prof::Marker key_mark;
+		entry = m_table->Find(key);
+		if (entry == nullptr || entry->conflicted) {
+			key_mark(Prof::kPKey);
+			// A hint of another permutation of the base may give a key nobody learned: the
+			// representative once more.
+			if (!tried_rep && !switched) {
+				tried_rep = true;
+				model     = rep;
+				continue;
+			}
+			return GC::kS1Miss;
+		}
+		if (!entry->s1_covered) {
+			m_s1_mask |= entry->s1_mask;
+			key_mark(Prof::kPKey);
+			return shape(entry->s1_shape, entry->s1_shape_stage);
+		}
+		m_s1_write_kinds = entry->write_kinds;
+		// The plain choice is part of the key (its first mixed value): an entry found with the
+		// model's choice has the same plain availability as the program it describes.
+		if (entry == model || (SameS1Stages(*entry, *model) && entry->plain_available == model->plain_available)) {
+			key_mark(Prof::kPKey);
+			found = true;
+			break;
+		}
+		key_mark(Prof::kPKey);
+		if (switched || !S1VariantEnabled() || entry->stage_count != stages) return shape(GC::kShVariant, 0);
+		switched = true;
+		model    = entry;
+	}
+	if (!found) return shape(GC::kShVariant, 0);
+	hint                     = {base, entry};
+	m_prediction.entry       = entry;
+	m_prediction.key         = key;
+	m_prediction.stage_count = stages;
+	m_prediction.plain       = plain;
+	m_prediction.pipeline    = entry->current;
+	m_prediction.generation  = entry->current_generation;
+	return GC::kS1Emitted;
+}
+
+// S1e: PredictS1's rebuild of the stages and the embedded fetch with `model`'s stages (user data,
+// active sources, recipes through the load groups, specialization, fetch), and the full key.
+uint32_t Session::BuildS1(const Entry& model, const S1Inputs& in, uint64_t base, bool plain, uint64_t& key) {
+	Prof::Marker mark;
+	const auto   shape = [&](uint32_t code, uint32_t stage) {
+        m_s1_shape       = code;
+        m_s1_shape_stage = stage;
+        m_s1_mask |= GC::S1ShapeBit(code, stage);
+        return GC::kS1Shape;
+	};
+	const uint32_t stages = model.stage_count;
+	uint64_t       spec   = Mix(0x84222325cbf29ce4ull, plain ? 1u : 0u);
 	for (uint32_t s = 0; s < stages; s++) {
-		const auto&     st     = rep->s1[s];
+		const auto&     st     = model.s1[s];
 		const uint32_t* sgpr   = s == 0 ? in.user_sgpr : in.ps_user_sgpr;
 		const uint32_t  sgpr_n = s == 0 ? in.user_sgpr_count : in.ps_user_sgpr_count;
 		// S1d: user_data = prefix (zeros, or the GS user-data address) + the bound user SGPRs; the
@@ -1034,10 +1315,24 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 		std::copy_n(sgpr, sgpr_n, snap.user_data.begin() + st.ud_prefix);
 		const uint32_t* ud     = snap.user_data.data();
 		const uint32_t  ud_n   = st.ud_count;
-		const auto&     recipe = rep->recipe[s];
-		const auto&     info   = (s == 0 ? rep->vs : rep->ps)->info;
+		const auto&     recipe = model.recipe[s];
+		const auto&     info   = (s == 0 ? model.vs : model.ps)->info;
+		mark(Prof::kPUserData);
 		// S1c: the plan's active sources (control flow): an inactive source materializes as zeros.
-		if (!ActiveSources(*st.plan, snap.user_data, s == 0 ? in.es_addr : in.ps_addr, m_s1_active)) return GC::kS1Read;
+		if (!ActiveSources(*st.plan, snap.user_data, s == 0 ? in.es_addr : in.ps_addr, m_s1_active)) {
+			mark(Prof::kPFlow);
+			return GC::kS1Read;
+		}
+		mark(Prof::kPFlow);
+		// S1e: the load groups' bytes, read on first use (S1d read each dword on its own).
+		if (m_s1_group_data.size() < st.group_bytes + 4u) m_s1_group_data.resize(st.group_bytes + 4u);
+		m_s1_group_state.assign(st.groups.size() + 1u, 0u);
+		uint8_t*   group_data  = m_s1_group_data.data();
+		uint8_t*   group_state = m_s1_group_state.data();
+		const bool grouped     = S1GroupedReads();
+		const auto eval        = [&](const DwordRecipe& r, uint32_t& out) {
+            return grouped ? EvaluateGrouped(r, ud, ud_n, st, group_data, group_state, out) : EvaluateBound(r, ud, ud_n, out);
+		};
 		const auto build = [&](const std::vector<ResourceRecipe>& recipes, const auto& resources, std::vector<IR::DescriptorValue>& values) {
 			values.resize(recipes.size());
 			for (size_t i = 0; i < recipes.size(); i++) {
@@ -1054,31 +1349,40 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 					}
 				}
 				for (uint32_t k = 0; k < r.dword_count; k++) {
-				if (!EvaluateBound(r.dwords[k], ud, ud_n, v.dwords[k])) return false;
-			}
+					if (!eval(r.dwords[k], v.dwords[k])) return false;
+				}
 			}
 			return true;
 		};
 		if (!build(recipe.buffers, info.buffers, snap.buffers) || !build(recipe.images, info.images, snap.images) ||
 		    !build(recipe.samplers, info.samplers, snap.samplers)) {
+			mark(Prof::kPEval);
 			return GC::kS1Read;
 		}
 		snap.uniform_fill = {};
 		snap.flattened_srt.assign(st.flat_size, 0u);
 		for (const auto& flat: recipe.flat) {
 			if (flat.flat_offset >= st.flat_size) return shape(GC::kShFlat, s);
-			if (!EvaluateBound(flat.recipe, ud, ud_n, snap.flattened_srt[flat.flat_offset])) return GC::kS1Read;
+			if (!eval(flat.recipe, snap.flattened_srt[flat.flat_offset])) {
+				mark(Prof::kPEval);
+				return GC::kS1Read;
+			}
 		}
+		mark(Prof::kPEval);
 		// The whole specialization as materialization derives it (null V#s and invalid T#s zeroed,
 		// the image remap applied to the snapshot).
-		if (!IR::SpecializeForNative(*st.plan, snap, m_prediction.specialization[s])) return GC::kS1Spec;
+		if (!IR::SpecializeForNative(*st.plan, snap, m_prediction.specialization[s])) {
+			mark(Prof::kPSpec);
+			return GC::kS1Spec;
+		}
 		spec = Mix(spec, SpecHash(m_prediction.specialization[s]));
+		mark(Prof::kPSpec);
 	}
 	// S1c: the embedded fetch, rebuilt from the bound SGPRs and the guest tables.
-	m_prediction.fetch      = rep->fetch != nullptr;
+	m_prediction.fetch      = model.fetch != nullptr;
 	m_prediction.fetch_hash = 0;
-	if (rep->fetch != nullptr) {
-		const auto& tpl = *rep->fetch;
+	if (model.fetch != nullptr) {
+		const auto& tpl = *model.fetch;
 		auto&       vi  = m_prediction.vertex;
 		vi.resources_num = static_cast<int>(tpl.count);
 		for (uint32_t i = 0; i < tpl.count; i++) {
@@ -1088,25 +1392,15 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 		}
 		vi.fetch_attrib_reg = tpl.attrib_reg;
 		vi.fetch_buffer_reg = tpl.buffer_reg;
-		if (!ShaderRebuildEmbeddedFetch(tpl.attrib_reg, tpl.buffer_reg, in.user_sgpr, in.user_sgpr_max, vi)) return GC::kS1Read;
+		if (!ShaderRebuildEmbeddedFetch(tpl.attrib_reg, tpl.buffer_reg, in.user_sgpr, in.user_sgpr_max, vi)) {
+			mark(Prof::kPFetch);
+			return GC::kS1Read;
+		}
 		m_prediction.fetch_hash = FetchHash(vi);
+		mark(Prof::kPFetch);
 	}
-	uint64_t key = Mix(Mix(base, m_prediction.fetch_hash), spec);
-	key          = key == 0 ? 1 : key;
-	const Entry* entry = m_table->Find(key);
-	if (entry == nullptr || entry->conflicted) return GC::kS1Miss;
-	if (!entry->s1_covered) {
-		m_s1_mask |= entry->s1_mask;
-		return shape(entry->s1_shape, entry->s1_shape_stage);
-	}
-	m_s1_write_kinds = entry->write_kinds;
-	if (!SameS1Stages(*entry, *rep)) return shape(GC::kShVariant, 0);
-	m_prediction.entry       = entry;
-	m_prediction.key         = key;
-	m_prediction.stage_count = stages;
-	m_prediction.plain       = plain;
-	m_prediction.pipeline    = entry->current;
-	m_prediction.generation  = entry->current_generation;
+	key = Mix(Mix(base, m_prediction.fetch_hash), spec);
+	key = key == 0 ? 1 : key;
 	return GC::kS1Emitted;
 }
 

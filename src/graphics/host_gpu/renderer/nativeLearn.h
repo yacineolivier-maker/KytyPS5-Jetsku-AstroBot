@@ -142,6 +142,27 @@
 //  - Eligibility cache: a direct-mapped table keyed by the selection signature (NativeRegsHash,
 //    which includes the stage program addresses) and the formats remembers a base entry that is not
 //    covered: such a draw returns before the record lookup.
+
+// S1e (cost of the S1 path, permutation variants):
+//  - "vs:variant" is a permutation variant, not the plain-pixel variant: the base key (programs,
+//    state, formats, registers) has several learned entries, and the one the full key finds (with
+//    the rebuilt fetch hash and specialization) has other S1 stages than the base's representative:
+//    another resource plan (each program source has its own: an embedded fetch with other V#
+//    formats is another vertex program key, hence another source), other recipes, user-data count
+//    or fetch template. S1d predicted with the representative's stages only, so these draws ran
+//    the whole prediction and then fell back. The prediction now rebuilds with a model entry: the
+//    base's last found entry (hint), else the representative; when the found entry has other
+//    stages, once more with that entry as the model, and it stands only when that rebuild's key
+//    finds the model again (a fixed point: the plan, recipes and template are those of the program
+//    the normal path selects for these inputs; verify compares the whole prediction as before). A
+//    hint whose key nobody learned retries with the representative. KYTY_NATIVE_S1_VARIANT=0: S1d.
+//  - Guest reads: the recipe loads of a stage are grouped at learning time by pointer halves into
+//    spans of at most 256 bytes (LoadGroup); the prediction reads a group once, on first use, in one
+//    clean backing read (S1d: one TryReadGpuCleanBacking per dword, e.g. 8 per T#), and falls back
+//    to the per-dword reads when the span read is refused, so every dword is the per-dword answer.
+//    The embedded fetch rebuild reads the attribute words and the V# table by span the same way.
+//    KYTY_NATIVE_S1_GROUPED=0: per dword.
+//  - KYTY_NATIVE_S1_PROFILE=1: Prof (below).
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -164,6 +185,22 @@ struct DwordRecipe {
 	uint8_t  hi     = 0; // Load: and of its high half
 	uint32_t value  = 0; // Const: the value; User: the user-data index
 	int64_t  offset = 0; // Load: byte offset added to the dword-aligned pointer
+	// S1e (derived from the fields above when the entry is learned; not part of the recipe's
+	// identity): the stage's load group of a Load (Entry::S1Stage::groups) and its byte offset in it.
+	uint16_t group      = 0xffffu;
+	uint16_t group_byte = 0;
+};
+
+// S1e: a run of a stage's Load dwords through the same pointer halves, read from guest memory in
+// one TryReadGpuCleanBacking call (bytes [offset, offset + bytes) after the dword-aligned pointer).
+// A group read that fails (or a range touching a never-mapped address) falls back to the per-dword
+// reads, so every evaluated dword is exactly the one the per-dword path gives.
+struct LoadGroup {
+	uint8_t  lo     = 0;
+	uint8_t  hi     = 0;
+	int64_t  offset = 0;
+	uint32_t bytes  = 0;
+	uint32_t at     = 0; // byte position of the group in the prediction's group buffer
 };
 
 struct ResourceRecipe {
@@ -232,6 +269,8 @@ struct Entry {
 		uint32_t prefix_mode = 0; // 0: prefix dwords 0; 1: dwords 0..1 the GS user-data address; 2: other / ambiguous
 		uint32_t ud_prefix   = 0; // S1d: user_data dwords before the bound user SGPRs (0 or 8)
 		uint32_t flat_size   = 0; // flattened SRT dwords
+		std::vector<LoadGroup> groups; // S1e: the recipe's loads by pointer (see LoadGroup)
+		uint32_t               group_bytes = 0;
 	};
 	std::array<S1Stage, 2> s1 {};
 	bool     viewport_index = false; // the vertex program writes the viewport index
@@ -318,6 +357,63 @@ struct DrawView {
 
 // S1d: KYTY_NATIVE_S1_WRITES (default 1): buffer-writing programs are emitted natively.
 [[nodiscard]] bool S1WritesEnabled();
+
+// S1e: KYTY_NATIVE_S1_PROFILE=1 (diagnostic): TSC sub-step timing of the S1 path on Thread_Gpu,
+// per engine thread slot, printed every 10 s ("GameNative s1 profile"): the native emissions (the
+// prediction's parts and the emission's), and what S1 adds to the normal-path draws of the slots it
+// emits for (the emission attempt that fell back, with its prediction parts when it ran, the
+// learning hook, the segment state), with those draws' DrawIndex totals and DrawRun continuations.
+// Thread_Gpu only (single writer, the report is printed by that thread).
+namespace Prof {
+enum Step : uint32_t {
+	kChecks,     // NativeS1Emit: segment, kind and register checks before the prediction
+	kPredict,    // PredictS1 (whole; its parts below)
+	kPLookup,    //   eligibility cache, record lookup, base entry, hint
+	kPUserData,  //   user data rebuild
+	kPFlow,      //   active-source walk (control flow)
+	kPEval,      //   recipe evaluation (guest reads)
+	kPSpec,      //   specialization and its hash
+	kPFetch,     //   embedded fetch rebuild and hash
+	kPKey,       //   full key lookup, coverage, variant check
+	kEPre,       // emission: pipeline / mesh / restart checks
+	kEBindVs,    // PrepareBindings, vertex stage
+	kEBindPs,    // PrepareBindings, pixel stage, feedback check
+	kEGfx,       // PrepareGraphicsBindings
+	kEVertex,    // vertex and index buffers, write stages, late check
+	kECommit,    // DrawScope, CommitBindings, dynamic state, BeginRendering, pipeline, draw, barrier
+	kETail,      // bookkeeping after the draw
+	kNLearn,     // normal path: NativeS0Learn (hashes, Begin, verify prediction)
+	kNSegment,   // normal path: NativeS1SegmentDraw
+	kNFinish,    // normal path: NativeS0Finish
+	kStepCount
+};
+[[nodiscard]] bool Enabled();
+// The slot the following Add / Draw calls are charged to (the native op's engine thread slot).
+void SetSlot(uint32_t op_flags);
+void Add(uint32_t step, uint64_t ticks);
+// One draw of the slot: emitted natively, or taken by the normal path (after an attempt: attempted;
+// continued: a DrawRun continuation), its DrawIndex ticks, and the ticks of a failed attempt.
+void Draw(bool native, bool attempted, bool continued, uint64_t ticks, uint64_t attempt_ticks);
+// Prints the window's report when 10 s passed (Thread_Gpu).
+void Tick();
+// Sub-step marker: each call charges the ticks since the previous mark (or construction) to a step.
+struct Marker {
+	bool     on;
+	uint64_t t;
+	Marker(): on(Enabled()), t(on ? Now() : 0) {}
+	void operator()(uint32_t step) {
+		if (on) [[unlikely]] {
+			const uint64_t n = Now();
+			Add(step, n - t);
+			t = n;
+		}
+	}
+	void Skip() {
+		if (on) [[unlikely]] t = Now();
+	}
+	static uint64_t Now();
+};
+} // namespace Prof
 
 class Session {
 public:
@@ -407,6 +503,19 @@ private:
 	static constexpr uint32_t kS1CacheSize = 2048; // power of two
 	std::unique_ptr<std::array<S1Ineligible, kS1CacheSize>> m_s1_cache;
 	std::vector<uint8_t> m_s1_active; // S1c: active descriptor sources of the stage being predicted
+	// S1e: the stage's load group bytes and states (0 unread, 1 read, 2 refused: per-dword reads).
+	std::vector<uint8_t> m_s1_group_data;
+	std::vector<uint8_t> m_s1_group_state;
+	// S1e ("vs:variant"): per base key, the entry the last successful prediction found; the next
+	// prediction of the base rebuilds with its stages first (one pass when the permutation repeats).
+	struct S1Hint {
+		uint64_t     base  = 0;
+		const Entry* entry = nullptr;
+	};
+	static constexpr uint32_t kS1HintSize = 1024; // power of two
+	std::unique_ptr<std::array<S1Hint, kS1HintSize>> m_s1_hints;
+	// S1e: the stage rebuild of PredictS1 with a model entry's stages (key out; reason on failure).
+	uint32_t BuildS1(const Entry& model, const S1Inputs& in, uint64_t base, bool plain, uint64_t& key);
 	// Verify sample: what the native path would push (expected) and what the commit pushed.
 	std::array<uint32_t, 32> m_push_expected {};
 	uint32_t                 m_push_mask = 0; // dwords of m_push_expected to compare

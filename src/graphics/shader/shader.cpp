@@ -1059,21 +1059,60 @@ bool ShaderRebuildEmbeddedFetch(int attrib_reg, int buffer_reg, const uint32_t* 
 	const uint64_t attrib = static_cast<uint64_t>(user_sgpr[attrib_reg]) | (static_cast<uint64_t>(user_sgpr[attrib_reg + 1]) << 32u);
 	const uint64_t buffer = static_cast<uint64_t>(user_sgpr[buffer_reg]) | (static_cast<uint64_t>(user_sgpr[buffer_reg + 1]) << 32u);
 	if (attrib == 0 || buffer == 0) return false;
+	// S1e: the attribute words in one clean read over the semantics' span, then the V#s in one read
+	// over the indices' span (S1c: two reads per resource). A refused span read falls back to the
+	// per-resource reads (a span that crosses the GPU address limit too: memory.cpp checks GPU
+	// ownership only below it), so every word is the one the per-resource read gives.
+	const auto span_read = [](uint64_t address, void* data, uint64_t size) {
+		constexpr uint64_t kGpuLimit = uint64_t {1} << 40u;
+		return (address < kGpuLimit) == (address + size - 1u < kGpuLimit) &&
+		       LibKernel::Memory::TryReadGpuCleanBacking(address, data, size);
+	};
+	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX> attributes {};
+	int                                                  min_semantic = INT32_MAX;
+	int                                                  max_semantic = -1;
 	for (int i = 0; i < info.resources_num; i++) {
-		auto&          r        = info.resources[i];
-		auto&          rd       = info.resources_dst[i];
-		const auto     semantic = static_cast<uint32_t>(rd.attr_id);
-		uint32_t       attribute = 0;
-		if (rd.attr_id < 0 ||
-		    !LibKernel::Memory::TryReadGpuCleanBacking(attrib + static_cast<uint64_t>(semantic) * 4u, &attribute, sizeof(attribute))) {
+		const int semantic = info.resources_dst[i].attr_id;
+		if (semantic < 0) return false;
+		min_semantic = std::min(min_semantic, semantic);
+		max_semantic = std::max(max_semantic, semantic);
+	}
+	bool attributes_read = false;
+	if (info.resources_num > 0 && max_semantic - min_semantic < 64) {
+		std::array<uint32_t, 64> words {};
+		const auto               count = static_cast<uint32_t>(max_semantic - min_semantic + 1);
+		if (span_read(attrib + static_cast<uint64_t>(min_semantic) * 4u, words.data(), count * sizeof(uint32_t))) {
+			for (int i = 0; i < info.resources_num; i++) attributes[i] = words[info.resources_dst[i].attr_id - min_semantic];
+			attributes_read = true;
+		}
+	}
+	uint32_t min_index = 31;
+	uint32_t max_index = 0;
+	for (int i = 0; i < info.resources_num; i++) {
+		if (!attributes_read &&
+		    !LibKernel::Memory::TryReadGpuCleanBacking(attrib + static_cast<uint64_t>(info.resources_dst[i].attr_id) * 4u, &attributes[i],
+		                                               sizeof(uint32_t))) {
 			return false;
 		}
+		min_index = std::min(min_index, attributes[i] & 0x1fu);
+		max_index = std::max(max_index, attributes[i] & 0x1fu);
+	}
+	std::array<uint32_t, 32 * 4> table {};
+	const bool                    table_read = info.resources_num > 0 &&
+	                        span_read(buffer + static_cast<uint64_t>(min_index) * 16u, table.data() + min_index * 4u,
+	                                  static_cast<uint64_t>(max_index - min_index + 1u) * 16u);
+	for (int i = 0; i < info.resources_num; i++) {
+		auto&          r         = info.resources[i];
+		auto&          rd        = info.resources_dst[i];
+		const uint32_t attribute = attributes[i];
 		const uint32_t index       = attribute & 0x1fu;
 		const auto     format      = static_cast<Prospero::VertexAttribFormat>((attribute >> 5u) & 0x1ffu);
 		const uint32_t offset      = (attribute >> 14u) & 0xfffu;
 		const uint32_t fetch_index = (attribute >> 26u) & 0x1u;
 		rd.fetch_index             = fetch_index;
-		if (!LibKernel::Memory::TryReadGpuCleanBacking(buffer + static_cast<uint64_t>(index) * 16u, r.fields, 4 * sizeof(uint32_t))) {
+		if (table_read) {
+			std::memcpy(r.fields, table.data() + index * 4u, 4 * sizeof(uint32_t));
+		} else if (!LibKernel::Memory::TryReadGpuCleanBacking(buffer + static_cast<uint64_t>(index) * 16u, r.fields, 4 * sizeof(uint32_t))) {
 			return false;
 		}
 		if (r.AddTid() || r.SwizzleEnabled()) return false; // the normal path stops there

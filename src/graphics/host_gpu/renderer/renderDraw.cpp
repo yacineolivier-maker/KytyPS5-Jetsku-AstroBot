@@ -4281,6 +4281,31 @@ static bool NativeS1RegsRelax() {
 	return enabled;
 }
 
+// S1e: KYTY_NATIVE_S1_KEEP_RUN (default 1). A native emission leaves the DrawRun records as they
+// are (S1d dropped them, so the next normal draw resolved its structure in full: DrawRun
+// "started"). What a continuation of the record reuses is not changed by a successful emission:
+//  - targets and rendering instance: the emission continues the segment's (= the record's)
+//    rendering state; a change of instance, image state or command buffer fails the record's own
+//    checks (ActiveRenderingSerial, ImageStateEpoch through DrawRunImagesUnchanged, Identity, tick);
+//  - textures and samplers: the emission binds through its own PreparedBindings (NativeS1State),
+//    m_graphics_bindings keep the record's sets;
+//  - descriptors: its push / set bind moves the command buffer's DescriptorEpoch, so a partial push
+//    (DrawRunPartialPush) is refused and the continuation pushes in full;
+//  - pipeline, vertex / index buffers, push constants: always bound again by the normal path
+//    (through their shadows);
+//  - dynamic state: the emission may record its own (relaxed registers, another vertex program's
+//    viewport-index output...) and binds another pipeline: m_native_s1_dynamic_dirty, the next
+//    continuation records its own (SetGraphicsDynamicParams through the shadow: only differences
+//    are emitted) instead of skipping it.
+// KYTY_DRAW_RUN=verify checks continuations against the normal path. 0: S1d's behaviour.
+static bool NativeS1KeepRun() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_KEEP_RUN");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 // S1d: the context byte ranges NativeS1RelaxedKey leaves out, found once through
 // VisitKeyDiagParts (raster members by their order: line width, reset index, scan mode, AA sample,
 // AA config, mode control, polygon offset, EQAA; shader group: stages, shader registers); each
@@ -4446,9 +4471,11 @@ void RenderExecutor::NativeS1SegmentEnd(const CommandBuffer& buffer, bool valid)
 
 bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer, const DrawIndexArgs& args) {
 	namespace GC  = Loader::GameCapture;
+	namespace NP  = NativeLearn::Prof;
 	const auto op = m_native_s0_op;
 	GC::NativeS1Draw note;
 	bool             predicted = false; // S1d: PredictS1 ran (its census applies)
+	NP::Marker       mark;              // S1e (KYTY_NATIVE_S1_PROFILE)
 	const auto out = [&](uint32_t reason) {
 		note.reason = reason;
 		if (reason == GC::kS1Shape && m_native_s0 != nullptr) {
@@ -4542,7 +4569,10 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	in.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
 	NativeS1PixelInputs(buffer, pixel, in);
 	predicted = true;
-	if (const auto reason = m_native_s0->PredictS1(in); reason != GC::kS1Emitted) return out(reason);
+	mark(NP::kChecks);
+	const auto predict_reason = m_native_s0->PredictS1(in);
+	mark(NP::kPredict);
+	if (predict_reason != GC::kS1Emitted) return out(predict_reason);
 	const auto& pred  = m_native_s0->Prediction();
 	const auto& entry = *pred.entry;
 	if (GC::NativeVerifyEnabled() && m_native_s0->S1Sample()) {
@@ -4576,11 +4606,13 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	}
 	if (seg.has_clear && buffer.HasPendingBarriers()) return out(GC::kS1Barriers);
 	const auto& pipeline = *entry.current;
+	mark(NP::kEPre);
 	// Bindings: the emulator's own binding work on the rebuilt snapshots (textures and samplers:
 	// RepeatStageTextures / TextureBindingMemo / ResolveTexture and NativeSampler, as the normal
 	// path resolves them).
 	st.runtime = {entry.vs, &pred.snapshot[0]};
 	PrepareBindings(st.runtime, st.bindings, nullptr, false);
+	mark(NP::kEBindVs);
 	std::array<PreparedBindings*, 2> stage_array {&st.bindings, &st.ps_bindings};
 	const uint32_t                   stage_count = pixel ? 2u : 1u;
 	if (pixel) {
@@ -4607,8 +4639,10 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		(void)m_context.GetBufferCache().FindBuffer(index_source.address, index_source.size);
 	}
 	const auto stages = std::span<PreparedBindings* const> {stage_array.data(), stage_count};
+	mark(NP::kEBindPs);
 	// Texture views (RebindImages) when a stage samples; the targets are the segment's.
 	PrepareGraphicsBindings(stages, {}, !has_images);
+	mark(NP::kEGfx);
 	// S1c: the embedded fetch's vertex buffers (AcquireVertexBuffers on the rebuilt input info, as
 	// the normal path acquires them after the stage bindings), then the index buffer.
 	auto&                 pred_mut = m_native_s0->MutablePrediction();
@@ -4637,6 +4671,8 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	    (seg.has_clear && buffer.HasPendingBarriers())) {
 		return out(GC::kS1Late);
 	}
+	mark(NP::kEVertex);
+	bool dynamic_recorded = false; // S1e: the emission recorded dynamic state (KYTY_NATIVE_S1_KEEP_RUN)
 	// Emission.
 	{
 		const CommandBuffer::DrawScope draw_scope(buffer, false);
@@ -4653,6 +4689,7 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		                          m_dynamic_state.command == vk_buffer.Identity() && m_dynamic_state.pipeline != nullptr &&
 		                          buffer.BoundPipeline(vk::PipelineBindPoint::eGraphics) == m_dynamic_state.pipeline &&
 		                          feedback_ok && entry.viewport_index == seg.viewport_index;
+		dynamic_recorded = !dynamic_kept;
 		if (!dynamic_kept) {
 			st.vs_info.stage = st.runtime;
 			SetGraphicsDynamicParams(buffer, vk_buffer, st.vs_info, seg.depth, seg.rendering, m_dynamic_state, nullptr);
@@ -4725,12 +4762,21 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		}
 	}
 	ResetBindings();
-	// The DrawRun records no longer describe the command buffer's descriptors and pipeline.
-	BeginDrawRun();
-	m_run_prev_valid = false;
-	m_run_keepable   = false;
-	for (auto& record: m_run_kept) {
-		record.valid = false;
+	mark(NP::kECommit);
+	if (NativeS1KeepRun()) {
+		// S1e: the DrawRun records stay (NativeS1KeepRun). The next continuation records its dynamic
+		// state through the shadow (only differences are emitted) instead of skipping it: the emission
+		// may have recorded its own (dynamic_recorded) and bound another pipeline.
+		(void)dynamic_recorded;
+		m_native_s1_dynamic_dirty = true;
+	} else {
+		// S1d: the DrawRun records no longer describe the command buffer's descriptors and pipeline.
+		BeginDrawRun();
+		m_run_prev_valid = false;
+		m_run_keepable   = false;
+		for (auto& record: m_run_kept) {
+			record.valid = false;
+		}
 	}
 	seg.rendering_serial = buffer.ActiveRenderingSerial();
 	seg.activity         = DrawRun::ActivityEpoch();
@@ -4752,6 +4798,7 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	note.shape_mask  = 0;
 	note.write_kinds = m_native_s0->S1WriteKinds();
 	GC::NoteNativeS1(op, note);
+	mark(NP::kETail);
 	return true;
 }
 
@@ -5168,8 +5215,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	CommitStats::Mark(CommitStats::Phase::Pipeline);
 	// Astro Bot PC (KYTY_NATIVE_MODE=s0, nativeLearn.h): the learning hook of a native op's draw.
 	if (m_native_s0_op != 0) [[unlikely]] {
+		NativeLearn::Prof::Marker learn_mark; // S1e (KYTY_NATIVE_S1_PROFILE)
 		NativeS0Learn(state, pipeline, *programs, plain_pixel, mesh_active, static_cast<uint32_t>(vertex_stages.size()),
 		              draw.IsIndexed(), draw.index_count, buffer);
+		learn_mark(NativeLearn::Prof::kNLearn);
 	}
 	if (mesh_indirect) {
 		// The conversion of the argument record into this draw's dispatches and draw dwords:
@@ -5341,8 +5390,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// vertex program as the previous draw's, which recorded it into this command buffer; the
 	// shadow shows nothing replaced it since (another pipeline bind or command buffer).
 	// A recall records it again: the draws in between left their own.
+	// S1e: a native emission since the record recorded the dynamic state of its own registers and
+	// vertex program (m_native_s1_dynamic_dirty): the continuation records its own again.
 	const bool run_dynamic = (m_run_active || m_run_verify) && !m_run_recall && !m_run_pipeswap &&
-	                         DynamicStateShadowEnabled() &&
+	                         !m_native_s1_dynamic_dirty && DynamicStateShadowEnabled() &&
 	                         m_dynamic_state.valid && m_dynamic_state.command == vk_buffer.Identity() &&
 	                         m_dynamic_state.pipeline != nullptr &&
 	                         buffer.BoundPipeline(vk::PipelineBindPoint::eGraphics) ==
@@ -5375,6 +5426,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 	}
+	m_native_s1_dynamic_dirty = false; // S1e: the draw's dynamic state is recorded (or the record's still holds)
 	if (m_run_verify && run_verify_images && run_dynamic &&
 	    g_dynamic_state_emitted != run_dynamic_emitted) {
 		DrawRun::CountVerifyCheck();
@@ -5513,11 +5565,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (m_native_s0 != nullptr) [[unlikely]] {
 		// S1: the segment state this native op's normal-path draw leaves (its own draw only).
 		// S1b: only for the slots S1 emits for (the segment state costs a targets key without one).
+		NativeLearn::Prof::Marker segment_mark; // S1e (KYTY_NATIVE_S1_PROFILE)
 		if (Loader::GameCapture::NativeS1() && m_native_s0->Active() && indirect == nullptr && !mesh_indirect &&
 		    Loader::GameCapture::NativeS1SlotEnabled(m_native_s0->ActiveOp())) {
 			NativeS1SegmentDraw(buffer, state, rendering);
+			segment_mark(NativeLearn::Prof::kNSegment);
 		}
 		NativeS0Finish(); // S0: compares a verify sample's captures, reports the draw
+		segment_mark(NativeLearn::Prof::kNFinish);
 	}
 	CommitStats::StepMark(CommitStats::Step::DrawCmd);
 	static const bool occlusion_draw_rows = [] {
@@ -5819,6 +5874,27 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+	// S1e (KYTY_NATIVE_S1_PROFILE, nativeLearn.h Prof): the DrawIndex ticks of a native op of an S1
+	// slot, charged to its class (native, or normal path) when it returns.
+	struct NativeS1ProfileGuard {
+		RenderExecutor& ex;
+		uint64_t        start = 0;
+		bool            on    = false;
+		~NativeS1ProfileGuard() {
+			if (on) [[unlikely]] {
+				const bool native = ex.m_native_s1_done;
+				NativeLearn::Prof::Draw(native, ex.m_native_s1_attempted, !native && ex.m_run_active,
+				                        NativeLearn::Prof::Marker::Now() - start, ex.m_native_s1_attempt_ticks);
+			}
+		}
+	} native_s1_profile {*this};
+	m_native_s1_attempted = false;
+	if (m_native_s0_op != 0 && Loader::GameCapture::NativeS1() && NativeLearn::Prof::Enabled() &&
+	    Loader::GameCapture::NativeS1SlotEnabled(m_native_s0_op)) [[unlikely]] {
+		native_s1_profile.on    = true;
+		native_s1_profile.start = NativeLearn::Prof::Marker::Now();
+		NativeLearn::Prof::SetSlot(m_native_s0_op);
+	}
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::DrainPendingOperations");
 		m_context.GetCommandScheduler().PopReadyOperations();
@@ -5842,8 +5918,13 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	m_native_draw_counter++;
 	m_native_s1_done = false;
 	if (m_native_s0_op != 0 && Loader::GameCapture::NativeS1()) [[unlikely]] {
+		const uint64_t attempt_start = native_s1_profile.on ? NativeLearn::Prof::Marker::Now() : 0u;
 		if (NativeS1Emit(submit_id, buffer, args)) {
 			return;
+		}
+		if (native_s1_profile.on) [[unlikely]] {
+			m_native_s1_attempted     = true;
+			m_native_s1_attempt_ticks = NativeLearn::Prof::Marker::Now() - attempt_start;
 		}
 	}
 	// KYTY_DRAW_RUN: only a draw that records through the eligible path seeds the next continuation.
