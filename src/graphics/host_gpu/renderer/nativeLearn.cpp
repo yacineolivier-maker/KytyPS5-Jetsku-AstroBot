@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <string>
+#include <xxhash.h>
 
 namespace Libs::Graphics::NativeLearn {
 
@@ -287,8 +289,8 @@ uint32_t S1StageShape(const Entry& e, uint32_t s, const DrawView& view) {
 	const auto& st      = e.s1[s];
 	const auto& recipe  = e.recipe[s];
 	if (s == 0 && view.vertex_stage_count != 1) return GC::kShTess;
-	if (recipe.reason == GC::kS0Flow) return GC::kShFlow;
-	if (recipe.reason != GC::kS0Simple) return GC::kShDeep; // deep, indirect descriptor, const buffer
+	// S1c: a simple recipe with control flow is covered (active-source walk at prediction).
+	if (recipe.reason != GC::kS0Simple && recipe.reason != GC::kS0Flow) return GC::kShDeep; // deep, indirect descriptor, const buffer
 	if (program.has_address_writes ||
 	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(), [](const auto& b) { return b.written || b.atomic; }) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& i) { return i.written || i.atomic; })) {
@@ -317,9 +319,14 @@ uint32_t S1StageShape(const Entry& e, uint32_t s, const DrawView& view) {
 				return GC::kShBinding;
 		}
 	}
-	if (st.plan == nullptr || !st.plan->control_flow.empty()) return GC::kShFlow;
+	if (st.plan == nullptr) return GC::kShFlow;
+	// S1c: the flow walk evaluates block conditions only (not the uniform fill's values).
 	if (st.plan->uniform_fill.fill.words != 0) return GC::kShUniform;
-	if (s == 0 && (view.fetch_embedded || view.vertex_buffers != 0)) return GC::kShFetch;
+	// S1c: embedded fetch is covered on the vertex (non-mesh) path with a learned template.
+	if (s == 0 && (view.fetch_embedded || view.vertex_buffers != 0) &&
+	    (e.mesh_active || e.fetch == nullptr || !view.fetch_embedded)) {
+		return GC::kShFetch;
+	}
 	if (s == 0 && view.user_clip_planes != 0) return GC::kShClip;
 	if (st.prefix_mode > 1 || st.ud_count < st.ud_base) return GC::kShPrefix;
 	for (const auto* list: {&recipe.buffers, &recipe.images, &recipe.samplers}) {
@@ -342,8 +349,23 @@ void S1Shape(Entry& e, const DrawView& view) {
 	e.s1_covered = e.s1_shape == GC::kShCovered;
 }
 
+bool SameFetch(const Entry& a, const Entry& b) {
+	if ((a.fetch == nullptr) != (b.fetch == nullptr)) return false;
+	if (a.fetch == nullptr) return true;
+	const auto& x = *a.fetch;
+	const auto& y = *b.fetch;
+	if (x.attrib_reg != y.attrib_reg || x.buffer_reg != y.buffer_reg || x.count != y.count) return false;
+	for (uint32_t i = 0; i < x.count; i++) {
+		if (x.dst[i].register_start != y.dst[i].register_start || x.dst[i].registers_num != y.dst[i].registers_num ||
+		    x.dst[i].attr_id != y.dst[i].attr_id) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool SameS1Stages(const Entry& a, const Entry& b) {
-	if (a.stage_count != b.stage_count) return false;
+	if (a.stage_count != b.stage_count || !SameFetch(a, b)) return false;
 	for (uint32_t s = 0; s < a.stage_count; s++) {
 		const auto& x = a.s1[s];
 		const auto& y = b.s1[s];
@@ -355,7 +377,78 @@ bool SameS1Stages(const Entry& a, const Entry& b) {
 	return true;
 }
 
+// S1c: the clean reader of the active-source walk: ReadShaderGuestMemory's answers (clean backing,
+// or 0 for an address the GPU cannot read) without its retry bookkeeping; a refused read is noted
+// (the prediction then falls back: the walk follows both edges of an unevaluated condition, where
+// the normal path's read may succeed).
+struct FlowReads {
+	bool failed = false;
+};
+bool FlowRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) return false;
+	if (LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes())) return true;
+	const auto size = values.size_bytes();
+	if (IR::NeverMappedAddress(address, size) ||
+	    (ShaderRecompiler::GetCodegenOptions().srt_variant_reads && !LibKernel::Memory::IsGpuMapped(address, size))) {
+		std::fill(values.begin(), values.end(), 0u); // ReadsUnmappedGuestMemory
+		return true;
+	}
+	static_cast<FlowReads*>(userdata)->failed = true;
+	return false;
+}
+
+// S1c: the plan's active descriptor sources for the user data (MaterializeResources' clean walk).
+// False: a condition read refused. `active` empty: every source is active.
+bool ActiveSources(const IR::ResourcePlan& plan, std::span<const uint32_t> user_data, uint64_t shader_base,
+                   std::vector<uint8_t>& active) {
+	active.clear();
+	if (plan.control_flow.empty()) return true;
+	FlowReads       reads;
+	IR::SrtRuntime  runtime {
+	     .user_data                  = user_data,
+	     .shader_base                = shader_base,
+	     .userdata                   = &reads,
+	     .read_specialization_memory = FlowRead,
+	     .is_guest_mapped = ShaderRecompiler::GetCodegenOptions().srt_variant_reads ? LibKernel::Memory::IsGpuMapped : nullptr,
+    };
+	IR::SrtWalker clean(plan, IR::CleanRuntime(runtime));
+	const auto    found = clean.FindActiveSources();
+	if (reads.failed) return false;
+	active.assign(found.begin(), found.end());
+	return true;
+}
+
 } // namespace
+
+// S1b/S1c (nativeLearn.h): one XXH3 over the packed words (was one call per buffer and attribute
+// list): the embedded fetch inputs of the vertex program key (per resource the destination
+// registers, attribute and V# dword 3 & 0x7ffff) and of the pipeline's vertex input state
+// (strides, instance flags, attribute offsets).
+uint64_t FetchHash(const ShaderVertexInputInfo& info) {
+	if (!info.fetch_embedded && info.resources_num == 0 && info.buffers_num == 0) return 0;
+	constexpr int Max = ShaderVertexInputInfo::RES_MAX;
+	std::array<uint32_t, 3 + Max * 3 + Max * (3 + 2 * ShaderVertexInputBuffer::ATTR_MAX)> words; // filled up to n
+	uint32_t n = 0;
+	words[n++] = info.fetch_embedded ? 1u : 0u;
+	words[n++] = static_cast<uint32_t>(info.resources_num);
+	words[n++] = static_cast<uint32_t>(info.buffers_num);
+	for (int i = 0; i < info.resources_num && i < Max; i++) {
+		words[n++] = static_cast<uint32_t>(info.resources_dst[i].registers_num);
+		words[n++] = static_cast<uint32_t>(info.resources_dst[i].attr_id);
+		words[n++] = info.resources[i].fields[3] & 0x7ffffu;
+	}
+	for (int i = 0; i < info.buffers_num && i < Max; i++) {
+		const auto& b = info.buffers[i];
+		words[n++]    = b.stride;
+		words[n++]    = b.fetch_index;
+		words[n++]    = static_cast<uint32_t>(b.attr_num);
+		const auto attrs = std::clamp(b.attr_num, 0, ShaderVertexInputBuffer::ATTR_MAX);
+		for (int a = 0; a < attrs; a++) words[n++] = static_cast<uint32_t>(b.attr_indices[a]);
+		for (int a = 0; a < attrs; a++) words[n++] = b.attr_offsets[a];
+	}
+	const uint64_t h = XXH3_64bits(words.data(), n * sizeof(uint32_t));
+	return h != 0 ? h : 1;
+}
 
 // Append-only open-addressing table (one writer, lock-free readers).
 struct Session::Table {
@@ -597,6 +690,23 @@ bool Session::Begin(const DrawView& view) {
 			for (uint32_t i = 2; front && i < st.ud_base && i < st.ud_count; i++) front = snapshot.user_data[i] == 0;
 			st.prefix_mode = zero ? 0u : front ? 1u : 2u;
 		}
+		// S1c: the embedded fetch's static part.
+		if (view.fetch_embedded && view.vertex_info != nullptr && !view.mesh_active) {
+			const auto& vi = *view.vertex_info;
+			if (vi.resources_num >= 0 && vi.resources_num <= ShaderVertexInputInfo::RES_MAX) {
+				auto tpl        = std::make_unique<FetchTemplate>();
+				tpl->attrib_reg = vi.fetch_attrib_reg;
+				tpl->buffer_reg = vi.fetch_buffer_reg;
+				tpl->count      = static_cast<uint32_t>(vi.resources_num);
+				for (uint32_t i = 0; i < tpl->count; i++) {
+					tpl->dst[i]             = {};
+					tpl->dst[i].register_start = vi.resources_dst[i].register_start;
+					tpl->dst[i].registers_num  = vi.resources_dst[i].registers_num;
+					tpl->dst[i].attr_id        = vi.resources_dst[i].attr_id;
+				}
+				e->fetch = std::move(tpl);
+			}
+		}
 		{
 			const auto& outputs = e->vs->info.outputs;
 			e->viewport_index   = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -825,20 +935,32 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 		std::copy_n(sgpr, sgpr_n, snap.user_data.begin() + st.ud_base);
 		const uint32_t* ud     = snap.user_data.data() + st.ud_base;
 		const auto&     recipe = rep->recipe[s];
-		const auto      build  = [&](const std::vector<ResourceRecipe>& recipes, std::vector<IR::DescriptorValue>& values) {
-            values.resize(recipes.size());
-            for (size_t i = 0; i < recipes.size(); i++) {
-                const auto& r = recipes[i];
-                auto&       v = values[i];
-                v             = {};
-                v.dword_count = r.dword_count;
-                for (uint32_t k = 0; k < r.dword_count; k++) {
-                    if (!EvaluateBound(r.dwords[k], ud, sgpr_n, v.dwords[k])) return false;
-                }
-            }
-            return true;
+		const auto&     info   = (s == 0 ? rep->vs : rep->ps)->info;
+		// S1c: the plan's active sources (control flow): an inactive source materializes as zeros.
+		if (!ActiveSources(*st.plan, snap.user_data, s == 0 ? in.es_addr : in.ps_addr, m_s1_active)) return GC::kS1Read;
+		const auto build = [&](const std::vector<ResourceRecipe>& recipes, const auto& resources, std::vector<IR::DescriptorValue>& values) {
+			values.resize(recipes.size());
+			for (size_t i = 0; i < recipes.size(); i++) {
+				const auto& r = recipes[i];
+				auto&       v = values[i];
+				v             = {};
+				v.dword_count = r.dword_count;
+				if (!m_s1_active.empty() && i < resources.size()) {
+					const auto source = resources[i].source;
+					if (source >= m_s1_active.size()) return false;
+					if (m_s1_active[source] == 0u) {
+						v.dword_count = st.plan->descriptor_sources[source].dword_count;
+						continue;
+					}
+				}
+				for (uint32_t k = 0; k < r.dword_count; k++) {
+					if (!EvaluateBound(r.dwords[k], ud, sgpr_n, v.dwords[k])) return false;
+				}
+			}
+			return true;
 		};
-		if (!build(recipe.buffers, snap.buffers) || !build(recipe.images, snap.images) || !build(recipe.samplers, snap.samplers)) {
+		if (!build(recipe.buffers, info.buffers, snap.buffers) || !build(recipe.images, info.images, snap.images) ||
+		    !build(recipe.samplers, info.samplers, snap.samplers)) {
 			return GC::kS1Read;
 		}
 		snap.uniform_fill = {};
@@ -852,7 +974,24 @@ uint32_t Session::PredictS1(const S1Inputs& in) {
 		if (!IR::SpecializeForNative(*st.plan, snap, m_prediction.specialization[s])) return GC::kS1Spec;
 		spec = Mix(spec, SpecHash(m_prediction.specialization[s]));
 	}
-	uint64_t key = Mix(Mix(base, 0u /* no embedded fetch: covered entries have none */), spec);
+	// S1c: the embedded fetch, rebuilt from the bound SGPRs and the guest tables.
+	m_prediction.fetch      = rep->fetch != nullptr;
+	m_prediction.fetch_hash = 0;
+	if (rep->fetch != nullptr) {
+		const auto& tpl = *rep->fetch;
+		auto&       vi  = m_prediction.vertex;
+		vi.resources_num = static_cast<int>(tpl.count);
+		for (uint32_t i = 0; i < tpl.count; i++) {
+			vi.resources_dst[i].register_start = tpl.dst[i].register_start;
+			vi.resources_dst[i].registers_num  = tpl.dst[i].registers_num;
+			vi.resources_dst[i].attr_id        = tpl.dst[i].attr_id;
+		}
+		vi.fetch_attrib_reg = tpl.attrib_reg;
+		vi.fetch_buffer_reg = tpl.buffer_reg;
+		if (!ShaderRebuildEmbeddedFetch(tpl.attrib_reg, tpl.buffer_reg, in.user_sgpr, in.user_sgpr_max, vi)) return GC::kS1Read;
+		m_prediction.fetch_hash = FetchHash(vi);
+	}
+	uint64_t key = Mix(Mix(base, m_prediction.fetch_hash), spec);
 	key          = key == 0 ? 1 : key;
 	const Entry* entry = m_table->Find(key);
 	if (entry == nullptr || entry->conflicted) return GC::kS1Miss;
@@ -931,6 +1070,45 @@ void Session::CheckS1(const DrawView& view, uint64_t key, const Entry* entry) {
 		if (snap->user_data != p.user_data) fail(fmt::format("{} user data ({} dwords)", stage, snap->user_data.size()));
 		if (!(snap->uniform_fill == p.uniform_fill)) fail(fmt::format("{} uniform fill", stage));
 		if (view.stages[s].spec == nullptr || !(*view.stages[s].spec == pred.specialization[s])) fail(fmt::format("{} specialization", stage));
+	}
+	// S1c: the rebuilt embedded fetch against the normal path's vertex input info.
+	const bool view_fetch = view.vertex_info != nullptr && view.vertex_info->fetch_embedded;
+	if (pred.fetch != view_fetch) {
+		fail(fmt::format("embedded fetch {} predicted {}", view_fetch, pred.fetch));
+	} else if (pred.fetch) {
+		const auto& a = *view.vertex_info;
+		const auto& b = pred.vertex;
+		if (a.resources_num != b.resources_num || a.buffers_num != b.buffers_num) {
+			fail(fmt::format("fetch resources {} buffers {} predicted {} {}", a.resources_num, a.buffers_num, b.resources_num, b.buffers_num));
+		} else {
+			for (int i = 0; i < a.resources_num && i < ShaderVertexInputInfo::RES_MAX; i++) {
+				const auto& x = a.resources_dst[i];
+				const auto& y = b.resources_dst[i];
+				if (std::memcmp(a.resources[i].fields, b.resources[i].fields, sizeof(a.resources[i].fields)) != 0 ||
+				    x.register_start != y.register_start || x.registers_num != y.registers_num || x.attr_id != y.attr_id ||
+				    x.fetch_index != y.fetch_index) {
+					fail(fmt::format("fetch V# {}: 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} v{}x{} a{} i{} predicted 0x{:08x} 0x{:08x} 0x{:08x} "
+					                 "0x{:08x} v{}x{} a{} i{}",
+					                 i, a.resources[i].fields[0], a.resources[i].fields[1], a.resources[i].fields[2], a.resources[i].fields[3],
+					                 x.register_start, x.registers_num, x.attr_id, x.fetch_index, b.resources[i].fields[0],
+					                 b.resources[i].fields[1], b.resources[i].fields[2], b.resources[i].fields[3], y.register_start,
+					                 y.registers_num, y.attr_id, y.fetch_index));
+				}
+			}
+			for (int i = 0; i < a.buffers_num && i < ShaderVertexInputInfo::RES_MAX; i++) {
+				const auto& x    = a.buffers[i];
+				const auto& y    = b.buffers[i];
+				bool        same = x.addr == y.addr && x.stride == y.stride && x.num_records == y.num_records &&
+				            x.fetch_index == y.fetch_index && x.attr_num == y.attr_num;
+				for (int k = 0; same && k < x.attr_num && k < ShaderVertexInputBuffer::ATTR_MAX; k++) {
+					same = x.attr_indices[k] == y.attr_indices[k] && x.attr_offsets[k] == y.attr_offsets[k];
+				}
+				if (!same) {
+					fail(fmt::format("fetch buffer {}: 0x{:x} stride {} records {} attrs {} predicted 0x{:x} stride {} records {} attrs {}", i,
+					                 x.addr, x.stride, x.num_records, x.attr_num, y.addr, y.stride, y.num_records, y.attr_num));
+				}
+			}
+		}
 	}
 	m_result.s1_checked    = true;
 	m_result.s1_mismatches = bad;

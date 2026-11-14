@@ -1047,6 +1047,98 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	}
 }
 
+// Astro Bot PC (S1c, shader.h): ShaderApplyAttribSemantics + ShaderDetectBuffers for a learned
+// program, without metadata, dumps, direct guest reads or stops (each of those cases returns false).
+bool ShaderRebuildEmbeddedFetch(int attrib_reg, int buffer_reg, const uint32_t* user_sgpr, uint32_t user_sgpr_max,
+                                ShaderVertexInputInfo& info) {
+	if (attrib_reg < 0 || buffer_reg < 0 || static_cast<uint32_t>(attrib_reg) + 1u >= user_sgpr_max ||
+	    static_cast<uint32_t>(buffer_reg) + 1u >= user_sgpr_max || info.resources_num < 0 ||
+	    info.resources_num > ShaderVertexInputInfo::RES_MAX) {
+		return false;
+	}
+	const uint64_t attrib = static_cast<uint64_t>(user_sgpr[attrib_reg]) | (static_cast<uint64_t>(user_sgpr[attrib_reg + 1]) << 32u);
+	const uint64_t buffer = static_cast<uint64_t>(user_sgpr[buffer_reg]) | (static_cast<uint64_t>(user_sgpr[buffer_reg + 1]) << 32u);
+	if (attrib == 0 || buffer == 0) return false;
+	for (int i = 0; i < info.resources_num; i++) {
+		auto&          r        = info.resources[i];
+		auto&          rd       = info.resources_dst[i];
+		const auto     semantic = static_cast<uint32_t>(rd.attr_id);
+		uint32_t       attribute = 0;
+		if (rd.attr_id < 0 ||
+		    !LibKernel::Memory::TryReadGpuCleanBacking(attrib + static_cast<uint64_t>(semantic) * 4u, &attribute, sizeof(attribute))) {
+			return false;
+		}
+		const uint32_t index       = attribute & 0x1fu;
+		const auto     format      = static_cast<Prospero::VertexAttribFormat>((attribute >> 5u) & 0x1ffu);
+		const uint32_t offset      = (attribute >> 14u) & 0xfffu;
+		const uint32_t fetch_index = (attribute >> 26u) & 0x1u;
+		rd.fetch_index             = fetch_index;
+		if (!LibKernel::Memory::TryReadGpuCleanBacking(buffer + static_cast<uint64_t>(index) * 16u, r.fields, 4 * sizeof(uint32_t))) {
+			return false;
+		}
+		if (r.AddTid() || r.SwizzleEnabled()) return false; // the normal path stops there
+		if (format != Prospero::VertexAttribFormat::kInvalid) {
+			const auto format_raw    = static_cast<uint32_t>(format);
+			const auto buffer_format = format_raw >> 2u;
+			const auto channels      = (format_raw & 3u) + 1u;
+			r.fields[3]              = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) | (buffer_format << 12u) |
+			              DstSel(4, channels > 1u ? 5u : 0u, channels > 2u ? 6u : 0u, channels > 3u ? 7u : 1u);
+		}
+		const auto size        = static_cast<uint32_t>(rd.registers_num);
+		const auto format_info = ShaderRecompiler::Format::GetFormatInfo(r.Format());
+		bool       invalid     = size > 4;
+		for (uint32_t component = 0; component < std::min(size, 4u); component++) {
+			invalid |= ShaderRecompiler::Format::ResolveFormattedSource(format_info, GetDstSel(r.DstSelXYZW(), component)).kind ==
+			           ShaderRecompiler::Format::FormattedSourceKind::Invalid;
+		}
+		if (invalid) return false; // the normal path reports it (and its program may not compile)
+		if (offset != 0) {
+			r.UpdateAddress48(r.Base48() + offset);
+		}
+	}
+	// ShaderDetectBuffers.
+	info.buffers_num = 0;
+	for (int ri = 0; ri < info.resources_num; ri++) {
+		const auto& r      = info.resources[ri];
+		bool        merged = false;
+		for (int bi = 0; bi < info.buffers_num; bi++) {
+			auto&          b      = info.buffers[bi];
+			const uint64_t stride = b.stride;
+			if (stride == r.Stride() && b.fetch_index == info.resources_dst[ri].fetch_index) {
+				const uint64_t rbase   = r.Base48();
+				const uint64_t base    = std::min(rbase, b.addr);
+				const uint64_t offset1 = rbase - base;
+				const uint64_t offset2 = b.addr - base;
+				if (offset1 < stride && offset2 < stride) {
+					if (b.num_records != r.NumRecords() || b.attr_num >= ShaderVertexInputBuffer::ATTR_MAX) return false;
+					b.addr                       = base;
+					b.attr_indices[b.attr_num++] = ri;
+					merged                       = true;
+					break;
+				}
+			}
+		}
+		if (!merged) {
+			const int bi                     = info.buffers_num++;
+			info.buffers[bi].addr            = r.Base48();
+			info.buffers[bi].stride          = r.Stride();
+			info.buffers[bi].num_records     = r.NumRecords();
+			info.buffers[bi].fetch_index     = info.resources_dst[ri].fetch_index;
+			info.buffers[bi].attr_num        = 1;
+			info.buffers[bi].attr_indices[0] = ri;
+		}
+	}
+	for (int bi = 0; bi < info.buffers_num; bi++) {
+		auto& b = info.buffers[bi];
+		for (int ri = 0; ri < b.attr_num; ri++) {
+			b.attr_offsets[ri] = static_cast<uint32_t>(info.resources[b.attr_indices[ri]].Base48() - b.addr);
+		}
+	}
+	info.fetch_embedded = true;
+	info.fetch_external = false;
+	return true;
+}
+
 static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	constexpr uint32_t ps_input_persp_sample    = 0x00000001u;
 	constexpr uint32_t ps_input_persp_center    = 0x00000002u;

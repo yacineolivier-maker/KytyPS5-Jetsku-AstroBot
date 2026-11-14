@@ -90,6 +90,33 @@
 //    the emission resolves T#/S# through the emulator's PrepareBindings (RepeatStageTextures,
 //    TextureBindingMemo certificate, ResolveTexture) and RebindImages, exactly as the normal path.
 //  - kS1Shape is broken down by first uncovered property and stage (NativeS1Shape).
+//
+// S1c (embedded vertex fetch, control flow):
+//  - Embedded fetch (a non-NGG vertex program whose AGC metadata names a vertex attribute table
+//    and a vertex buffer table, ShaderGetStaticVertexInputInfo): the fetch V#s are not descriptor
+//    sources of the resource plan. The program preparation reads, per input semantic, the
+//    attribute word attrib[semantic] (V# index, attribute format, byte offset, instance flag) and
+//    the V# buffer[index * 4 .. + 4] through the two table pointers in the GS user SGPRs, applies
+//    the format to dword 3 and the offset to the base, then merges the attributes into vertex
+//    buffers (ShaderDetectBuffers: same stride and instance flag, bases less than a stride apart).
+//    The recompiled program reads them as Vulkan vertex attributes (GetAttribute): the pipeline's
+//    vertex input state (strides, attribute offsets, formats) and the program key (dword 3 &
+//    0x7ffff per resource) depend on them, the draw binds the merged buffers through the
+//    BufferCache (AcquireVertexBuffers: one ObtainBuffer per merged guest range, then
+//    bindVertexBuffers2 with the guest sizes) and takes its vertex / instance offsets from the user
+//    SGPRs the fetch code names (ResolveDrawOffsets). The entry learns the static part (table
+//    SGPRs, per resource its destination registers and semantic: FetchTemplate); a prediction
+//    rebuilds the rest from the bound SGPRs and guest memory (ShaderRebuildEmbeddedFetch, clean
+//    backing reads), mixes its fetch hash (FetchHash, the S1b key part) into the full key, and the
+//    emission acquires and binds the vertex buffers and resolves the offsets with the emulator's
+//    own functions. Verify compares every rebuilt V#, destination and merged buffer.
+//  - Control flow: a plan with control flow activates descriptor sources per block; a source
+//    reached by no taken edge is inactive and materializes as zero dwords (a condition that does
+//    not evaluate follows both edges). The prediction runs the emulator's own active-source walk
+//    (SrtWalker::FindActiveSources over the clean runtime, as MaterializeResources does) on the
+//    rebuilt user data, zeroes the inactive sources and skips their reads. A condition read that
+//    fails (bytes not clean) falls back (kS1Read): the walk would have followed both edges where the
+//    normal path's read may succeed.
 
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
@@ -130,6 +157,17 @@ struct StageRecipe {
 	uint32_t          reason      = Loader::GameCapture::kS0Simple;
 	uint32_t          deep_opcode = 0; // kS0Deep / kS0ConstBuffer: ValueOpcode + 1
 };
+
+// S1c: the static part of an embedded vertex fetch (ShaderVertexInputInfo of the learned draw).
+struct FetchTemplate {
+	int      attrib_reg = -1;
+	int      buffer_reg = -1;
+	uint32_t count      = 0; // resources_num
+	std::array<ShaderVertexDestination, ShaderVertexInputInfo::RES_MAX> dst {}; // register_start, registers_num, attr_id
+};
+
+// S1b/S1c: the embedded fetch part of the NativeKey (0 without embedded fetch).
+uint64_t FetchHash(const ShaderVertexInputInfo& info);
 
 struct Entry {
 	Entry()                        = default;
@@ -172,6 +210,7 @@ struct Entry {
 	};
 	std::array<S1Stage, 2> s1 {};
 	bool     viewport_index = false; // the vertex program writes the viewport index
+	std::unique_ptr<FetchTemplate> fetch; // S1c: embedded vertex fetch (null: none)
 	bool     s1_covered     = false;
 	uint32_t s1_shape       = 0; // first uncovered property (Loader::GameCapture::NativeS1Shape)
 	uint32_t s1_shape_stage = 0; // and its stage
@@ -187,6 +226,11 @@ struct S1Prediction {
 	uint64_t                                                    generation  = 0;
 	std::array<ShaderRecompiler::IR::ResourceSnapshot, 2>       snapshot;
 	std::array<ShaderRecompiler::IR::ResourceSpecialization, 2> specialization;
+	// S1c: the rebuilt embedded fetch (fetch: valid; only the fetch fields and `stage`, which the
+	// emission sets, are meaningful).
+	bool                  fetch      = false;
+	uint64_t              fetch_hash = 0;
+	ShaderVertexInputInfo vertex;
 };
 // S1: what PredictS1 reads besides the record.
 struct S1Inputs {
@@ -197,6 +241,7 @@ struct S1Inputs {
 	uint64_t        es_addr           = 0; // bound SPI_SHADER_PGM_LO/HI_ES
 	const uint32_t* user_sgpr         = nullptr; // bound GS user SGPRs
 	uint32_t        user_sgpr_count   = 0;
+	uint32_t        user_sgpr_max     = 0; // S1c: entries of the user_sgpr array (HW::UserSgprInfo::SGPRS_MAX)
 	uint64_t        gs_user_data_addr = 0;
 	// S1b: the pixel stage.
 	bool            pixel              = false;
@@ -239,6 +284,7 @@ struct DrawView {
 	uint64_t                       fetch_hash        = 0; // S1b: embedded fetch formats/strides (0: none)
 	bool                           plain_available   = false; // S1b: the pixel permutation has a plain variant
 	bool                           ps_mip_stats      = false; // S1b: the pixel bindings record mip statistics
+	const ShaderVertexInputInfo*   vertex_info       = nullptr; // S1c: the draw's vertex input info
 };
 
 class Session {
@@ -270,6 +316,8 @@ public:
 	// (kS1Emitted: Prediction() is valid until the next call).
 	uint32_t PredictS1(const S1Inputs& in);
 	[[nodiscard]] const S1Prediction& Prediction() const { return m_prediction; }
+	// S1c: the emission sets the rebuilt vertex info's stage (ResolveDrawOffsets).
+	[[nodiscard]] S1Prediction& MutablePrediction() { return m_prediction; }
 	// S1b: the last kS1Shape's first uncovered property and stage.
 	[[nodiscard]] uint32_t S1ShapeCode() const { return m_s1_shape; }
 	[[nodiscard]] uint32_t S1ShapeStage() const { return m_s1_shape_stage; }
@@ -310,6 +358,7 @@ private:
 	uint32_t     m_s1_samples  = 0;
 	uint32_t     m_s1_shape       = 0;
 	uint32_t     m_s1_shape_stage = 0;
+	std::vector<uint8_t> m_s1_active; // S1c: active descriptor sources of the stage being predicted
 	// Verify sample: what the native path would push (expected) and what the commit pushed.
 	std::array<uint32_t, 32> m_push_expected {};
 	uint32_t                 m_push_mask = 0; // dwords of m_push_expected to compare

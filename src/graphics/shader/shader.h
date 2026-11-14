@@ -418,6 +418,19 @@ void ShaderUnmapCode(uint64_t addr, uint64_t size);
 // Changes after every shader map update (draw-prep certificates compare it).
 [[nodiscard]] uint64_t ShaderMapGeneration();
 
+// Astro Bot PC (KYTY_NATIVE_MODE=s1, step S1c, renderer/nativeLearn.h): the embedded vertex
+// fetch part of a vertex program's input info for one draw, as ShaderGetStaticVertexInputInfo
+// derives it (ShaderApplyAttribSemantics + ShaderDetectBuffers), from the program's static part
+// learned earlier: `info.resources_num` and each `info.resources_dst[i]`'s register_start,
+// registers_num and attr_id (the semantic). `user_sgpr` are the bound GS user SGPRs (array of
+// `user_sgpr_max`), `attrib_reg` / `buffer_reg` the metadata's table pointer SGPRs. Fills each
+// resource's V# (attribute format and offset applied), destination fetch index and the merged
+// vertex buffers. Guest bytes through clean backing reads only. False (nothing may be used): a
+// null table, a refused read, or a case where the normal path would stop the emulator or report
+// an invalid descriptor.
+bool ShaderRebuildEmbeddedFetch(int attrib_reg, int buffer_reg, const uint32_t* user_sgpr, uint32_t user_sgpr_max,
+                                ShaderVertexInputInfo& info);
+
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);

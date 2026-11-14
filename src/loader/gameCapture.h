@@ -451,6 +451,15 @@ struct NativeS1Draw {
 	uint32_t shape       = kShCovered; // kS1Shape: NativeS1Shape
 	uint32_t shape_stage = 0;          // kS1Shape: 0 vertex/mesh, 1 pixel
 	bool     pixel       = false;      // the draw has a pixel stage
+	// S1c (kS1Regs with KYTY_NATIVE_S1_REGS_DIAG=1): the register groups that differ from the
+	// segment's last normal draw, bit = NativeS1RegPart.
+	uint32_t regs_parts  = 0;
+};
+// S1c: register groups of a kS1Regs fallback (HW::Context::VisitKeyDiagParts groups, then the user
+// clip planes, the user-config registers and context bytes outside every group).
+enum NativeS1RegPart : uint32_t {
+	kRpTargets, kRpClear, kRpDepth, kRpBlend, kRpBlendColor, kRpDepthState, kRpStencil, kRpClearValues, kRpViewport,
+	kRpRaster, kRpShRegs, kRpUserClip, kRpUserConfig, kRpOther, kRpCount
 };
 // Executor: one native op's S1 outcome (emitted, or why not).
 void NoteNativeS1(uint32_t op_flags, const NativeS1Draw& draw);

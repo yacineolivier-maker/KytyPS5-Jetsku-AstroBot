@@ -4030,33 +4030,11 @@ static uint64_t NativeRegsHash(const CommandBuffer& buffer, uint64_t context_has
 	return XXH3_64bits(&p, sizeof(p));
 }
 
-// S1b: the embedded fetch inputs of the vertex program key (BuildStageStaticKey: per resource the
-// destination registers, attribute and V# dword 3 & 0x7ffff) and of the pipeline's vertex input
-// state (strides, attribute offsets); 0 without embedded fetch. Read from guest memory through the
-// fetch tables by the program preparation, so no register shows them (the S0b "vs-static"
-// conflicts on static words 13, 16, 22, 25, 28, 31).
+// S1b: the embedded fetch inputs of the vertex program key and of the pipeline's vertex input state
+// (the S0b "vs-static" conflicts on static words 13, 16, 22, 25, 28, 31): NativeLearn::FetchHash
+// (S1c: one XXH3, shared with the prediction's rebuilt fetch).
 static uint64_t NativeFetchHash(const ShaderVertexInputInfo& info) {
-	if (!info.fetch_embedded && info.resources_num == 0 && info.buffers_num == 0) return 0;
-	std::array<uint32_t, 3 + ShaderVertexInputInfo::RES_MAX * 3 + ShaderVertexInputInfo::RES_MAX * 3> words {};
-	uint32_t n = 0;
-	words[n++] = info.fetch_embedded ? 1u : 0u;
-	words[n++] = static_cast<uint32_t>(info.resources_num);
-	words[n++] = static_cast<uint32_t>(info.buffers_num);
-	for (int i = 0; i < info.resources_num && i < ShaderVertexInputInfo::RES_MAX; i++) {
-		words[n++] = static_cast<uint32_t>(info.resources_dst[i].registers_num);
-		words[n++] = static_cast<uint32_t>(info.resources_dst[i].attr_id);
-		words[n++] = info.resources[i].fields[3] & 0x7ffffu;
-	}
-	uint64_t h = XXH3_64bits(words.data(), n * sizeof(uint32_t));
-	for (int i = 0; i < info.buffers_num && i < ShaderVertexInputInfo::RES_MAX; i++) {
-		const auto& b = info.buffers[i];
-		const uint32_t head[3] {b.stride, b.fetch_index, static_cast<uint32_t>(b.attr_num)};
-		h = XXH3_64bits_withSeed(head, sizeof(head), h);
-		const auto attrs = static_cast<size_t>(std::clamp(b.attr_num, 0, ShaderVertexInputBuffer::ATTR_MAX));
-		h = XXH3_64bits_withSeed(b.attr_indices, attrs * sizeof(int), h);
-		h = XXH3_64bits_withSeed(b.attr_offsets, attrs * sizeof(uint32_t), h);
-	}
-	return h != 0 ? h : 1;
+	return NativeLearn::FetchHash(info);
 }
 
 // S1b: KYTY_NATIVE_S1_PIXEL (default 1): native emission of continuations with a pixel stage; 0
@@ -4143,6 +4121,7 @@ void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineC
 	view.fetch_embedded    = state.vertex_info[0].fetch_embedded;
 	view.vertex_buffers    = static_cast<uint32_t>(std::max(state.vertex_info[0].buffers_num, 0));
 	view.user_clip_planes  = state.vertex_info[0].user_clip_planes;
+	view.vertex_info       = &state.vertex_info[0];
 	// S1 verify: the native prediction of this normal-path native draw (a segment head, or a draw
 	// that fell back), compared by Begin with what the normal path prepared.
 	if (Loader::GameCapture::NativeS1() && Loader::GameCapture::NativeVerifyEnabled() && !m_native_s0->S1Armed() &&
@@ -4155,6 +4134,7 @@ void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineC
 		in.es_addr           = cp_es_addr;
 		in.user_sgpr         = vs_regs.gs_user_sgpr.value;
 		in.user_sgpr_count   = vs_regs.gs_regs.rsrc2.user_sgpr;
+		in.user_sgpr_max     = HW::UserSgprInfo::SGPRS_MAX;
 		in.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
 		NativeS1PixelInputs(buffer, state.ps_active, in);
 		if (m_native_s0->PredictS1(in) == Loader::GameCapture::kS1Emitted) {
@@ -4232,7 +4212,43 @@ struct RenderExecutor::NativeS1State {
 	PreparedBindings      ps_bindings; // S1b: the pixel stage (its texture sets persist, RepeatStageTextures)
 	ShaderStageRuntime    ps_runtime;
 	ShaderVertexInputInfo vs_info;
+	// S1c (KYTY_NATIVE_S1_REGS_DIAG=1): the registers of the segment's last normal draw.
+	std::unique_ptr<HW::Context>    diag_context;
+	std::unique_ptr<HW::UserConfig> diag_config;
 };
+
+// S1c: KYTY_NATIVE_S1_REGS_DIAG=1 (diagnostic): the segment keeps a copy of its last normal draw's
+// registers, and a "regs" fallback reports the register groups that differ ("s1 regs parts").
+static bool NativeS1RegsDiag() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_REGS_DIAG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// S1c: the register groups (Loader::GameCapture::NativeS1RegPart bits) in which two register states
+// differ, the index offset and object id excluded (as the targets key).
+static uint32_t NativeS1RegParts(const HW::Context& a, const HW::UserConfig& ua, const HW::Context& b, const HW::UserConfig& ub) {
+	namespace GC   = Loader::GameCapture;
+	uint32_t   parts = 0;
+	const auto base  = reinterpret_cast<const char*>(&a);
+	const auto other = reinterpret_cast<const char*>(&b);
+	a.VisitKeyDiagParts([&](uint32_t group, const void* data, size_t size) {
+		const auto offset = static_cast<const char*>(data) - base;
+		if (std::memcmp(data, other + offset, size) != 0) parts |= 1u << group;
+	});
+	if (a.GetUserClipPlanes() != b.GetUserClipPlanes()) parts |= 1u << GC::kRpUserClip;
+	auto ca = ua;
+	auto cb = ub;
+	ca.SetIndexOffset(0);
+	ca.SetObjectId(0);
+	cb.SetIndexOffset(0);
+	cb.SetObjectId(0);
+	if (std::memcmp(&ca, &cb, sizeof(ca)) != 0) parts |= 1u << GC::kRpUserConfig;
+	if (parts == 0 && std::memcmp(&a, &b, sizeof(a)) != 0) parts |= 1u << GC::kRpOther;
+	return parts;
+}
 
 void RenderExecutor::NativeS1BreakSegment() {
 	if (m_native_s1 != nullptr) {
@@ -4269,6 +4285,14 @@ void RenderExecutor::NativeS1SegmentDraw(const CommandBuffer& buffer, const Draw
 	}
 	seg.targets_key  = m_run_targets_key != 0 ? m_run_targets_key : NativeTargetsKey(buffer.GetRegisters(), buffer.GetUserConfig());
 	seg.formats_hash = m_native_s0->ActiveFormats();
+	if (NativeS1RegsDiag()) [[unlikely]] {
+		if (m_native_s1->diag_context == nullptr) {
+			m_native_s1->diag_context = std::make_unique<HW::Context>();
+			m_native_s1->diag_config  = std::make_unique<HW::UserConfig>();
+		}
+		*m_native_s1->diag_context = buffer.GetRegisters();
+		*m_native_s1->diag_config  = buffer.GetUserConfig();
+	}
 	const auto& outputs = state.vertex_info[0].stage.program->info.outputs;
 	seg.viewport_index  = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
         return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
@@ -4349,7 +4373,12 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	note.pixel       = pixel;
 	if (pixel && !NativeS1PixelEnabled()) return out(GC::kS1Pixel);
 	const uint64_t targets_key = m_run_targets_key != 0 ? m_run_targets_key : NativeTargetsKey(buffer.GetRegisters(), ucfg);
-	if (targets_key != seg.targets_key) return out(GC::kS1Regs);
+	if (targets_key != seg.targets_key) {
+		if (NativeS1RegsDiag() && st.diag_context != nullptr) [[unlikely]] {
+			note.regs_parts = NativeS1RegParts(buffer.GetRegisters(), ucfg, *st.diag_context, *st.diag_config);
+		}
+		return out(GC::kS1Regs);
+	}
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) return out(GC::kS1Kind);
 	// The vertex stage, rebuilt.
@@ -4364,6 +4393,7 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	in.es_addr           = vs_regs.es_regs.data_addr;
 	in.user_sgpr         = vs_regs.gs_user_sgpr.value;
 	in.user_sgpr_count   = vs_regs.gs_regs.rsrc2.user_sgpr;
+	in.user_sgpr_max     = HW::UserSgprInfo::SGPRS_MAX;
 	in.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
 	NativeS1PixelInputs(buffer, pixel, in);
 	if (const auto reason = m_native_s0->PredictS1(in); reason != GC::kS1Emitted) return out(reason);
@@ -4428,8 +4458,20 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	const auto stages = std::span<PreparedBindings* const> {stage_array.data(), stage_count};
 	// Texture views (RebindImages) when a stage samples; the targets are the segment's.
 	PrepareGraphicsBindings(stages, {}, !has_images);
-	PreparedIndexBuffer index_binding;
+	// S1c: the embedded fetch's vertex buffers (AcquireVertexBuffers on the rebuilt input info, as
+	// the normal path acquires them after the stage bindings), then the index buffer.
+	auto&                 pred_mut = m_native_s0->MutablePrediction();
+	PreparedVertexBuffers vertex_bindings;
+	PreparedIndexBuffer   index_binding;
 	if (!mesh) {
+		if (pred_mut.fetch) {
+			pred_mut.vertex.stage = st.runtime;
+			if (CpCommit::Enabled(CpCommit::Part::Draws)) {
+				AcquireVertexBuffersInto(buffer, pred_mut.vertex, nullptr, vertex_bindings);
+			} else {
+				vertex_bindings = AcquireVertexBuffers(buffer, pred_mut.vertex, nullptr);
+			}
+		}
 		index_binding = PrepareIndexBuffer(buffer, index_source);
 	}
 	// Late check: the binding work may submit, end rendering, change images or retire buffers.
@@ -4443,6 +4485,7 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	{
 		const CommandBuffer::DrawScope draw_scope(buffer, false);
 		const auto                     vk_buffer = buffer.EmissionSink();
+		if (!mesh) CommitVertexBuffers(vk_buffer, vertex_bindings); // S1c (count 0 without fetch)
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, false);
 		if (!mesh) CommitIndexBuffer(vk_buffer, index_binding);
 		// The dynamic state is a function of the segment's registers, targets and depth state and
@@ -4475,9 +4518,15 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		}
 		const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count, args.first_instance};
 		DrawEmitInfo       emit {};
-		// ResolveDrawOffsets without embedded fetch (covered entries have none).
-		emit.vertex_offset  = static_cast<int32_t>(ucfg.GetIndexOffset()) + args.base_vertex;
-		emit.first_instance = 0;
+		// ResolveDrawOffsets (S1c: an embedded fetch takes its offsets from the user SGPRs it names).
+		if (!mesh && pred_mut.fetch) {
+			const auto [vertex_offset, instance_offset] = ResolveDrawOffsets(ucfg.GetIndexOffset(), pred_mut.vertex);
+			emit.vertex_offset  = vertex_offset + args.base_vertex;
+			emit.first_instance = instance_offset;
+		} else {
+			emit.vertex_offset  = static_cast<int32_t>(ucfg.GetIndexOffset()) + args.base_vertex;
+			emit.first_instance = 0;
+		}
 		if (mesh) {
 			const uint32_t mesh_draw_dwords    = ShaderRecompiler::IR::PushData::MeshDrawDwords(entry.mesh.split_groups != 0);
 			const auto     groups_per_dispatch = MeshGroupsPerDispatch(mesh_groups, entry.mesh, limits);

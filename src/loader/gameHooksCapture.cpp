@@ -637,13 +637,18 @@ struct S1Resolve {
 	std::atomic<uint64_t>                                    checked {0}, mismatched {0};
 	std::array<std::array<std::atomic<uint64_t>, GameCapture::kShCount>, 2> shapes {};
 	std::atomic<uint64_t>                                    pixel_draws {0}, pixel_emitted {0};
+	std::array<std::atomic<uint64_t>, GameCapture::kRpCount> regs_parts {}; // S1c
 };
 std::array<S1Resolve, kEngineThreads> g_s1 {};
+constexpr const char* kS1RegPartNames[GameCapture::kRpCount] = {"targets", "clear", "depth", "blend", "blend-color",
+                                                               "depth-state", "stencil", "clear-values", "viewport", "raster",
+                                                               "sh-regs", "user-clip", "user-config", "other"};
 struct S1ResolveLast {
 	std::array<uint64_t, GameCapture::kS1Count> reasons {};
 	uint64_t                                    checked = 0, mismatched = 0;
 	std::array<std::array<uint64_t, GameCapture::kShCount>, 2> shapes {};
 	uint64_t                                    pixel_draws = 0, pixel_emitted = 0;
+	std::array<uint64_t, GameCapture::kRpCount> regs_parts {};
 };
 std::array<S1ResolveLast, kEngineThreads> g_s1_last {};
 std::atomic<uint32_t> g_s1_logged {0};
@@ -1725,6 +1730,15 @@ std::string S0SlotReport(uint32_t s) {
 			out += fmt::format(" | s1 shape:{} | s1 pixel-stage draws {} emitted {}", shapes.empty() ? " none" : shapes, pixel_draws,
 			                   pixel_emitted);
 		}
+		// S1c: the register groups of the "regs" fallbacks (KYTY_NATIVE_S1_REGS_DIAG=1).
+		{
+			std::string parts;
+			for (uint32_t k = 0; k < GameCapture::kRpCount; k++) {
+				const auto d = take(r.regs_parts[k], last.regs_parts[k]);
+				if (d != 0) parts += fmt::format(" {} {}", kS1RegPartNames[k], d);
+			}
+			if (!parts.empty()) out += " | s1 regs parts:" + parts;
+		}
 		out += fmt::format(" | s1 verify: predictions checked {} mismatched {}{}", checked, mismatched,
 		                   Native().verify ? "" : " (off: KYTY_NATIVE_VERIFY=1)");
 		out += " | s1 HOT copies: through the emulator's BufferCache (ObtainBuffer) in this subset, not counted separately";
@@ -2613,6 +2627,9 @@ void NoteNativeS1(uint32_t op_flags, const NativeS1Draw& d) {
 	auto& r = g_s1[slot];
 	Inc(r.reasons[std::min<uint32_t>(d.reason, kS1Count - 1u)]);
 	if (d.reason == kS1Shape) Inc(r.shapes[d.shape_stage & 1u][std::min<uint32_t>(d.shape, kShCount - 1u)]);
+	for (uint32_t k = 0; d.regs_parts != 0 && k < kRpCount; k++) {
+		if ((d.regs_parts & (1u << k)) != 0) Inc(r.regs_parts[k]);
+	}
 	if (d.pixel) {
 		Inc(r.pixel_draws);
 		if (d.reason == kS1Emitted) Inc(r.pixel_emitted);
