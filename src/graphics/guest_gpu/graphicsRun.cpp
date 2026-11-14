@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/listCensus.h" // Astro Bot PC (KYTY_CP_PAR_CENSUS2)
 #include "graphics/host_gpu/renderer/cache/bindingCensus.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
@@ -7676,6 +7677,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
                                                      std::span<const uint32_t> commands,
                                                      bool& handoff, uint32_t context) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Resolve");
+	ListCensus::BeginList(submission); // Astro Bot PC (KYTY_CP_PAR_CENSUS2)
 	// Astro Bot PC (KYTY_CP_PAR=1a): the resolver context's op ring (always m_ops when off).
 	EXIT_IF(context != 0 && m_ops_b == nullptr);
 	auto& ops = context != 0 ? *m_ops_b : *m_ops;
