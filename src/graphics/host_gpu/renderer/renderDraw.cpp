@@ -3939,28 +3939,145 @@ static uint64_t NativeTargetsKey(const HW::Context& context, const HW::UserConfi
 	return hash != 0 ? hash : 1;
 }
 
-// S0b: the program-selection register signature of the NativeKey: the targets key, the stage
-// program registers (HW::Shader) and, with a pixel stage, its target export mapping.
-static uint64_t NativeRegsHash(const CommandBuffer& buffer, uint64_t targets_key,
-                               const ShaderPixelInputInfo* pixel) {
+// S1b (nativeLearn.h "S1b"): the context part of the NativeKey's register signature, the registers
+// program and pipeline selection read that the record's state hash does not cover: the shader
+// registers (PA_CL_VS_OUT_CNTL, GE/VGT group sizes, SPI_PS_*, BARYC, DB_SHADER_CONTROL,
+// CB_SHADER_MASK, target output modes...), the clip control and, with CLIP_DISABLE, viewport 0's
+// scale and offset (baked into the program, ApplyClipSpace), VGT_SHADER_STAGES_EN (wave size), mode
+// control (provoking vertex, polygon mode, cull), AA / EQAA / scan mode, the depth bounds while
+// tested, blend 0 (dual source / alpha remap), and the user-config GE registers, primitive type and
+// restart control. Not the per-object registers (stencil reference, blend colour, scissors,
+// viewports while clipping, clear values): those made one key per draw. One XXH3 over ~250 bytes.
+static uint64_t NativeContextSelectionHash(const HW::Context& c, const HW::UserConfig& u) {
+	struct Packed {
+		HW::ShaderRegisters sh;
+		HW::ClipControl     clip;
+		float               viewport[4];
+		uint32_t            shader_stages;
+		HW::ModeControl     mode;
+		HW::AaConfig        aa_config;
+		HW::AaSampleControl aa_sample;
+		HW::EqaaControl     eqaa;
+		HW::ScanModeControl scan;
+		float               depth_bounds[2];
+		HW::BlendControl    blend0;
+		HW::GeControl       ge;
+		HW::GeUserVgprEn    ge_vgpr;
+		uint32_t            prim_type;
+		uint32_t            prim_reset;
+	};
+	Packed p;
+	std::memset(&p, 0, sizeof(p)); // padding: a stable hash
+	p.sh   = c.GetShaderRegisters();
+	p.clip = c.GetClipControl();
+	if (p.clip.clip_disable) {
+		const auto& vp = c.GetScreenViewport().viewports[0];
+		p.viewport[0]  = vp.xscale;
+		p.viewport[1]  = vp.yscale;
+		p.viewport[2]  = vp.xoffset;
+		p.viewport[3]  = vp.yoffset;
+	}
+	p.shader_stages = c.GetShaderStages();
+	p.mode          = c.GetModeControl();
+	p.aa_config     = c.GetAaConfig();
+	p.aa_sample     = c.GetAaSampleControl();
+	p.eqaa          = c.GetEqaaControl();
+	p.scan          = c.GetScanModeControl();
+	if (c.GetDepthControl().depth_bounds_enable) {
+		p.depth_bounds[0] = c.GetDepthBoundsMin();
+		p.depth_bounds[1] = c.GetDepthBoundsMax();
+	}
+	p.blend0     = c.GetBlendControl(0);
+	p.ge         = u.GetGeControl();
+	p.ge_vgpr    = u.GetGeUserVgprEn();
+	p.prim_type  = static_cast<uint32_t>(u.GetPrimType());
+	p.prim_reset = u.GetPrimitiveResetControl();
+	return XXH3_64bits_withSeed(&p, sizeof(p), 0x9e3779b97f4a7c15ull);
+}
+
+// S1b: the pixel stage's target export mapping (0 without a pixel stage).
+static uint64_t NativeExportHash(const ShaderPixelInputInfo* pixel) {
+	return pixel != nullptr ? XXH3_64bits(pixel->target_export_mapping.data(), sizeof(pixel->target_export_mapping)) : 0u;
+}
+
+// S0b/S1b: the NativeKey's register signature: the context part (above), the stage program
+// registers (HW::Shader) and, with a pixel stage, its target export mapping.
+static uint64_t NativeRegsHash(const CommandBuffer& buffer, uint64_t context_hash, uint64_t export_hash) {
 	const auto& vs = buffer.GetShaders().GetVs();
 	const auto& ps = buffer.GetShaders().GetPs().ps_regs;
-	uint64_t    h  = targets_key;
-	const auto  mix = [&](const void* data, size_t size) { h = XXH3_64bits_withSeed(data, size, h); };
-	mix(&vs.es_regs.data_addr, sizeof(vs.es_regs.data_addr));
-	mix(&vs.gs_regs.data_addr, sizeof(vs.gs_regs.data_addr));
-	mix(&vs.gs_regs.rsrc1, sizeof(vs.gs_regs.rsrc1));
-	mix(&vs.gs_regs.rsrc2, sizeof(vs.gs_regs.rsrc2));
-	mix(&vs.ls_regs.data_addr, sizeof(vs.ls_regs.data_addr));
-	mix(&vs.hs_regs.data_addr, sizeof(vs.hs_regs.data_addr));
-	mix(&vs.start_instance_user_sgpr, sizeof(vs.start_instance_user_sgpr));
-	mix(&ps.data_addr, sizeof(ps.data_addr));
-	mix(&ps.rsrc1, sizeof(ps.rsrc1));
-	mix(&ps.rsrc2, sizeof(ps.rsrc2));
-	if (pixel != nullptr) {
-		mix(pixel->target_export_mapping.data(), sizeof(pixel->target_export_mapping));
+	struct Packed {
+		uint64_t                context_hash, export_hash, es, gs, ls, hs, ps;
+		HW::GsShaderResource1   gs_rsrc1;
+		HW::GsShaderResource2   gs_rsrc2;
+		HW::PsShaderResource1   ps_rsrc1;
+		HW::PsShaderResource2   ps_rsrc2;
+		int32_t                 start_instance;
+	};
+	Packed p;
+	std::memset(&p, 0, sizeof(p));
+	p.context_hash   = context_hash;
+	p.export_hash    = export_hash;
+	p.es             = vs.es_regs.data_addr;
+	p.gs             = vs.gs_regs.data_addr;
+	p.ls             = vs.ls_regs.data_addr;
+	p.hs             = vs.hs_regs.data_addr;
+	p.ps             = ps.data_addr;
+	p.gs_rsrc1       = vs.gs_regs.rsrc1;
+	p.gs_rsrc2       = vs.gs_regs.rsrc2;
+	p.ps_rsrc1       = ps.rsrc1;
+	p.ps_rsrc2       = ps.rsrc2;
+	p.start_instance = vs.start_instance_user_sgpr;
+	return XXH3_64bits(&p, sizeof(p));
+}
+
+// S1b: the embedded fetch inputs of the vertex program key (BuildStageStaticKey: per resource the
+// destination registers, attribute and V# dword 3 & 0x7ffff) and of the pipeline's vertex input
+// state (strides, attribute offsets); 0 without embedded fetch. Read from guest memory through the
+// fetch tables by the program preparation, so no register shows them (the S0b "vs-static"
+// conflicts on static words 13, 16, 22, 25, 28, 31).
+static uint64_t NativeFetchHash(const ShaderVertexInputInfo& info) {
+	if (!info.fetch_embedded && info.resources_num == 0 && info.buffers_num == 0) return 0;
+	std::array<uint32_t, 3 + ShaderVertexInputInfo::RES_MAX * 3 + ShaderVertexInputInfo::RES_MAX * 3> words {};
+	uint32_t n = 0;
+	words[n++] = info.fetch_embedded ? 1u : 0u;
+	words[n++] = static_cast<uint32_t>(info.resources_num);
+	words[n++] = static_cast<uint32_t>(info.buffers_num);
+	for (int i = 0; i < info.resources_num && i < ShaderVertexInputInfo::RES_MAX; i++) {
+		words[n++] = static_cast<uint32_t>(info.resources_dst[i].registers_num);
+		words[n++] = static_cast<uint32_t>(info.resources_dst[i].attr_id);
+		words[n++] = info.resources[i].fields[3] & 0x7ffffu;
 	}
-	return h;
+	uint64_t h = XXH3_64bits(words.data(), n * sizeof(uint32_t));
+	for (int i = 0; i < info.buffers_num && i < ShaderVertexInputInfo::RES_MAX; i++) {
+		const auto& b = info.buffers[i];
+		const uint32_t head[3] {b.stride, b.fetch_index, static_cast<uint32_t>(b.attr_num)};
+		h = XXH3_64bits_withSeed(head, sizeof(head), h);
+		const auto attrs = static_cast<size_t>(std::clamp(b.attr_num, 0, ShaderVertexInputBuffer::ATTR_MAX));
+		h = XXH3_64bits_withSeed(b.attr_indices, attrs * sizeof(int), h);
+		h = XXH3_64bits_withSeed(b.attr_offsets, attrs * sizeof(uint32_t), h);
+	}
+	return h != 0 ? h : 1;
+}
+
+// S1b: KYTY_NATIVE_S1_PIXEL (default 1): native emission of continuations with a pixel stage; 0
+// keeps them on the normal path (reason "pixel"), the first subset's behaviour.
+static bool NativeS1PixelEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_S1_PIXEL");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// S1b: the pixel stage inputs of a prediction (the bound PS program and user SGPRs).
+static void NativeS1PixelInputs(const CommandBuffer& buffer, bool pixel, NativeLearn::S1Inputs& in) {
+	in.pixel = pixel;
+	if (!pixel) return;
+	const auto& ps        = buffer.GetShaders().GetPs();
+	in.ps_addr            = ps.ps_regs.data_addr;
+	in.ps_user_sgpr       = ps.ps_user_sgpr.value;
+	in.ps_user_sgpr_count = ps.ps_regs.rsrc2.user_sgpr;
+	in.lod_plain          = static_cast<uint32_t>(LodStatsCounter::PlainVariant());
 }
 
 void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineCache::Pipeline& pipeline,
@@ -4007,12 +4124,20 @@ void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineC
 	if (state.depth_info.image_id) mix(static_cast<uint64_t>(state.depth_info.desc.info.guest_format));
 	view.formats_hash = formats;
 	view.pipeline_generation = m_native_pipeline_generation;
-	// S0b: the register signature and the permutations' identities.
-	const uint64_t targets_key = m_run_targets_key != 0 ? m_run_targets_key
-	                                                    : NativeTargetsKey(buffer.GetRegisters(), buffer.GetUserConfig());
-	view.regs_hash         = NativeRegsHash(buffer, targets_key, state.ps_active ? &state.ps_input_info : nullptr);
+	// S0b/S1b: the register signature (selection registers only: nativeLearn.h "S1b"), the embedded
+	// fetch inputs and the permutations' identities.
+	const uint64_t context_hash = NativeContextSelectionHash(buffer.GetRegisters(), buffer.GetUserConfig());
+	const uint64_t export_hash  = NativeExportHash(state.ps_active ? &state.ps_input_info : nullptr);
+	view.regs_hash         = NativeRegsHash(buffer, context_hash, export_hash);
+	view.fetch_hash        = NativeFetchHash(state.vertex_info[0]);
+	m_native_context_hash  = context_hash; // S1: the segment state of this draw (NativeS1SegmentDraw)
+	m_native_export_hash   = export_hash;
 	view.identity[0]       = PipelineCache::NativePermutationIdentity(state.stage_preps.vertex[0]);
-	if (state.ps_active) view.identity[1] = PipelineCache::NativePermutationIdentity(state.stage_preps.pixel);
+	if (state.ps_active) {
+		view.identity[1]     = PipelineCache::NativePermutationIdentity(state.stage_preps.pixel);
+		view.plain_available = static_cast<bool>(PipelineCache::PlainPixelProgram(state.stage_preps.pixel));
+		view.ps_mip_stats    = m_graphics_bindings.pixel.has_value() && m_graphics_bindings.pixel->mip_stats_active;
+	}
 	const auto& vs_regs    = buffer.GetShaders().GetVs();
 	view.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
 	view.fetch_embedded    = state.vertex_info[0].fetch_embedded;
@@ -4021,7 +4146,7 @@ void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineC
 	// S1 verify: the native prediction of this normal-path native draw (a segment head, or a draw
 	// that fell back), compared by Begin with what the normal path prepared.
 	if (Loader::GameCapture::NativeS1() && Loader::GameCapture::NativeVerifyEnabled() && !m_native_s0->S1Armed() &&
-	    !state.ps_active && Loader::GameCapture::NativeS1SlotEnabled(m_native_s0_op)) {
+	    (!state.ps_active || NativeS1PixelEnabled()) && Loader::GameCapture::NativeS1SlotEnabled(m_native_s0_op)) {
 		NativeLearn::S1Inputs in;
 		in.op_flags          = m_native_s0_op;
 		in.regs_hash         = view.regs_hash;
@@ -4031,6 +4156,7 @@ void RenderExecutor::NativeS0Learn(const DrawRenderState& state, const PipelineC
 		in.user_sgpr         = vs_regs.gs_user_sgpr.value;
 		in.user_sgpr_count   = vs_regs.gs_regs.rsrc2.user_sgpr;
 		in.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
+		NativeS1PixelInputs(buffer, state.ps_active, in);
 		if (m_native_s0->PredictS1(in) == Loader::GameCapture::kS1Emitted) {
 			m_native_s0->ArmS1Check();
 		}
@@ -4092,15 +4218,19 @@ struct RenderExecutor::NativeS1State {
 		vk::CommandBuffer command = nullptr;
 		uint64_t          tick = 0, rendering_serial = 0, activity = 0, image_epoch = 0, draw_counter = 0;
 		uint64_t          targets_key = 0, formats_hash = 0;
+		uint64_t          context_hash = 0, export_hash = 0; // S1b: the selection signature's parts
 		RenderState       rendering;
 		RenderDepthInfo   depth;
 		uint32_t          color_count    = 0;
+		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX> color_ids {}; // S1b: attachments (feedback check)
 		bool              has_clear      = false;
 		bool              viewport_index = false;
 	};
 	Segment               seg;
 	PreparedBindings      bindings;
 	ShaderStageRuntime    runtime;
+	PreparedBindings      ps_bindings; // S1b: the pixel stage (its texture sets persist, RepeatStageTextures)
+	ShaderStageRuntime    ps_runtime;
 	ShaderVertexInputInfo vs_info;
 };
 
@@ -4127,6 +4257,12 @@ void RenderExecutor::NativeS1SegmentDraw(const CommandBuffer& buffer, const Draw
 	seg.rendering        = rendering;
 	seg.depth            = state.depth_info;
 	seg.color_count      = state.color_count;
+	seg.color_ids        = {};
+	for (uint32_t i = 0; i < state.color_count && i < seg.color_ids.size(); i++) {
+		seg.color_ids[i] = state.color_info[i].image_id;
+	}
+	seg.context_hash     = m_native_context_hash;
+	seg.export_hash      = m_native_export_hash;
 	seg.has_clear        = rendering.depth_stencil_attachment.depth_clear || rendering.depth_stencil_attachment.stencil_clear;
 	for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
 		seg.has_clear = seg.has_clear || rendering.color_attachments[i].is_clear;
@@ -4155,10 +4291,16 @@ void RenderExecutor::NativeS1SegmentEnd(const CommandBuffer& buffer, bool valid)
 }
 
 bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer, const DrawIndexArgs& args) {
-	namespace GC   = Loader::GameCapture;
-	const auto op  = m_native_s0_op;
-	const auto out = [op](uint32_t reason) {
-		GC::NoteNativeS1(op, {reason});
+	namespace GC  = Loader::GameCapture;
+	const auto op = m_native_s0_op;
+	GC::NativeS1Draw note;
+	const auto out = [&](uint32_t reason) {
+		note.reason = reason;
+		if (reason == GC::kS1Shape && m_native_s0 != nullptr) {
+			note.shape       = m_native_s0->S1ShapeCode();
+			note.shape_stage = m_native_s0->S1ShapeStage();
+		}
+		GC::NoteNativeS1(op, note);
 		return false;
 	};
 	if (!GC::NativeS1SlotEnabled(op)) return out(GC::kS1Slot);
@@ -4203,7 +4345,9 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
 	auto& ucfg = buffer.GetUserConfig();
 	if (!DrawHasValidVertexShader(buffer.GetShaders())) return out(GC::kS1Kind);
-	if (DrawHasActivePixelShader(buffer)) return out(GC::kS1Pixel);
+	const bool pixel = DrawHasActivePixelShader(buffer);
+	note.pixel       = pixel;
+	if (pixel && !NativeS1PixelEnabled()) return out(GC::kS1Pixel);
 	const uint64_t targets_key = m_run_targets_key != 0 ? m_run_targets_key : NativeTargetsKey(buffer.GetRegisters(), ucfg);
 	if (targets_key != seg.targets_key) return out(GC::kS1Regs);
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
@@ -4212,13 +4356,16 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	const auto&          vs_regs = buffer.GetShaders().GetVs();
 	NativeLearn::S1Inputs in;
 	in.op_flags          = op;
-	in.regs_hash         = NativeRegsHash(buffer, targets_key, nullptr);
+	// S1b: the registers equal the segment's last normal draw's (targets key): its selection
+	// signature's context part and export mapping are this draw's.
+	in.regs_hash         = NativeRegsHash(buffer, seg.context_hash, pixel ? seg.export_hash : 0u);
 	in.formats_hash      = seg.formats_hash;
 	in.index_count       = args.index_count;
 	in.es_addr           = vs_regs.es_regs.data_addr;
 	in.user_sgpr         = vs_regs.gs_user_sgpr.value;
 	in.user_sgpr_count   = vs_regs.gs_regs.rsrc2.user_sgpr;
 	in.gs_user_data_addr = vs_regs.gs_regs.user_data_addr;
+	NativeS1PixelInputs(buffer, pixel, in);
 	if (const auto reason = m_native_s0->PredictS1(in); reason != GC::kS1Emitted) return out(reason);
 	const auto& pred  = m_native_s0->Prediction();
 	const auto& entry = *pred.entry;
@@ -4227,7 +4374,11 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 		return out(GC::kS1Sample);
 	}
 	const bool mesh = entry.mesh_active;
-	if (mesh != (entry.vs->stage == ShaderType::Mesh) || entry.current == nullptr) return out(GC::kS1Shape);
+	if (mesh != (entry.vs->stage == ShaderType::Mesh) || entry.current == nullptr) {
+		note.shape = GC::kShPipeline;
+		GC::NoteNativeS1(op, {GC::kS1Shape, GC::kShPipeline, 0, pixel});
+		return false;
+	}
 	// A pipeline replaced since the normal path last selected the key's (its old handle may be
 	// destroyed): the normal path selects it again.
 	if (entry.current_generation != m_context.GetPipelineCache().PipelineGeneration()) return out(GC::kS1Miss);
@@ -4244,16 +4395,39 @@ bool RenderExecutor::NativeS1Emit(uint64_t /*submit_id*/, CommandBuffer& buffer,
 	}
 	if (seg.has_clear && buffer.HasPendingBarriers()) return out(GC::kS1Barriers);
 	const auto& pipeline = *entry.current;
-	// Bindings: the emulator's own binding work on the rebuilt snapshot.
-	st.runtime = {entry.vs, &pred.snapshot};
+	// Bindings: the emulator's own binding work on the rebuilt snapshots (textures and samplers:
+	// RepeatStageTextures / TextureBindingMemo / ResolveTexture and NativeSampler, as the normal
+	// path resolves them).
+	st.runtime = {entry.vs, &pred.snapshot[0]};
 	PrepareBindings(st.runtime, st.bindings, nullptr, false);
+	std::array<PreparedBindings*, 2> stage_array {&st.bindings, &st.ps_bindings};
+	const uint32_t                   stage_count = pixel ? 2u : 1u;
+	if (pixel) {
+		st.ps_runtime = {entry.ps, &pred.snapshot[1]};
+		PrepareBindings(st.ps_runtime, st.ps_bindings, nullptr, false);
+		// The plain variant is the normal path's choice only while no image records mip statistics.
+		if (pred.plain && st.ps_bindings.mip_stats_active) return out(GC::kS1Plain);
+	}
+	bool has_images = false;
+	for (uint32_t s = 0; s < stage_count; s++) {
+		for (const auto& binding: stage_array[s]->images) {
+			has_images = true;
+			// A texture that is one of the segment's attachments: the normal path's feedback and
+			// attachment layout handling (AcquireRenderTargets) decides that draw.
+			const bool attachment = (seg.depth.image_id && binding.image_id == seg.depth.image_id) ||
+			                        std::any_of(seg.color_ids.begin(), seg.color_ids.begin() + std::min<uint32_t>(seg.color_count, RENDER_COLOR_ATTACHMENTS_MAX),
+			                                    [&](const ImageId& id) { return id && id == binding.image_id; });
+			if (attachment) return out(GC::kS1Feedback);
+		}
+	}
 	if (mesh) {
 		// The original guest indices, registered for shader reads (synchronized by the BDA
 		// preparation below), as the normal path does for a mesh draw.
 		(void)m_context.GetBufferCache().FindBuffer(index_source.address, index_source.size);
 	}
-	std::array<PreparedBindings*, 1> stages {&st.bindings};
-	PrepareGraphicsBindings(stages, {}, true);
+	const auto stages = std::span<PreparedBindings* const> {stage_array.data(), stage_count};
+	// Texture views (RebindImages) when a stage samples; the targets are the segment's.
+	PrepareGraphicsBindings(stages, {}, !has_images);
 	PreparedIndexBuffer index_binding;
 	if (!mesh) {
 		index_binding = PrepareIndexBuffer(buffer, index_source);
@@ -5108,7 +5282,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	draw_cmd_scope.Stop();
 	if (m_native_s0 != nullptr) [[unlikely]] {
 		// S1: the segment state this native op's normal-path draw leaves (its own draw only).
-		if (Loader::GameCapture::NativeS1() && m_native_s0->Active() && indirect == nullptr && !mesh_indirect) {
+		// S1b: only for the slots S1 emits for (the segment state costs a targets key without one).
+		if (Loader::GameCapture::NativeS1() && m_native_s0->Active() && indirect == nullptr && !mesh_indirect &&
+		    Loader::GameCapture::NativeS1SlotEnabled(m_native_s0->ActiveOp())) {
 			NativeS1SegmentDraw(buffer, state, rendering);
 		}
 		NativeS0Finish(); // S0: compares a verify sample's captures, reports the draw

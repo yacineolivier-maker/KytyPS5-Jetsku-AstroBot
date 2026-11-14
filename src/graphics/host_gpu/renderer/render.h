@@ -1134,6 +1134,10 @@ private:
 	NativeS1State* m_native_s1           = nullptr; // created on the first S1 draw, never freed
 	uint64_t       m_native_draw_counter = 0;
 	uint64_t       m_native_pipeline_generation = 0; // read before a native op's pipeline selection
+	// S1b: the selection signature's context part and export mapping of the last learned draw
+	// (NativeS0Learn), kept by NativeS1SegmentDraw for the segment's continuations.
+	uint64_t       m_native_context_hash = 0;
+	uint64_t       m_native_export_hash  = 0;
 	bool           NativeS1Emit(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void           NativeS1SegmentDraw(const CommandBuffer& buffer, const DrawRenderState& state, const RenderState& rendering);
 	void           NativeS1SegmentEnd(const CommandBuffer& buffer, bool valid);

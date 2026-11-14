@@ -68,6 +68,28 @@
 // not emitted; the normal path runs and Begin compares it (key, entry, program, every snapshot
 // dword, user data, flat SRT, specialization, layout); a difference is logged and stops the
 // emulator.
+//
+// S1b (key cost, conflicts, pixel stage):
+//  - The register part of the key is no longer the DrawRun targets key (every context register):
+//    per-object registers (stencil reference, blend colour, scissors, depth clear...) made a new
+//    key for almost every draw of the Geometry passes, i.e. a learning attempt (recipe build,
+//    entry) per draw on Thread_Gpu once the table was full. It is now the selection signature
+//    (renderDraw.cpp NativeSelectionHash): the context registers program and pipeline selection
+//    read (ShaderRegisters, clip control, viewport 0 when CLIP_DISABLE bakes it into the program,
+//    VGT_SHADER_STAGES_EN, mode control, AA config / sample control, EQAA, depth bounds, blend 0)
+//    plus the user-config GE registers and the stage program registers: a few hundred bytes.
+//  - The remaining "vs-static" conflicts (static words 13/16/22/25/28/31) are the embedded vertex
+//    fetch words of BuildStageStaticKey: with no LDS word, clip space off and no mesh, the vertex
+//    key is 11 words then 3 per fetch resource (registers, attribute, V# dword 3 & 0x7ffff =
+//    dst_sel / formats), so words 13, 16, 19, ... are fetch V# formats, read from guest memory
+//    through the fetch tables, which no register shows. The key mixes their hash (fetch_hash,
+//    with the vertex input strides), outside the base key; a prediction (no fetch: not covered)
+//    mixes the no-fetch value.
+//  - The pixel stage is covered (images, samplers, buffers; plain variant): the prediction
+//    rebuilds both stages' snapshots and their whole specialization (IR::SpecializeForNative);
+//    the emission resolves T#/S# through the emulator's PrepareBindings (RepeatStageTextures,
+//    TextureBindingMemo certificate, ResolveTexture) and RebindImages, exactly as the normal path.
+//  - kS1Shape is broken down by first uncovered property and stage (NativeS1Shape).
 
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
@@ -133,40 +155,55 @@ struct Entry {
 	// S0b: the permutations' identities when learned (conflict diagnosis) and whether a conflict was
 	// seen for the key (S1 never emits a conflicted entry).
 	std::array<PipelineCache::NativeProgramIdentity, 2> identity {};
-	bool                                                plain_pixel = false;
-	mutable bool                                        conflicted  = false;
+	bool                                                plain_pixel     = false;
+	bool                                                plain_available = false; // S1b: the pixel permutation has a plain variant
+	mutable bool                                        conflicted      = false;
 	// The newest pipeline object the normal path selected for the key (a fast-first build is
 	// replaced by its optimized one; old objects stay valid). Thread_Gpu only.
 	mutable const PipelineCache::Pipeline* current            = nullptr;
 	mutable uint64_t                       current_generation = 0; // PipelineGeneration before that selection
-	// S1: the stage-0 inputs a native rebuild needs, and whether the entry is covered.
-	const ShaderRecompiler::IR::ResourcePlan* plan0 = nullptr;
-	uint32_t ud_count       = 0;     // snapshot.user_data size (user SGPR base + count)
-	uint32_t ud_base        = 0;     // the plan's user SGPR base
-	uint32_t prefix_mode    = 0;     // 0: prefix dwords 0; 1: dwords 0..1 the GS user-data address; 2: other
-	uint32_t flat_size      = 0;     // flattened SRT dwords
+	// S1: per stage (vertex/mesh, pixel), the inputs a native rebuild needs; whether the entry is covered.
+	struct S1Stage {
+		const ShaderRecompiler::IR::ResourcePlan* plan = nullptr;
+		uint32_t ud_count    = 0; // snapshot.user_data size (user SGPR base + count)
+		uint32_t ud_base     = 0; // the plan's user SGPR base
+		uint32_t prefix_mode = 0; // 0: prefix dwords 0; 1: dwords 0..1 the GS user-data address; 2: other
+		uint32_t flat_size   = 0; // flattened SRT dwords
+	};
+	std::array<S1Stage, 2> s1 {};
 	bool     viewport_index = false; // the vertex program writes the viewport index
 	bool     s1_covered     = false;
-	uint32_t s1_shape       = 0;     // first uncovered property (diagnostic)
+	uint32_t s1_shape       = 0; // first uncovered property (Loader::GameCapture::NativeS1Shape)
+	uint32_t s1_shape_stage = 0; // and its stage
 };
 
-// S1: a native op's rebuilt vertex stage (PredictS1), owned by the session.
+// S1: a native op's rebuilt stages (PredictS1), owned by the session.
 struct S1Prediction {
-	const Entry*                                 entry = nullptr;
-	uint64_t                                     key   = 0;
-	ShaderRecompiler::IR::ResourceSnapshot       snapshot;
-	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	const Entry*                                                entry = nullptr;
+	uint64_t                                                    key   = 0;
+	uint32_t                                                    stage_count = 0;
+	bool                                                        plain       = false; // S1b: the plain pixel variant
+	const PipelineCache::Pipeline*                              pipeline    = nullptr; // entry->current when predicted
+	uint64_t                                                    generation  = 0;
+	std::array<ShaderRecompiler::IR::ResourceSnapshot, 2>       snapshot;
+	std::array<ShaderRecompiler::IR::ResourceSpecialization, 2> specialization;
 };
 // S1: what PredictS1 reads besides the record.
 struct S1Inputs {
 	uint32_t        op_flags          = 0;
-	uint64_t        regs_hash         = 0; // NativeRegsHash of the bound registers
+	uint64_t        regs_hash         = 0; // NativeRegsHash of the bound registers (selection signature)
 	uint64_t        formats_hash      = 0; // the segment's resolved target formats (its last normal draw)
 	uint32_t        index_count       = 0;
 	uint64_t        es_addr           = 0; // bound SPI_SHADER_PGM_LO/HI_ES
 	const uint32_t* user_sgpr         = nullptr; // bound GS user SGPRs
 	uint32_t        user_sgpr_count   = 0;
 	uint64_t        gs_user_data_addr = 0;
+	// S1b: the pixel stage.
+	bool            pixel              = false;
+	uint64_t        ps_addr            = 0;
+	const uint32_t* ps_user_sgpr       = nullptr;
+	uint32_t        ps_user_sgpr_count = 0;
+	uint32_t        lod_plain          = 0; // LodStatsCounter::Plain (0 off, 1 on, 2 verify)
 };
 
 // What ExecutePreparedDraw knows about one stage of the draw.
@@ -199,6 +236,9 @@ struct DrawView {
 	uint32_t                       vertex_buffers    = 0;
 	uint32_t                       user_clip_planes  = 0;
 	std::array<PipelineCache::NativeProgramIdentity, 2> identity {}; // S0b: the stages' permutations
+	uint64_t                       fetch_hash        = 0; // S1b: embedded fetch formats/strides (0: none)
+	bool                           plain_available   = false; // S1b: the pixel permutation has a plain variant
+	bool                           ps_mip_stats      = false; // S1b: the pixel bindings record mip statistics
 };
 
 class Session {
@@ -230,6 +270,9 @@ public:
 	// (kS1Emitted: Prediction() is valid until the next call).
 	uint32_t PredictS1(const S1Inputs& in);
 	[[nodiscard]] const S1Prediction& Prediction() const { return m_prediction; }
+	// S1b: the last kS1Shape's first uncovered property and stage.
+	[[nodiscard]] uint32_t S1ShapeCode() const { return m_s1_shape; }
+	[[nodiscard]] uint32_t S1ShapeStage() const { return m_s1_shape_stage; }
 	// S1 verify: the prediction is compared by the op's own draw on the normal path (Begin).
 	void ArmS1Check() {
 		m_s1_armed    = true;
@@ -265,6 +308,8 @@ private:
 	bool         m_s1_armed    = false;
 	uint32_t     m_s1_armed_op = 0;
 	uint32_t     m_s1_samples  = 0;
+	uint32_t     m_s1_shape       = 0;
+	uint32_t     m_s1_shape_stage = 0;
 	// Verify sample: what the native path would push (expected) and what the commit pushed.
 	std::array<uint32_t, 32> m_push_expected {};
 	uint32_t                 m_push_mask = 0; // dwords of m_push_expected to compare

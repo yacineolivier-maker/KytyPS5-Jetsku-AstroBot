@@ -279,17 +279,26 @@ uint64_t BaseKey(const GC::NativeDraw& record, uint64_t formats_hash, uint64_t r
 	return base;
 }
 
-// S1 coverage of a learned entry (stage 0 = the vertex/mesh stage); 0: covered, else the first
-// uncovered property.
-uint32_t S1Shape(const Entry& e, const DrawView& view, const IR::ResourceSnapshot& snapshot) {
-	using Kind = IR::DescriptorBindingKind;
-	if (e.stage_count != 1 || view.vertex_stage_count != 1) return 1; // a pixel stage, or tessellation
-	if (e.reason != GC::kS0Simple) return 2;                          // control flow or deep recipes
-	const auto& program = *e.vs;
-	if (!program.info.images.empty() || !program.info.samplers.empty()) return 3;
-	if (program.has_address_writes || std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
-	                                               [](const auto& b) { return b.written; })) {
-		return 4;
+// S1 coverage of one stage of a learned entry (0: the vertex/mesh stage, 1: the pixel stage);
+// GC::kShCovered, else the first uncovered property (GC::NativeS1Shape).
+uint32_t S1StageShape(const Entry& e, uint32_t s, const DrawView& view) {
+	using Kind          = IR::DescriptorBindingKind;
+	const auto& program = s == 0 ? *e.vs : *e.ps;
+	const auto& st      = e.s1[s];
+	const auto& recipe  = e.recipe[s];
+	if (s == 0 && view.vertex_stage_count != 1) return GC::kShTess;
+	if (recipe.reason == GC::kS0Flow) return GC::kShFlow;
+	if (recipe.reason != GC::kS0Simple) return GC::kShDeep; // deep, indirect descriptor, const buffer
+	if (program.has_address_writes ||
+	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(), [](const auto& b) { return b.written || b.atomic; }) ||
+	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& i) { return i.written || i.atomic; })) {
+		return GC::kShWrites;
+	}
+	if (std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& i) { return i.resource_class != IR::ImageResourceClass::Sampled || !i.indirect_resources.empty() ||
+	                                       i.indirect_root != IR::ImageResource::NoIndirectImage;
+	                })) {
+		return GC::kShImageClass;
 	}
 	for (const auto& binding: program.bindings.descriptors) {
 		switch (binding.kind) {
@@ -298,18 +307,52 @@ uint32_t S1Shape(const Entry& e, const DrawView& view, const IR::ResourceSnapsho
 			case Kind::BdaPagetable:
 			case Kind::FaultBuffer:
 			case Kind::FlattenedSrt:
+			case Kind::Samplers:
 			case Kind::ShaderData: break;
-			default: return 5;
+			case Kind::MipStats:
+				if (s == 1) break; // the pixel stage's mip statistics (bound by the emulator's functions)
+				return GC::kShBinding;
+			default:
+				if (IR::ImageBindingResourceClass(binding.kind) == IR::ImageResourceClass::Sampled) break;
+				return GC::kShBinding;
 		}
 	}
-	if (e.plan0 == nullptr || e.plan0->uniform_fill.fill.words != 0 || !e.plan0->control_flow.empty()) return 6;
-	if (view.fetch_embedded || view.vertex_buffers != 0 || view.user_clip_planes != 0) return 7;
-	if (e.prefix_mode > 1 || e.ud_count < e.ud_base) return 8;
-	for (const auto& b: e.recipe[0].buffers) {
-		if (b.dword_count == 0) return 9;
+	if (st.plan == nullptr || !st.plan->control_flow.empty()) return GC::kShFlow;
+	if (st.plan->uniform_fill.fill.words != 0) return GC::kShUniform;
+	if (s == 0 && (view.fetch_embedded || view.vertex_buffers != 0)) return GC::kShFetch;
+	if (s == 0 && view.user_clip_planes != 0) return GC::kShClip;
+	if (st.prefix_mode > 1 || st.ud_count < st.ud_base) return GC::kShPrefix;
+	for (const auto* list: {&recipe.buffers, &recipe.images, &recipe.samplers}) {
+		for (const auto& r: *list) {
+			if (r.dword_count == 0) return GC::kShIndirect;
+		}
 	}
-	if (snapshot.flattened_srt.size() != e.flat_size) return 10;
-	return 0;
+	if (view.stages[s].snapshot->flattened_srt.size() != st.flat_size) return GC::kShFlat;
+	return GC::kShCovered;
+}
+
+// S1 coverage of a learned entry: every stage covered (shape/stage: the first uncovered one).
+void S1Shape(Entry& e, const DrawView& view) {
+	e.s1_shape       = GC::kShCovered;
+	e.s1_shape_stage = 0;
+	for (uint32_t s = 0; s < e.stage_count && e.s1_shape == GC::kShCovered; s++) {
+		e.s1_shape       = S1StageShape(e, s, view);
+		e.s1_shape_stage = s;
+	}
+	e.s1_covered = e.s1_shape == GC::kShCovered;
+}
+
+bool SameS1Stages(const Entry& a, const Entry& b) {
+	if (a.stage_count != b.stage_count) return false;
+	for (uint32_t s = 0; s < a.stage_count; s++) {
+		const auto& x = a.s1[s];
+		const auto& y = b.s1[s];
+		if (x.plan != y.plan || x.ud_count != y.ud_count || x.ud_base != y.ud_base || x.prefix_mode != y.prefix_mode ||
+		    x.flat_size != y.flat_size || !SameRecipe(a.recipe[s], b.recipe[s])) {
+			return false;
+		}
+	}
+	return true;
 }
 
 } // namespace
@@ -479,7 +522,8 @@ bool Session::Begin(const DrawView& view) {
 	for (uint32_t s = 0; s < view.stage_count; s++) {
 		spec = Mix(spec, view.stages[s].spec != nullptr ? SpecHash(*view.stages[s].spec) : 0u);
 	}
-	uint64_t key = Mix(base, spec);
+	// S1b: the embedded fetch words of the vertex program key (from guest memory), outside the base.
+	uint64_t key = Mix(Mix(base, view.fetch_hash), spec);
 	key          = key == 0 ? 1 : key;
 	const auto* pixel   = view.stage_count > 1 ? &view.stages[1] : nullptr;
 	const Entry* entry  = m_table->Find(key);
@@ -504,6 +548,9 @@ bool Session::Begin(const DrawView& view) {
 		m_result.reason      = entry->reason;
 		m_result.deep_opcode = entry->deep_opcode;
 		recipes              = &entry->recipe;
+	} else if (m_table->owned.size() >= Table::MaxEntries) {
+		// S1b: a full table learns nothing: no recipe is built for nothing (was one per draw).
+		m_result.reason = GC::kS0TableFull;
 	} else {
 		auto e              = std::make_unique<Entry>();
 		e->key              = key;
@@ -522,6 +569,7 @@ bool Session::Begin(const DrawView& view) {
 		e->current_generation = view.pipeline_generation;
 		e->identity         = view.identity;
 		e->plain_pixel      = view.plain_pixel;
+		e->plain_available  = view.plain_available;
 		if (view.mesh != nullptr) e->mesh = *view.mesh;
 		e->stage_count = view.stage_count;
 		uint32_t reason = GC::kS0Simple;
@@ -533,25 +581,28 @@ bool Session::Begin(const DrawView& view) {
 		}
 		e->reason      = reason;
 		e->deep_opcode = opcode;
-		// S1: the stage-0 inputs of a native rebuild, and its coverage.
-		{
-			const auto& vs_snapshot = *view.stages[0].snapshot;
-			e->plan0                = view.stages[0].plan;
-			e->ud_base              = e->plan0->user_data_base;
-			e->ud_count             = static_cast<uint32_t>(vs_snapshot.user_data.size());
-			e->flat_size            = static_cast<uint32_t>(vs_snapshot.flattened_srt.size());
+		// S1: each stage's inputs of a native rebuild, and the coverage.
+		for (uint32_t s = 0; s < view.stage_count; s++) {
+			const auto& snapshot = *view.stages[s].snapshot;
+			auto&       st       = e->s1[s];
+			st.plan              = view.stages[s].plan;
+			st.ud_base           = st.plan->user_data_base;
+			st.ud_count          = static_cast<uint32_t>(snapshot.user_data.size());
+			st.flat_size         = static_cast<uint32_t>(snapshot.flattened_srt.size());
 			bool zero = true;
-			for (uint32_t i = 0; i < e->ud_base && i < e->ud_count; i++) zero = zero && vs_snapshot.user_data[i] == 0;
-			bool front = e->ud_base >= 2 && e->ud_count >= 2 && vs_snapshot.user_data[0] == static_cast<uint32_t>(view.gs_user_data_addr) &&
-			             vs_snapshot.user_data[1] == static_cast<uint32_t>(view.gs_user_data_addr >> 32u);
-			for (uint32_t i = 2; front && i < e->ud_base && i < e->ud_count; i++) front = vs_snapshot.user_data[i] == 0;
-			e->prefix_mode = zero ? 0u : front ? 1u : 2u;
+			for (uint32_t i = 0; i < st.ud_base && i < st.ud_count; i++) zero = zero && snapshot.user_data[i] == 0;
+			bool front = s == 0 && st.ud_base >= 2 && st.ud_count >= 2 &&
+			             snapshot.user_data[0] == static_cast<uint32_t>(view.gs_user_data_addr) &&
+			             snapshot.user_data[1] == static_cast<uint32_t>(view.gs_user_data_addr >> 32u);
+			for (uint32_t i = 2; front && i < st.ud_base && i < st.ud_count; i++) front = snapshot.user_data[i] == 0;
+			st.prefix_mode = zero ? 0u : front ? 1u : 2u;
+		}
+		{
 			const auto& outputs = e->vs->info.outputs;
 			e->viewport_index   = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
                 return output.kind == IR::StageOutputKind::ViewportIndex;
             });
-			e->s1_shape   = S1Shape(*e, view, vs_snapshot);
-			e->s1_covered = e->s1_shape == 0;
+			S1Shape(*e, view);
 		}
 		m_result.reason      = reason;
 		m_result.deep_opcode = opcode;
@@ -731,61 +782,88 @@ void Session::Conflict(const Entry& entry, const DrawView& view) {
 }
 
 uint32_t Session::PredictS1(const S1Inputs& in) {
-	m_s1_op          = in.op_flags;
-	m_s1_armed       = false;
+	m_s1_op            = in.op_flags;
+	m_s1_armed         = false;
+	m_s1_shape         = GC::kShCovered;
+	m_s1_shape_stage   = 0;
 	m_prediction.entry = nullptr;
+	const auto shape   = [&](uint32_t code, uint32_t stage) {
+        m_s1_shape       = code;
+        m_s1_shape_stage = stage;
+        return GC::kS1Shape;
+	};
 	if (!GC::LookupNativeRecordForOp(in.op_flags, m_record)) {
 		return GC::kS1Record;
 	}
-	if (m_record.count != in.index_count || ((m_record.known & GC::kNkPgmEs) != 0 && m_record.pgm_es != in.es_addr)) {
+	if (m_record.count != in.index_count || ((m_record.known & GC::kNkPgmEs) != 0 && m_record.pgm_es != in.es_addr) ||
+	    (in.pixel && (m_record.known & GC::kNkPgmPs) != 0 && m_record.pgm_ps != in.ps_addr)) {
 		return GC::kS1Record;
 	}
 	const uint64_t base = BaseKey(m_record, in.formats_hash, in.regs_hash);
 	const Entry*   rep  = m_table->FindBase(base);
 	if (rep == nullptr) return GC::kS1Miss;
-	if (!rep->s1_covered) return GC::kS1Shape;
-	if (in.user_sgpr_count + rep->ud_base != rep->ud_count) return GC::kS1Shape;
-	auto& snap = m_prediction.snapshot;
-	snap.user_data.assign(rep->ud_count, 0u);
-	if (rep->prefix_mode == 1u) {
-		snap.user_data[0] = static_cast<uint32_t>(in.gs_user_data_addr);
-		snap.user_data[1] = static_cast<uint32_t>(in.gs_user_data_addr >> 32u);
-	}
-	std::copy_n(in.user_sgpr, in.user_sgpr_count, snap.user_data.begin() + rep->ud_base);
-	const uint32_t* ud     = snap.user_data.data() + rep->ud_base;
-	const uint32_t  ud_n   = in.user_sgpr_count;
-	const auto&     recipe = rep->recipe[0];
-	snap.buffers.resize(recipe.buffers.size());
-	for (size_t i = 0; i < recipe.buffers.size(); i++) {
-		const auto& r = recipe.buffers[i];
-		auto&       v = snap.buffers[i];
-		v             = {};
-		v.dword_count = r.dword_count;
-		for (uint32_t k = 0; k < r.dword_count; k++) {
-			if (!EvaluateBound(r.dwords[k], ud, ud_n, v.dwords[k])) return GC::kS1Read;
+	if (!rep->s1_covered) return shape(rep->s1_shape, rep->s1_shape_stage);
+	const uint32_t stages = in.pixel ? 2u : 1u;
+	if (rep->stage_count != stages) return shape(GC::kShVariant, stages - 1u);
+	// The plain pixel variant (KYTY_LOD_STATS_PLAIN_VARIANT): verify mode binds a canary the native
+	// path does not handle; on, the variant is taken unless the bindings record mip statistics,
+	// which the emission checks after resolving them (kS1Plain).
+	if (in.pixel && in.lod_plain == 2u) return shape(GC::kShLodVerify, 1);
+	const bool plain = in.pixel && in.lod_plain == 1u && rep->plain_available;
+	uint64_t   spec  = Mix(0x84222325cbf29ce4ull, plain ? 1u : 0u);
+	for (uint32_t s = 0; s < stages; s++) {
+		const auto&     st     = rep->s1[s];
+		const uint32_t* sgpr   = s == 0 ? in.user_sgpr : in.ps_user_sgpr;
+		const uint32_t  sgpr_n = s == 0 ? in.user_sgpr_count : in.ps_user_sgpr_count;
+		if (sgpr_n + st.ud_base != st.ud_count || sgpr_n > 32u) return shape(GC::kShUdCount, s);
+		auto& snap = m_prediction.snapshot[s];
+		snap.user_data.assign(st.ud_count, 0u);
+		if (st.prefix_mode == 1u) {
+			snap.user_data[0] = static_cast<uint32_t>(in.gs_user_data_addr);
+			snap.user_data[1] = static_cast<uint32_t>(in.gs_user_data_addr >> 32u);
 		}
+		std::copy_n(sgpr, sgpr_n, snap.user_data.begin() + st.ud_base);
+		const uint32_t* ud     = snap.user_data.data() + st.ud_base;
+		const auto&     recipe = rep->recipe[s];
+		const auto      build  = [&](const std::vector<ResourceRecipe>& recipes, std::vector<IR::DescriptorValue>& values) {
+            values.resize(recipes.size());
+            for (size_t i = 0; i < recipes.size(); i++) {
+                const auto& r = recipes[i];
+                auto&       v = values[i];
+                v             = {};
+                v.dword_count = r.dword_count;
+                for (uint32_t k = 0; k < r.dword_count; k++) {
+                    if (!EvaluateBound(r.dwords[k], ud, sgpr_n, v.dwords[k])) return false;
+                }
+            }
+            return true;
+		};
+		if (!build(recipe.buffers, snap.buffers) || !build(recipe.images, snap.images) || !build(recipe.samplers, snap.samplers)) {
+			return GC::kS1Read;
+		}
+		snap.uniform_fill = {};
+		snap.flattened_srt.assign(st.flat_size, 0u);
+		for (const auto& flat: recipe.flat) {
+			if (flat.flat_offset >= st.flat_size) return shape(GC::kShFlat, s);
+			if (!EvaluateBound(flat.recipe, ud, sgpr_n, snap.flattened_srt[flat.flat_offset])) return GC::kS1Read;
+		}
+		// The whole specialization as materialization derives it (null V#s and invalid T#s zeroed,
+		// the image remap applied to the snapshot).
+		if (!IR::SpecializeForNative(*st.plan, snap, m_prediction.specialization[s])) return GC::kS1Spec;
+		spec = Mix(spec, SpecHash(m_prediction.specialization[s]));
 	}
-	snap.images.clear();
-	snap.samplers.clear();
-	snap.uniform_fill = {};
-	snap.flattened_srt.assign(rep->flat_size, 0u);
-	for (const auto& flat: recipe.flat) {
-		if (flat.flat_offset >= rep->flat_size) return GC::kS1Shape;
-		if (!EvaluateBound(flat.recipe, ud, ud_n, snap.flattened_srt[flat.flat_offset])) return GC::kS1Read;
-	}
-	if (!IR::SpecializeBuffersForNative(*rep->plan0, snap, m_prediction.specialization)) return GC::kS1Spec;
-	uint64_t spec = Mix(0x84222325cbf29ce4ull, 0u); // no pixel stage: no plain variant
-	spec          = Mix(spec, SpecHash(m_prediction.specialization));
-	uint64_t key  = Mix(base, spec);
-	key           = key == 0 ? 1 : key;
+	uint64_t key = Mix(Mix(base, 0u /* no embedded fetch: covered entries have none */), spec);
+	key          = key == 0 ? 1 : key;
 	const Entry* entry = m_table->Find(key);
 	if (entry == nullptr || entry->conflicted) return GC::kS1Miss;
-	if (!entry->s1_covered || entry->plan0 != rep->plan0 || entry->ud_count != rep->ud_count || entry->ud_base != rep->ud_base ||
-	    entry->prefix_mode != rep->prefix_mode || entry->flat_size != rep->flat_size || !SameRecipe(entry->recipe[0], recipe)) {
-		return GC::kS1Shape;
-	}
-	m_prediction.entry = entry;
-	m_prediction.key   = key;
+	if (!entry->s1_covered) return shape(entry->s1_shape, entry->s1_shape_stage);
+	if (!SameS1Stages(*entry, *rep)) return shape(GC::kShVariant, 0);
+	m_prediction.entry       = entry;
+	m_prediction.key         = key;
+	m_prediction.stage_count = stages;
+	m_prediction.plain       = plain;
+	m_prediction.pipeline    = entry->current;
+	m_prediction.generation  = entry->current_generation;
 	return GC::kS1Emitted;
 }
 
@@ -803,6 +881,9 @@ void Session::CheckS1(const DrawView& view, uint64_t key, const Entry* entry) {
 	m_s1_armed = false;
 	if (m_s1_armed_op != view.op_flags) return;
 	const auto& pred = m_prediction;
+	// S1b: a predicted plain pixel variant whose draw records mip statistics is not emitted
+	// (kS1Plain): the normal path's instrumented program is the expected outcome, not compared.
+	if (pred.plain && view.ps_mip_stats && !view.plain_pixel) return;
 	uint32_t    bad  = 0;
 	std::string what;
 	const auto  fail = [&](const std::string& text) {
@@ -811,33 +892,46 @@ void Session::CheckS1(const DrawView& view, uint64_t key, const Entry* entry) {
 	};
 	if (key != pred.key) fail(fmt::format("key 0x{:x} predicted 0x{:x}", key, pred.key));
 	if (entry != pred.entry) fail("entry");
-	if (view.stage_count != 1) fail(fmt::format("stages {}", view.stage_count));
-	if (pred.entry != nullptr && view.stages[0].program != pred.entry->vs) fail("program");
+	if (view.stage_count != pred.stage_count) fail(fmt::format("stages {} predicted {}", view.stage_count, pred.stage_count));
+	if (view.plain_pixel != pred.plain) fail(fmt::format("plain pixel {} predicted {}", view.plain_pixel, pred.plain));
+	if (pred.entry != nullptr && view.stages[0].program != pred.entry->vs) fail("vs program");
+	if (pred.entry != nullptr && view.stage_count > 1 && view.stages[1].program != pred.entry->ps) fail("ps program");
 	if (pred.entry != nullptr && view.pipeline->pipeline_layout != pred.entry->layout) fail("layout");
-	const auto* s = view.stages[0].snapshot;
-	if (s != nullptr) {
-		if (s->buffers.size() != pred.snapshot.buffers.size()) {
-			fail(fmt::format("buffers {} predicted {}", s->buffers.size(), pred.snapshot.buffers.size()));
-		} else {
-			for (size_t i = 0; i < s->buffers.size(); i++) {
-				const auto& a = s->buffers[i];
-				const auto& b = pred.snapshot.buffers[i];
-				bool        same = a.dword_count == b.dword_count;
-				for (uint32_t k = 0; same && k < a.dword_count && k < 8u; k++) same = a.dwords[k] == b.dwords[k];
-				if (!same) {
-					fail(fmt::format("V# {}: 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} predicted 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}", i, a.dwords[0],
-					                 a.dwords[1], a.dwords[2], a.dwords[3], b.dwords[0], b.dwords[1], b.dwords[2], b.dwords[3]));
-				}
+	// S1b: the pipeline object, unless one was replaced since the prediction's selection.
+	if (pred.pipeline != nullptr && view.pipeline_generation == pred.generation && view.pipeline->pipeline != pred.pipeline->pipeline) {
+		fail("pipeline object");
+	}
+	const auto words = [&](const char* what_name, const std::vector<IR::DescriptorValue>& a, const std::vector<IR::DescriptorValue>& b) {
+		if (a.size() != b.size()) {
+			fail(fmt::format("{} count {} predicted {}", what_name, a.size(), b.size()));
+			return;
+		}
+		for (size_t i = 0; i < a.size(); i++) {
+			bool same = a[i].dword_count == b[i].dword_count;
+			for (uint32_t k = 0; same && k < a[i].dword_count && k < 8u; k++) same = a[i].dwords[k] == b[i].dwords[k];
+			if (!same) {
+				fail(fmt::format("{} {}: 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} predicted 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}", what_name, i,
+				                 a[i].dwords[0], a[i].dwords[1], a[i].dwords[2], a[i].dwords[3], b[i].dwords[0], b[i].dwords[1],
+				                 b[i].dwords[2], b[i].dwords[3]));
 			}
 		}
-		if (!s->images.empty() || !s->samplers.empty()) fail("images/samplers");
-		if (s->flattened_srt != pred.snapshot.flattened_srt) fail(fmt::format("flat SRT ({} dwords)", s->flattened_srt.size()));
-		if (s->user_data != pred.snapshot.user_data) fail(fmt::format("user data ({} dwords)", s->user_data.size()));
-		if (!(s->uniform_fill == pred.snapshot.uniform_fill)) fail("uniform fill");
-	} else {
-		fail("no snapshot");
+	};
+	for (uint32_t s = 0; s < view.stage_count && s < pred.stage_count; s++) {
+		const char* stage = s == 0 ? "vs" : "ps";
+		const auto* snap  = view.stages[s].snapshot;
+		const auto& p     = pred.snapshot[s];
+		if (snap == nullptr) {
+			fail(fmt::format("{} no snapshot", stage));
+			continue;
+		}
+		words(s == 0 ? "vs V#" : "ps V#", snap->buffers, p.buffers);
+		words(s == 0 ? "vs T#" : "ps T#", snap->images, p.images);
+		words(s == 0 ? "vs S#" : "ps S#", snap->samplers, p.samplers);
+		if (snap->flattened_srt != p.flattened_srt) fail(fmt::format("{} flat SRT ({} dwords)", stage, snap->flattened_srt.size()));
+		if (snap->user_data != p.user_data) fail(fmt::format("{} user data ({} dwords)", stage, snap->user_data.size()));
+		if (!(snap->uniform_fill == p.uniform_fill)) fail(fmt::format("{} uniform fill", stage));
+		if (view.stages[s].spec == nullptr || !(*view.stages[s].spec == pred.specialization[s])) fail(fmt::format("{} specialization", stage));
 	}
-	if (view.stages[0].spec == nullptr || !(*view.stages[0].spec == pred.specialization)) fail("specialization");
 	m_result.s1_checked    = true;
 	m_result.s1_mismatches = bad;
 	if (bad != 0) {

@@ -412,18 +412,45 @@ enum NativeS1Reason : uint32_t {
 	kS1Regs,      // context / user-config registers differ from the segment's last normal draw
 	kS1Kind,      // not an indexed draw (DrawIndex), 8-bit indices, primitive restart
 	kS1Record,    // no record, or the executed draw is not the record's
-	kS1Pixel,     // a pixel stage is active (first subset: none)
+	kS1Pixel,     // a pixel stage is active and KYTY_NATIVE_S1_PIXEL=0
 	kS1Miss,      // NativeKey not learned (or conflicted, table full)
-	kS1Shape,     // learned entry not covered: images/samplers, written buffers, flow, fetch, tess...
+	kS1Shape,     // learned entry not covered (NativeS1Shape: why, per stage)
 	kS1Read,      // a recipe load refused (guest bytes not clean)
-	kS1Spec,      // specialization rejected a V#
+	kS1Spec,      // specialization rejected a V#, T# or S#
 	kS1Late,      // the binding work changed command buffer / rendering / image state
 	kS1Sample,    // KYTY_NATIVE_VERIFY=1: sampled, normal path, prediction compared
 	kS1Barriers,  // barriers pending and the segment's rendering state has a clear
+	kS1Feedback,  // S1b: a texture of the draw is one of the segment's attachments
+	kS1Plain,     // S1b: the pixel stage records mip statistics (the plain variant does not apply)
 	kS1Count
 };
+// S1b: why a learned entry is not covered (first uncovered property; diagnostic breakdown of
+// kS1Shape, per stage: vertex/mesh, pixel).
+enum NativeS1Shape : uint32_t {
+	kShCovered,
+	kShTess,        // more than one vertex stage
+	kShFlow,        // recipe with control flow (plan control flow)
+	kShDeep,        // recipe deeper than user data / one load (or indirect descriptor, const buffer)
+	kShWrites,      // written buffers / images, atomics, address writes
+	kShBinding,     // binding kind not covered (GDS, shared memory, fault buffer...)
+	kShUniform,     // uniform fill
+	kShFetch,       // embedded vertex fetch or vertex buffers
+	kShClip,        // user clip planes
+	kShPrefix,      // user-data prefix neither zero nor the GS user-data address
+	kShIndirect,    // a resource recipe without dwords (indirect / unknown source)
+	kShFlat,        // flattened SRT size differs
+	kShUdCount,     // bound user SGPR count differs from the learned one
+	kShVariant,     // the full key's entry differs from the base key's representative
+	kShPipeline,    // no pipeline object (or mesh flag differs)
+	kShLodVerify,   // pixel stage with KYTY_LOD_STATS_PLAIN_VARIANT=verify (canary)
+	kShImageClass,  // pixel/vertex image not covered (storage, indirect image table)
+	kShCount
+};
 struct NativeS1Draw {
-	uint32_t reason = kS1Emitted;
+	uint32_t reason      = kS1Emitted;
+	uint32_t shape       = kShCovered; // kS1Shape: NativeS1Shape
+	uint32_t shape_stage = 0;          // kS1Shape: 0 vertex/mesh, 1 pixel
+	bool     pixel       = false;      // the draw has a pixel stage
 };
 // Executor: one native op's S1 outcome (emitted, or why not).
 void NoteNativeS1(uint32_t op_flags, const NativeS1Draw& draw);

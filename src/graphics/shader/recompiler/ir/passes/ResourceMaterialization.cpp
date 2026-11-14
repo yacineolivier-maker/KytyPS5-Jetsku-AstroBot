@@ -863,6 +863,42 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	return true;
 }
 
+// Astro Bot PC (KYTY_NATIVE_MODE=s1, step S1b): the specialization of a snapshot whose V#, T# and
+// S# dwords the native emitter rebuilt, as MaterializeResourcesImpl derives it once the dwords are
+// evaluated (direct images only: an indirect image table is rejected).
+bool SpecializeForNative(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                         ResourceSpecialization& specialization) {
+	if (snapshot.buffers.size() != program.info.buffers.size() ||
+	    snapshot.images.size() != program.info.images.size() ||
+	    snapshot.samplers.size() != program.info.samplers.size()) {
+		return false;
+	}
+	specialization.images.clear();
+	specialization.images.reserve(program.info.images.size());
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& image  = program.info.images[i];
+		const auto* source = Source(program, image.source);
+		if (source == nullptr || source->indirect_descriptor.has_value()) {
+			return false;
+		}
+		specialization.images.push_back(ResourceSpecialization::Image {
+		    .numeric_class              = image.numeric_class,
+		    .dimension                  = image.dimension,
+		    .mip_count                  = image.mip_count,
+		    .conversion_format          = image.conversion_format,
+		    .shader_swizzle             = image.shader_swizzle,
+		    .indirect_root              = image.indirect_root,
+		    .indirect_mapping_offset    = image.indirect_mapping_offset,
+		    .indirect_search_iterations = image.indirect_search_iterations,
+		    .cube                       = image.cube,
+		});
+		if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+			snapshot.images[i].dwords.fill(0); // as materialization does (without the report)
+		}
+	}
+	return BuildResourceSpecialization(program, snapshot, specialization, false);
+}
+
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan) {
 	if (base.samplers.size() > plan.mapping.size()) {

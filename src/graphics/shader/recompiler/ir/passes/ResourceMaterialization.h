@@ -61,6 +61,12 @@ void SetUnmappedBufferProbe(SrtMappedRange probe);
 // (the native emitter covers programs without images only). False: a V# the specialization rejects.
 bool SpecializeBuffersForNative(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                 ResourceSpecialization& specialization);
+// Astro Bot PC (KYTY_NATIVE_MODE=s1, step S1b): the whole specialization (buffers, direct images,
+// samplers' plan, image remap) of a snapshot whose V#/T#/S# dwords the native emitter rebuilt, as
+// materialization derives it from evaluated dwords (an invalid T# is zeroed, a null V# too). False:
+// an indirect image table, or a descriptor the specialization rejects.
+bool SpecializeForNative(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                         ResourceSpecialization& specialization);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

@@ -626,15 +626,24 @@ std::array<std::array<uint64_t, GameCapture::kCfCount>, kEngineThreads> g_s0_con
 // S1 (executor): native emission outcomes per slot.
 constexpr const char* kS1ReasonNames[GameCapture::kS1Count] = {"emitted", "seg-start", "slot",  "no-seg", "activity", "command",
                                                                "regs",    "kind",      "record", "pixel", "miss",     "shape",
-                                                               "read",    "spec",      "late",  "sample", "barriers"};
+                                                               "read",    "spec",      "late",  "sample", "barriers",
+                                                               "feedback", "plain"};
+// S1b: kS1Shape broken down by first uncovered property, per stage (vertex/mesh, pixel).
+constexpr const char* kS1ShapeNames[GameCapture::kShCount] = {"covered", "tess",    "flow",     "deep",     "writes",   "binding",
+                                                              "uniform", "fetch",   "clip",     "prefix",   "indirect", "flat",
+                                                              "ud-count", "variant", "pipeline", "lod-verify", "image-class"};
 struct S1Resolve {
 	std::array<std::atomic<uint64_t>, GameCapture::kS1Count> reasons {};
 	std::atomic<uint64_t>                                    checked {0}, mismatched {0};
+	std::array<std::array<std::atomic<uint64_t>, GameCapture::kShCount>, 2> shapes {};
+	std::atomic<uint64_t>                                    pixel_draws {0}, pixel_emitted {0};
 };
 std::array<S1Resolve, kEngineThreads> g_s1 {};
 struct S1ResolveLast {
 	std::array<uint64_t, GameCapture::kS1Count> reasons {};
 	uint64_t                                    checked = 0, mismatched = 0;
+	std::array<std::array<uint64_t, GameCapture::kShCount>, 2> shapes {};
+	uint64_t                                    pixel_draws = 0, pixel_emitted = 0;
 };
 std::array<S1ResolveLast, kEngineThreads> g_s1_last {};
 std::atomic<uint32_t> g_s1_logged {0};
@@ -1702,6 +1711,20 @@ std::string S0SlotReport(uint32_t s) {
 		for (uint32_t k = 1; k < GameCapture::kS1Count; k++) {
 			if (n[k] != 0) out += fmt::format(" {} {}", kS1ReasonNames[k], n[k]);
 		}
+		// S1b: the shape fallbacks by first uncovered property and stage.
+		{
+			std::string shapes;
+			for (uint32_t st = 0; st < 2; st++) {
+				for (uint32_t k = 1; k < GameCapture::kShCount; k++) {
+					const auto d = take(r.shapes[st][k], last.shapes[st][k]);
+					if (d != 0) shapes += fmt::format(" {}-{} {}", st == 0 ? "vs" : "ps", kS1ShapeNames[k], d);
+				}
+			}
+			const auto pixel_draws   = take(r.pixel_draws, last.pixel_draws);
+			const auto pixel_emitted = take(r.pixel_emitted, last.pixel_emitted);
+			out += fmt::format(" | s1 shape:{} | s1 pixel-stage draws {} emitted {}", shapes.empty() ? " none" : shapes, pixel_draws,
+			                   pixel_emitted);
+		}
 		out += fmt::format(" | s1 verify: predictions checked {} mismatched {}{}", checked, mismatched,
 		                   Native().verify ? "" : " (off: KYTY_NATIVE_VERIFY=1)");
 		out += " | s1 HOT copies: through the emulator's BufferCache (ObtainBuffer) in this subset, not counted separately";
@@ -2587,7 +2610,13 @@ void NoteNativeS1(uint32_t op_flags, const NativeS1Draw& d) {
 	if (slot >= kEngineThreads) {
 		return;
 	}
-	Inc(g_s1[slot].reasons[std::min<uint32_t>(d.reason, kS1Count - 1u)]);
+	auto& r = g_s1[slot];
+	Inc(r.reasons[std::min<uint32_t>(d.reason, kS1Count - 1u)]);
+	if (d.reason == kS1Shape) Inc(r.shapes[d.shape_stage & 1u][std::min<uint32_t>(d.shape, kShCount - 1u)]);
+	if (d.pixel) {
+		Inc(r.pixel_draws);
+		if (d.reason == kS1Emitted) Inc(r.pixel_emitted);
+	}
 }
 
 void NoteNativeS1Mismatch(uint32_t op_flags, const char* text) {
