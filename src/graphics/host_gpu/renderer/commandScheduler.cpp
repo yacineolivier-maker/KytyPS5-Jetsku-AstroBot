@@ -756,6 +756,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
+	GpuOpProfiler::NoteSubmitStack(); // Astro Bot PC (KYTY_RENDER_END_STATS)
 	const CpGaps::Scope gap(CpGaps::Cat::Flush);
 	HangWatchdog::NoteSubmission();
 	if (m_dual && CpPar::Concurrent()) {

@@ -206,6 +206,8 @@ inline void CountEndRendering(const void* caller = nullptr) noexcept {
 // Astro Bot PC (KYTY_RENDER_END_STATS): a render split's pending batch (BarrierOrigin bits; flags:
 // 1 images, 2 buffers, 4 uploads).
 void NoteSplitOrigins(uint32_t origins, uint32_t flags) noexcept;
+// Astro Bot PC (KYTY_RENDER_END_STATS): CommandScheduler::Submit's caller stack (4 frames), counted.
+void NoteSubmitStack() noexcept;
 
 // Shader/pipeline identity for per-pipeline attribution. Cheap no-ops unless CaptureEnabled().
 void RegisterShader(uint64_t program_id, const char* stage, uint64_t guest_hash);

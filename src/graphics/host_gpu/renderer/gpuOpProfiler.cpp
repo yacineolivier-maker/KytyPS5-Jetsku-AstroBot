@@ -1916,6 +1916,34 @@ void CountEndRendering(const void* caller) noexcept {
 
 } // namespace Detail
 
+namespace {
+std::mutex                                                 g_submit_stacks_mutex;
+std::unordered_map<uint64_t, std::array<uintptr_t, 4>>     g_submit_stack_frames;
+std::unordered_map<uint64_t, uint64_t>                     g_submit_stack_counts;
+bool RenderEndStatsOn() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_RENDER_END_STATS");
+		return value != nullptr && value[0] != 0 && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+} // namespace
+
+void NoteSubmitStack() noexcept {
+	if (!Detail::g_active || !RenderEndStatsOn()) return;
+	void*      frames[4] {};
+	const auto count = CaptureStackBackTrace(2, 4, frames, nullptr); // skip this and Submit
+	std::array<uintptr_t, 4> key_frames {};
+	uint64_t                 key = 0x9e3779b97f4a7c15ull;
+	for (USHORT i = 0; i < count && i < 4; i++) {
+		key_frames[i] = reinterpret_cast<uintptr_t>(frames[i]);
+		key           = (key ^ key_frames[i]) * 0x100000001b3ull;
+	}
+	std::lock_guard lock(g_submit_stacks_mutex);
+	g_submit_stack_frames[key] = key_frames;
+	g_submit_stack_counts[key]++;
+}
+
 void NoteSplitOrigins(uint32_t origins, uint32_t flags) noexcept {
 	if (!Detail::g_active) return;
 	for (uint32_t i = 0; i < Detail::g_split_origins.size(); i++) {
@@ -2179,6 +2207,21 @@ void OnGuestFlip() {
 				line += " | unknown-site callers (module offset):";
 				for (size_t i = 0; i < callers.size() && i < 8; i++) {
 					line += fmt::format(" 0x{:x}={}", callers[i].second - base, callers[i].first);
+				}
+				std::vector<std::pair<uint64_t, std::array<uintptr_t, 4>>> stacks;
+				{
+					std::lock_guard lock(g_submit_stacks_mutex);
+					for (const auto& [key, count]: g_submit_stack_counts) stacks.emplace_back(count, g_submit_stack_frames[key]);
+					g_submit_stack_counts.clear();
+					g_submit_stack_frames.clear();
+				}
+				std::sort(stacks.begin(), stacks.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+				line += " | submit stacks:";
+				for (size_t i = 0; i < stacks.size() && i < 6; i++) {
+					line += fmt::format(" {}@", stacks[i].first);
+					for (const auto frame: stacks[i].second) {
+						if (frame != 0) line += fmt::format("0x{:x}/", frame - base);
+					}
 				}
 			}
 			flips = 0;
