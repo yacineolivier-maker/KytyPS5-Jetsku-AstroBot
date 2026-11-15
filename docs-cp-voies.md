@@ -17,6 +17,8 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `87d2964e` | 1 | rejeu par voie, remise à la file dans l'ordre des listes | BUILD_OK |
 | `d4e6056d` | 2 | plages de ticks par segment de voie (au lieu d'un tick provisoire), ordre de remise par segment, soumissions et opérations différées d'un segment plus jeune retenues jusqu'à son tour | BUILD_OK |
 | `48d04f8c` | 3a | 2b accepté avec `KYTY_EOP_TIMESTAMPS=gpu` (préréglage U59) ; tas de descripteurs : un pool se retire au plus grand tick de ses utilisateurs | BUILD_OK |
+| `ae518a8e` | 3b-1 | retraits « au tick du fil appelant » relevés ; dépendance de soumission UploadDma par voie ; compteur « early retires avoided » | BUILD_OK |
+| `36a6a7ee` | 3b-2 (partielle) | verrou global FIFO des voies autour de chaque opération (`KYTY_CP_PAR_LOCK=0` le coupe), `IsGpuThread` vrai pour son détenteur ; compteurs prises/attente/temps tenu | BUILD_OK |
 | `ba1b4058` | 4–5 | registre des plages liées/écrites par segment ouvert, attente de dépendance, violations d'ordre (`KYTY_CP_PAR_VERIFY=1`), ligne « CpPar 10s: 2b » complète | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
@@ -78,6 +80,26 @@ paquet `Submit`), `renderer/masterSemaphore.{h,cpp}` (plages de ticks), `rendere
 tour, opérations retenues, registre des dépendances), `renderer/pipeline/descriptors.cpp` (point d'appel du
 registre), `renderer/renderContext.cpp` (exécuteurs par voie aussi en 2b).
 
+### Étapes 3b-1 et 3b-2 (toujours à tour de rôle)
+
+**3b-1.** Relevé des objets retirés au tick du fil appelant. Pages du flux (`StreamBuffer::Commit`), plages de
+l'anneau `UploadDma`, emplacements d'occlusion et de statistiques LOD : chacun est daté au tick de la voie qui
+l'utilise (avec les plages de ticks : le tick du tampon qui le lit) et récupéré dans l'ordre de son anneau (un
+tick plus grand en tête ne fait que retarder) : correct aussi en simultané. Retiré par un autre que son dernier
+utilisateur : les pools de descripteurs (corrigé en 3a : plus grand tick des utilisateurs). Corrigé en 3b-1 :
+la dépendance de soumission d'`UploadDma` (un seul `m_stage_tick`) devient propre à chaque voie. « early
+retires avoided » (ligne 2b) compte les cas où l'ancien calcul aurait été trop tôt : 0 attendu à tour de rôle.
+
+**3b-2 (partielle).** Verrou global FIFO des voies (`CpPar::LaneLockAcquire`), pris autour de chaque opération
+d'une voie dans `ResolveSubmission` (pas autour des flips renvoyés à Thread_Gpu) ; `IsGpuThread()` répond aussi
+vrai pour son détenteur (requalifie tous les contrôles « fil GPU » d'un coup, sans changement à tour de rôle).
+Ligne 2b : « lane lock n takes, x ms waiting, y ms held » (attente ≈ 0 attendue). **Pas faits** : état du
+`CommandProcessor` gardé d'une opération à l'autre (`m_submit_id`, `m_deferred_eop_flushes`,
+`m_packets_since_eop_request`, `m_idle_flush_*`, `m_resolve_lane`, `m_slice_draws`, `g_current_execution`…) par
+voie, `RenderMutex` (propriétaire unique donné avec le jeton), compteur d'opérations exécutées du séquenceur. Les
+services renvoyés à Thread_Gpu (`RunOnGpuThread`) s'exécutent pendant que la voie tient le verrou : sans risque
+à tour de rôle, à revoir en 3b-3 (Thread_Gpu ne doit pas prendre le verrou pour eux, ou la voie doit le lâcher).
+
 ### Variables pour l'essai en jeu
 
 Base (comme P1) : `KYTY_CP_SEQ=1`, `KYTY_CP_RECORDER=1` (sans `KYTY_CP_RECORDER_VERIFY`),
@@ -126,7 +148,7 @@ Comparer image, i/s (3 tours), stabilité (5 min) à 2a.
 
 ### Suite
 
-**Étape 3b (non faite) — exécution simultanée sous un verrou global.** Seule la préparation 3a est faite
+**Étape 3b-3 (non faite) — exécution simultanée, opération entière sous le verrou.** Seule la préparation 3a est faite
 (`48d04f8c`). La simultanéité réelle n'a pas été écrite : elle change la boucle des files de Thread_Gpu, le
 partage du `CommandProcessor` (un seul objet, champs gardés d'une opération à l'autre : `SetSubmitId`,
 `BufferInit/BufferFlush`, compteur d'opérations exécutées du séquenceur qui ne suit que Thread_Gpu), la propriété
