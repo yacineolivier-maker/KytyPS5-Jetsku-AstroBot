@@ -79,6 +79,14 @@ public:
 		       Encode(head, State::Done);
 	}
 
+	// Astro Bot PC (KYTY_CP_PAR_FASTDRAW): the head is claimed and not done yet (outside the
+	// producer's own commit: claimed by a worker that is preparing it).
+	[[nodiscard]] bool HeadClaimed() const noexcept {
+		const auto head = Head();
+		return m_slots[head & m_mask].state.load(std::memory_order_acquire) ==
+		       Encode(head, State::Claimed);
+	}
+
 	// Retires the head after its commit.
 	void Retire() noexcept {
 		const auto head = Head();

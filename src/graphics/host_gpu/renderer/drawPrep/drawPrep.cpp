@@ -1491,6 +1491,36 @@ void Engine::CommitPublished(uint64_t position, uint64_t submit_id, uint32_t ins
 	CommitHead(&patch);
 }
 
+// Astro Bot PC (KYTY_CP_PAR_FASTDRAW=1, drawPrep.h).
+uint64_t Engine::WaitHeadPrepared(uint64_t position, bool& unclaimed) {
+	unclaimed = false;
+	if (m_workers == nullptr) {
+		return 0;
+	}
+	auto& window = m_workers->window;
+	if (window.Empty() || window.Head() != position) {
+		return 0;
+	}
+	if (!window.HeadClaimed()) {
+		unclaimed = !window.HeadDone();
+		return 0;
+	}
+	const auto start = NowNs();
+	for (uint32_t spins = 0; window.HeadClaimed(); spins++) {
+		if ((spins & 1023u) == 1023u) {
+			// The commit's own wait (ReadyHead) services pending commands after 2 ms as a last-resort
+			// deadlock guard: past that, leave the rest of the wait to it (under the lock, as before).
+			if (NowNs() - start > 2'000'000u) {
+				break;
+			}
+			std::this_thread::yield();
+		} else {
+			CpuRelax();
+		}
+	}
+	return NowNs() - start;
+}
+
 void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 	auto& slot = ReadyHead();
 	// A dispatch slot is only ever taken by its own op (ExecuteDispatch).

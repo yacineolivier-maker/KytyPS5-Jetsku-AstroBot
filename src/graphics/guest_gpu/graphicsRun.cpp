@@ -8823,6 +8823,37 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				const CpPar::TurnReasonScope why(reason);
 				GetScheduler().WaitSegmentTurn();
 			}
+			if (CpPar::FastDrawEnabled()) {
+				// Astro Bot PC (KYTY_CP_PAR_FASTDRAW=1, P3 first step): the slot this op commits is
+				// waited for here, outside the lanes' lock, while a draw-prep worker prepares it.
+				uint64_t window = UINT64_MAX;
+				if (kind == CpSeq::OpKind::DrawIndex &&
+				    (view.As<CpSeq::DrawIndexOp>().flags & CpSeq::DrawFlagPublished) != 0) {
+					window = view.As<CpSeq::DrawIndexOp>().window;
+				} else if (kind == CpSeq::OpKind::DrawAuto &&
+				           (view.As<CpSeq::DrawAutoOp>().flags & CpSeq::DrawFlagPublished) != 0) {
+					window = view.As<CpSeq::DrawAutoOp>().window;
+				} else if (kind == CpSeq::OpKind::DispatchDirect &&
+				           (view.As<CpSeq::DispatchDirectOp>().flags & CpSeq::DispatchFlagPrepared) != 0) {
+					window = view.As<CpSeq::DispatchDirectOp>().window;
+				}
+				if (window != UINT64_MAX && ResolvePrep() != nullptr) {
+					bool       unclaimed = false;
+					const auto waited    = [&] {
+						const CpPar::LaneIdleScope idle;
+						const CpPar::WaitScope     stall("draw-prep slot (fast draw, window)", window);
+						return ResolvePrep()->WaitHeadPrepared(window, unclaimed);
+					}();
+					if (waited != 0) {
+						CpPar::NoteLaneStat(context, CpPar::LaneStat::FastDrawWaits, 1);
+						CpPar::NoteLaneStat(context, CpPar::LaneStat::FastDrawWaitNs, waited);
+					} else {
+						CpPar::NoteLaneStat(context, unclaimed ? CpPar::LaneStat::FastDrawUnclaimed
+						                                       : CpPar::LaneStat::FastDrawReady,
+						                    1);
+					}
+				}
+			}
 			CpPar::LaneLockAcquire();
 			concurrent_op.held  = true;
 			concurrent_op.lane  = context;

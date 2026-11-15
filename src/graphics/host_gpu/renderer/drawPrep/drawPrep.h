@@ -310,6 +310,13 @@ public:
 	// Resolver: commits the draw at window position `position` (the head), recorded with
 	// `submit_id` and, unless UINT32_MAX, `instance_count` (resolved in order).
 	void CommitPublished(uint64_t position, uint64_t submit_id, uint32_t instance_count);
+	// Astro Bot PC (KYTY_CP_PAR_FASTDRAW=1, cpParallel.h): the resolver, before taking the lanes'
+	// lock for the op that commits window position `position` (the head): waits while a worker
+	// prepares that slot, so that the wait (ReadyHead's commit wait) is not spent holding the lock.
+	// Only reads the slot's state (no claim, no preparation); the commit itself is unchanged.
+	// Returns the time waited (0: no wait) and sets `unclaimed` when no thread has claimed the
+	// head yet (ReadyHead then prepares it itself, under the lock, as before).
+	uint64_t WaitHeadPrepared(uint64_t position, bool& unclaimed);
 
 	// KYTY_DRAW_PREP_INDIRECT (default on; parallel mode with the CP sequencer): a single-record
 	// indirect draw (DRAW_INDIRECT, DRAW_INDEX_INDIRECT) is published like a direct draw, so a

@@ -580,6 +580,10 @@ enum class LaneStat : uint32_t {
 	ResumedBeforeYounger, //     a resumed unfinished list placed before younger lists already out
 	OutOfOrderEnds,     //       a list out ended (and is kept) while not at the front of the flights (0 expected)
 	BeganBesideKept,    //       the lane began its slice's segment while an older lane's was kept
+	FastDrawWaits,      // KYTY_CP_PAR_FASTDRAW: a committed slot waited for outside the lanes' lock
+	FastDrawWaitNs,
+	FastDrawReady,      //       ... already prepared (no wait)
+	FastDrawUnclaimed,  //       ... not claimed by any worker: prepared under the lock (as before)
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
@@ -628,6 +632,12 @@ inline bool g_lane_concurrent = false;
 	return g_lane_concurrent;
 }
 [[nodiscard]] bool LaneConcurrentConfigured(); // KYTY_CP_PAR_CONCURRENT=1 in 2b, read once
+// Astro Bot PC (KYTY_CP_PAR_FASTDRAW=1, concurrent mode only, default off): P3, first step for the
+// committed draws (DrawIndex / DrawAuto from a published slot, prepared dispatches). Before taking
+// the lanes' lock, a lane waits outside it while a draw-prep worker is still preparing the slot
+// its op commits (the commit's head wait used to spin with the lock held, stopping every other
+// lane). Read-only on the slot's state; the commit (RenderExecutor) still runs under the lock.
+[[nodiscard]] bool FastDrawEnabled();
 // Why a lane waits for its turn (counted per reason in the concurrent line). The calling thread's
 // reason is set for the scope of a wait (TurnReasonScope); Submit otherwise.
 enum class TurnReason : uint32_t {

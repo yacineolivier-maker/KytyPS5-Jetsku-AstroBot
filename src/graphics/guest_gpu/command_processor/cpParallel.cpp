@@ -1093,6 +1093,22 @@ bool LaneConcurrentConfigured() {
 	return on;
 }
 
+bool FastDrawEnabled() {
+	// Astro Bot PC (KYTY_CP_PAR_FASTDRAW, cpParallel.h).
+	static const bool on = [] {
+		if (!g_lane_concurrent) {
+			return false;
+		}
+		const auto* value = std::getenv("KYTY_CP_PAR_FASTDRAW");
+		const bool  set   = value != nullptr && std::strcmp(value, "1") == 0;
+		std::printf("Kyty CpPar: 2b concurrent: committed draws wait for their prepared slot outside "
+		            "the lanes' lock: %s (KYTY_CP_PAR_FASTDRAW)\n",
+		            set ? "on" : "off");
+		return set;
+	}();
+	return on;
+}
+
 void SetTurnReason(TurnReason reason) noexcept {
 	t_turn_reason = reason;
 }
@@ -1989,7 +2005,7 @@ void MaybeReport() {
 			              "%s%c: active %.1f ms, slices handed out %" PRIu64 " (back unfinished %" PRIu64
 			              "); turn waits:%s; out-of-turn submits %" PRIu64 ", visible ops not oldest %" PRIu64
 			              ", out of order %" PRIu64 ", dependency hazards %" PRIu64
-			              ", services left to the oldest %" PRIu64 ", retires held for younger %" PRIu64 ", fence holds %" PRIu64 " (timeouts %" PRIu64 "), unfinished-slice flushes %" PRIu64 ", resumed before younger %" PRIu64 ", out-of-order ends %" PRIu64 ", began beside a kept segment %" PRIu64,
+			              ", services left to the oldest %" PRIu64 ", retires held for younger %" PRIu64 ", fence holds %" PRIu64 " (timeouts %" PRIu64 "), unfinished-slice flushes %" PRIu64 ", resumed before younger %" PRIu64 ", out-of-order ends %" PRIu64 ", began beside a kept segment %" PRIu64 "; fast draw: slots waited for outside the lock %" PRIu64 " (%.1f ms), ready %" PRIu64 ", unclaimed %" PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane),
 			              static_cast<double>(n(LaneStat::ActiveNs)) / 1e6, n(LaneStat::Dispatched),
 			              n(LaneStat::CollectedUnfinished), waits.empty() ? " none" : waits.c_str(),
@@ -1997,7 +2013,9 @@ void MaybeReport() {
 			              n(LaneStat::VisibleOutOfOrder), n(LaneStat::DependencyHazards),
 			              n(LaneStat::YoungerServices), n(LaneStat::RetiresHeld), n(LaneStat::FenceHolds), n(LaneStat::FenceTimeouts),
 			              n(LaneStat::UnfinishedFlushes), n(LaneStat::ResumedBeforeYounger),
-			              n(LaneStat::OutOfOrderEnds), n(LaneStat::BeganBesideKept));
+			              n(LaneStat::OutOfOrderEnds), n(LaneStat::BeganBesideKept),
+			              n(LaneStat::FastDrawWaits), static_cast<double>(n(LaneStat::FastDrawWaitNs)) / 1e6,
+			              n(LaneStat::FastDrawReady), n(LaneStat::FastDrawUnclaimed));
 			lanes += item;
 		}
 		// Where the lanes' lock time goes: per lane, the op kinds by time held (count, ms), the
