@@ -1088,10 +1088,12 @@ void MaybeReport() {
 	            ", verify %" PRIu64 "\n",
 	            a, static_cast<double>(a_ns) / 1e6, b, static_cast<double>(b_ns) / 1e6, slices, bs, bf,
 	            f_seq, f_ho, f_ver);
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): each context's draw-prep counts, also for the lanes
+	// line below (contexts C, D: only there).
+	uint64_t values[MaxLanes][4] = {};
 	if (SeparateWindows()) {
 		// Astro Bot PC (KYTY_CP_PAR=1b1): each context's draw-prep window over the last 10 s.
-		uint64_t values[2][4] = {};
-		for (size_t c = 0; c < 2; c++) {
+		for (size_t c = 0; c < MaxLanes; c++) {
 			const auto published = stats.window_published[c].load(std::memory_order_relaxed);
 			const auto retired   = stats.window_retired[c].load(std::memory_order_relaxed);
 			values[c][0]         = published - stats.reported_published[c];
@@ -1275,15 +1277,24 @@ void MaybeReport() {
 	}
 	if (Lanes()) {
 		// Astro Bot PC (KYTY_CP_PAR=2a): the hand-off submits of each lane over the last 10 s.
+		// Per lane: lists resolved to their end, translation (resolving) time, hand-off submits
+		// (empty: only the Begin packet; skipped: nothing encoded, no submit), draw-prep commits
+		// and fallbacks. Lanes A and B reuse the counts taken for the lines above.
 		std::string lanes;
 		for (uint32_t lane = 0; lane < g_lane_count && lane < MaxLanes; lane++) {
-			char item[128];
-			std::snprintf(item, sizeof(item), "%s%c %" PRIu64 " (empty %" PRIu64 ", skipped %" PRIu64 ")",
-			              lane == 0 ? "" : ", ", LaneLetter(lane), take(stats.lane_submits[lane]),
-			              take(stats.lane_empty[lane]), take(stats.lane_skipped[lane]));
+			const uint64_t subs = lane == 0 ? a : (lane == 1 ? b : take(stats.completed[lane]));
+			const uint64_t ns   = lane == 0 ? a_ns : (lane == 1 ? b_ns : take(stats.resolve_ns[lane]));
+			char item[256];
+			std::snprintf(item, sizeof(item),
+			              "%s%c: %" PRIu64 " lists, %.1f ms translating, submits %" PRIu64
+			              " (empty %" PRIu64 ", skipped %" PRIu64 "), prep committed %" PRIu64
+			              " fell back %" PRIu64,
+			              lane == 0 ? "" : "; ", LaneLetter(lane), subs, static_cast<double>(ns) / 1e6,
+			              take(stats.lane_submits[lane]), take(stats.lane_empty[lane]),
+			              take(stats.lane_skipped[lane]), values[lane][2], values[lane][3]);
 			lanes += item;
 		}
-		std::printf("CpPar 10s: 2a lanes (%u): hand-off submits %s\n", g_lane_count, lanes.c_str());
+		std::printf("CpPar 10s: 2a lanes (%u): %s\n", g_lane_count, lanes.c_str());
 	}
 	std::fflush(stdout);
 }
