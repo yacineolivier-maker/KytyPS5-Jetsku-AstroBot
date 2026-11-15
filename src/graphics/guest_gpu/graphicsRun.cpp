@@ -7499,21 +7499,37 @@ GuestGpu::CpParStep GuestGpu::CpParConcurrentStep() {
 		CpParCollect(*flight);
 		progress = true;
 	}
-	// Control (0 expected): a lane keeps an unfinished segment only as the oldest, so every list
-	// before it has ended too. One ended unfinished behind a list still out means the flights are
-	// out of list order (see CpParTryDispatch): it would never be collected. Counted, logged once.
-	if (!m_cp_par_flights.empty() && !m_cp_par_flights.front()->done) {
-		for (size_t i = 1; i < m_cp_par_flights.size(); i++) {
-			if (m_cp_par_flights[i]->done && m_cp_par_flights[i]->result != Pm4ProcessResult::Complete) {
-				CpPar::NoteLaneStat(m_cp_par_flights[i]->lane, CpPar::LaneStat::OutOfOrderEnds, 1);
-				static std::atomic_bool logged {false};
-				if (!logged.exchange(true)) {
-					std::printf("Kyty CpPar 2b concurrent: list %" PRIu64 " ended unfinished behind list %" PRIu64
-					            " still out (flights out of list order)\n",
-					            m_cp_par_flights[i]->submission.sequence,
-					            m_cp_par_flights.front()->submission.sequence);
+	// Control: a lane keeps an unfinished segment only as the oldest, so every list before it has
+	// ended too, but the older list's lane marks its slice done only after its give hook returned
+	// (Resolver2::Run), while the younger one may already have taken the turn, kept and finished: for
+	// a moment a younger unfinished list is done behind an older one not yet marked (seen once in 4
+	// lanes, 15/11 19 h 45, harmless: both collected at the next step). Flights really out of list
+	// order would last: counted (0 expected) only when the same list is still stuck there after 1 s.
+	{
+		static uint64_t stuck_sequence = 0;
+		static uint64_t stuck_since    = 0;
+		uint64_t        behind         = 0;
+		uint32_t        behind_lane    = 0;
+		if (!m_cp_par_flights.empty() && !m_cp_par_flights.front()->done) {
+			for (size_t i = 1; i < m_cp_par_flights.size(); i++) {
+				if (m_cp_par_flights[i]->done && m_cp_par_flights[i]->result != Pm4ProcessResult::Complete) {
+					behind      = m_cp_par_flights[i]->submission.sequence;
+					behind_lane = m_cp_par_flights[i]->lane;
+					break;
 				}
 			}
+		}
+		if (behind == 0) {
+			stuck_sequence = 0;
+		} else if (behind != stuck_sequence) {
+			stuck_sequence = behind;
+			stuck_since    = CpPar::NowNs();
+		} else if (stuck_since != 0 && CpPar::NowNs() - stuck_since > 1'000'000'000ull) {
+			stuck_since = 0; // counted once per stuck list
+			CpPar::NoteLaneStat(behind_lane, CpPar::LaneStat::OutOfOrderEnds, 1);
+			std::printf("Kyty CpPar 2b concurrent: list %" PRIu64 " ended unfinished behind list %" PRIu64
+			            " still out for over 1 s (flights out of list order)\n",
+			            behind, m_cp_par_flights.front()->submission.sequence);
 		}
 	}
 	while (CpParTryDispatch()) {
@@ -8786,10 +8802,16 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		// bound, under the lock. Direct draws and dispatches carrying their registers run out of
 		// turn (younger segment: on its lane's image overlay, below).
 		struct ConcurrentOpLock {
-			bool held = false;
+			bool     held  = false;
+			uint32_t lane  = 0;
+			uint32_t kind  = 0;
+			bool     free  = false;
+			uint64_t start = 0;
 			void Release() {
 				if (held) {
 					held = false;
+					// The lock held per op kind (where the lanes' lock time goes).
+					CpPar::NoteOpLock(lane, kind, free, CpPar::NowNs() - start);
 					CpPar::LaneLockRelease();
 				}
 			}
@@ -8802,7 +8824,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				GetScheduler().WaitSegmentTurn();
 			}
 			CpPar::LaneLockAcquire();
-			concurrent_op.held = true;
+			concurrent_op.held  = true;
+			concurrent_op.lane  = context;
+			concurrent_op.kind  = static_cast<uint32_t>(kind);
+			concurrent_op.free  = reason == CpPar::TurnReason::Count;
+			concurrent_op.start = CpPar::NowNs();
 			if (reason != CpPar::TurnReason::Count) {
 				// Controls (0 expected): a visible op runs as the oldest segment, in op order.
 				CpPar::NoteVisibleOp(context, sequence, GetScheduler().LaneSegmentOldest(context));

@@ -74,6 +74,13 @@ struct Stats {
 	std::atomic<uint64_t> flights_max {0};
 	std::atomic<uint64_t> own_work_locked {0};
 	std::atomic<uint64_t> gc_deferred {0};
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the lanes' lock held per lane and op kind (NoteOpLock),
+	// and the out-of-turn share.
+	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(CpSeq::OpKind::Count)>, MaxLanes>
+	    op_lock_takes {};
+	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(CpSeq::OpKind::Count)>, MaxLanes>
+	                                            op_lock_ns {};
+	std::array<std::atomic<uint64_t>, MaxLanes> op_lock_free_ns {};
 	// KYTY_CP_PAR=1b3: run-ahead starts and ops, promotions by reason, merges and insertions with
 	// their fix-ups, op lock waits per thread, time both threads were busy (overlap).
 	std::atomic<uint64_t> runahead_starts {0};
@@ -1153,6 +1160,19 @@ void NoteVisibleOp(uint32_t lane, uint64_t sequence, bool oldest) {
 	g_last_visible = std::max(g_last_visible, sequence);
 }
 
+void NoteOpLock(uint32_t lane, uint32_t kind, bool free, uint64_t ns) {
+	if (kind >= static_cast<uint32_t>(CpSeq::OpKind::Count)) {
+		return;
+	}
+	auto&      stats = GetStats();
+	const auto index = LaneIndex(lane);
+	stats.op_lock_takes[index][kind].fetch_add(1, std::memory_order_relaxed);
+	stats.op_lock_ns[index][kind].fetch_add(ns, std::memory_order_relaxed);
+	if (free) {
+		stats.op_lock_free_ns[index].fetch_add(ns, std::memory_order_relaxed);
+	}
+}
+
 void NoteFlightsOut(uint32_t count) {
 	auto& max     = GetStats().flights_max;
 	auto  current = max.load(std::memory_order_relaxed);
@@ -1980,6 +2000,34 @@ void MaybeReport() {
 			              n(LaneStat::OutOfOrderEnds), n(LaneStat::BeganBesideKept));
 			lanes += item;
 		}
+		// Where the lanes' lock time goes: per lane, the op kinds by time held (count, ms), the
+		// out-of-turn share, and the rest of the lock's time (hooks, services, flips served,
+		// occlusion dumps, Thread_Gpu's own work...).
+		std::string by_op;
+		for (uint32_t lane = 0; lane < g_lane_count && lane < MaxLanes; lane++) {
+			uint64_t ops_ns = 0;
+			std::string kinds;
+			for (size_t k = 0; k < static_cast<size_t>(CpSeq::OpKind::Count); k++) {
+				const auto count = take(stats.op_lock_takes[lane][k]);
+				const auto ns    = take(stats.op_lock_ns[lane][k]);
+				ops_ns += ns;
+				if (count != 0) {
+					char item[96];
+					std::snprintf(item, sizeof(item), " %s %" PRIu64 " (%.1f ms)",
+					              CpSeq::OpKindName(static_cast<CpSeq::OpKind>(k)), count,
+					              static_cast<double>(ns) / 1e6);
+					kinds += item;
+				}
+			}
+			const auto held = taken[lane][static_cast<size_t>(LaneStat::LockHoldNs)];
+			char       item[160];
+			std::snprintf(item, sizeof(item), "; out of turn %.1f ms; rest of the lock %.1f ms",
+			              static_cast<double>(take(stats.op_lock_free_ns[lane])) / 1e6,
+			              held > ops_ns ? static_cast<double>(held - ops_ns) / 1e6 : 0.0);
+			by_op += (lane == 0 ? std::string() : std::string("; ")) + LaneLetter(lane) + ": ops" +
+			         (kinds.empty() ? std::string(" none") : kinds) + item;
+		}
+		std::printf("CpPar 10s: 2b lock by op (%u): %s\n", g_lane_count, by_op.c_str());
 		std::printf("CpPar 10s: 2b concurrent (%u): overlap 2+ lanes %.1f ms, 3+ lanes %.1f ms; most "
 		            "lists out %" PRIu64 "; Thread_Gpu own work under the lanes' lock %" PRIu64
 		            ", garbage collections deferred %" PRIu64 "; %s\n",

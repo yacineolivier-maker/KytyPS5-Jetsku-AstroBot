@@ -686,6 +686,9 @@ private:
 // `oldest`: its segment is the oldest open one (VisibleNotOldest otherwise); op sequences of visible
 // ops must not go back (VisibleOutOfOrder).
 void NoteVisibleOp(uint32_t lane, uint64_t sequence, bool oldest);
+// The lanes' lock held for one op of kind `kind` (CpSeq::OpKind; `free`: out of turn) on lane
+// `lane`: counted per lane and kind ("CpPar 10s: 2b lock by op" line, concurrent mode).
+void NoteOpLock(uint32_t lane, uint32_t kind, bool free, uint64_t ns);
 // Thread_Gpu statistics of the concurrent mode: flights out after a hand-out, its own work done
 // under the lanes' lock (lists out), garbage collections deferred to a moment with no list out.
 void NoteFlightsOut(uint32_t count);
