@@ -563,6 +563,16 @@ enum class LaneStat : uint32_t {
 	ResumedNotOldest,   //       ... while its segment was not the oldest (0 expected)
 	DelegatedRecordings, //      Thread_Gpu took the token and recorded into the lane's kept segment
 	OpenAtListEnd,      //       a lane's list completed with its segment still open (0 expected)
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacles 4-5): reported in the "CpPar 10s: 2b
+	// concurrent" line.
+	Dispatched,         //       slices handed to the lane without waiting (RunSliceAsync)
+	CollectedUnfinished, //      ... that came back with the list unfinished (kept, retried)
+	ActiveNs,           //       time the lane translated (in a slice, not waiting for its turn or the lock)
+	OutOfTurnSubmits,   //       a submit inside an op of a younger segment, lock held: not waited for
+	VisibleNotOldest,   //       an op visible to the guest executed while not the oldest (0 expected)
+	VisibleOutOfOrder,  //       ... with an op sequence below the last visible one (0 expected)
+	DependencyHazards,  //       KYTY_CP_PAR_VERIFY: a dependency wait refused (lock held), counted only
+	YoungerServices,    //       services not run by a younger segment (left to the oldest)
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
@@ -589,6 +599,103 @@ void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
 // the rest of an unfinished list. On in 2b unless KYTY_CP_PAR_KEEP=0 (then every slice and bounce
 // ends the segment, as before).
 [[nodiscard]] bool LaneKeepEnabled();
+// Astro Bot PC (KYTY_CP_PAR=2b, KYTY_CP_PAR_CONCURRENT=1, obstacles 4 and 5): the lanes run their
+// lists at the same time. Off unless KYTY_CP_PAR_CONCURRENT=1, and only with 2b active and the
+// lanes' lock, the reservation (obstacle 2), the kept segments (obstacle 3) and the overlay (d) on;
+// decided once at start-up (g_lane_concurrent, before Thread_Gpu starts). Then:
+//  - queue-0 graphics lists go to lanes B.. only (rank r -> lane 1 + (r - 1) % (N - 1)); the lists
+//    that must stay on A (constant engine) and flip preparations run on Thread_Gpu with no lane out;
+//  - Thread_Gpu hands each list to its lane without waiting (RunSliceAsync), in list order, the
+//    lane's order reserved at the hand-out, and goes on with the next list while the lane is free;
+//    it collects the slices in list order (PollSlice), serves the lanes' requests meanwhile, and
+//    hands out nothing past an unfinished (kept) list; its own work (other queues, services, A
+//    lists) waits until no lane is out, or, with an unfinished list at the head, is done in that
+//    list's kept segment under the lanes' lock;
+//  - a younger segment waits for its turn (oldest open segment) before every op the guest can see
+//    (labels, end-of-pipe, writes, waits, indirect or register-less draws, flips, services) and
+//    before ending its list or keeping an unfinished one; direct draws and dispatches carrying
+//    their registers run out of turn, under the lanes' lock, on the lane's image overlay.
+// Statistics: "CpPar 10s: 2b concurrent" (overlap, turn waits by reason, controls).
+inline bool g_lane_concurrent = false;
+[[nodiscard]] inline bool LaneConcurrent() noexcept {
+	return g_lane_concurrent;
+}
+[[nodiscard]] bool LaneConcurrentConfigured(); // KYTY_CP_PAR_CONCURRENT=1 in 2b, read once
+// Why a lane waits for its turn (counted per reason in the concurrent line). The calling thread's
+// reason is set for the scope of a wait (TurnReasonScope); Submit otherwise.
+enum class TurnReason : uint32_t {
+	Submit,   // a submit (scheduler), the default
+	Label,    // end-of-pipe, RELEASE_MEM, EVENT_WRITE
+	Write,    // WRITE_DATA, DMA_DATA, clocks, LOD statistics, constant RAM dumps
+	Wait,     // WAIT_REG_MEM, predication, COND_EXEC, branches, lockstep reads
+	Indirect, // indirect draws and dispatches (read GPU data)
+	Draw,     // draws inheriting the instance count or without their own registers
+	Flip,     // flips and flip waits (bounced to Thread_Gpu)
+	Service,  // service commands (bounced to Thread_Gpu)
+	Slice,    // a slice ending with the list unfinished (its segment is kept)
+	ListEnd,  // the list's end (hand-off submit, overlay merge)
+	Other,
+	Count,
+};
+void                     SetTurnReason(TurnReason reason) noexcept;
+[[nodiscard]] TurnReason CurrentTurnReason() noexcept;
+class TurnReasonScope {
+public:
+	explicit TurnReasonScope(TurnReason reason): m_previous(CurrentTurnReason()) {
+		SetTurnReason(reason);
+	}
+	~TurnReasonScope() { SetTurnReason(m_previous); }
+	TurnReasonScope(const TurnReasonScope&)            = delete;
+	TurnReasonScope& operator=(const TurnReasonScope&) = delete;
+
+private:
+	TurnReason m_previous;
+};
+// A turn wait of `lane` for `reason` lasted `ns` (CommandScheduler::WaitLaneTurn).
+void NoteTurnWait(uint32_t lane, TurnReason reason, uint64_t ns);
+// The calling lane thread translates (active) or waits (turn, lanes' lock): overlap accounting
+// ("2+ lanes active"). Nested calls keep the outer state (LaneActiveScope restores it).
+void               SetLaneActive(bool active);
+[[nodiscard]] bool LaneActive() noexcept;
+class LaneIdleScope {
+public:
+	LaneIdleScope(): m_was(LaneActive()) {
+		if (m_was) {
+			SetLaneActive(false);
+		}
+	}
+	~LaneIdleScope() {
+		if (m_was) {
+			SetLaneActive(true);
+		}
+	}
+	LaneIdleScope(const LaneIdleScope&)            = delete;
+	LaneIdleScope& operator=(const LaneIdleScope&) = delete;
+
+private:
+	bool m_was;
+};
+// An op visible to the guest (a TurnReason op) executes on lane `lane` (lanes' lock held):
+// `oldest`: its segment is the oldest open one (VisibleNotOldest otherwise); op sequences of visible
+// ops must not go back (VisibleOutOfOrder).
+void NoteVisibleOp(uint32_t lane, uint64_t sequence, bool oldest);
+// Thread_Gpu statistics of the concurrent mode: flights out after a hand-out, its own work done
+// under the lanes' lock (lists out), garbage collections deferred to a moment with no list out.
+void NoteFlightsOut(uint32_t count);
+void NoteOwnWorkLocked();
+void NoteGcDeferred();
+// Thread_Gpu: the token's hooks called directly (concurrent mode: no token passes).
+// HookGive: the give hook with `target` as the hand-off target (HandoffTarget).
+void HookGive(uint32_t target);
+void HookTake();
+// Thread_Gpu: lane `lane` runs `task(argument)` (a slice) without Thread_Gpu waiting; PollSlice
+// serves one pending RunOnGpuThread request of the lane (Thread_Gpu as the lanes' lock's delegated
+// holder, as in RunSlice) and returns true once the slice has ended (the lane is idle again).
+void               RunSliceAsync(uint32_t lane, void (*task)(void*), void* argument);
+[[nodiscard]] bool PollSlice(uint32_t lane);
+// The lanes (slice end, request) and Enqueue wake Thread_Gpu waiting in WaitDispatchEvent.
+void WakeDispatcher();
+void WaitDispatchEvent(uint64_t timeout_ns);
 void               SetListUnfinished(bool unfinished) noexcept;
 [[nodiscard]] bool ListUnfinished() noexcept;
 [[nodiscard]] bool GivingForRequest() noexcept;

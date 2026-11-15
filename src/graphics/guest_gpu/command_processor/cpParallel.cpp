@@ -62,6 +62,18 @@ struct Stats {
 	// Astro Bot PC (KYTY_CP_PAR=2b): per lane, the LaneStat counters.
 	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(LaneStat::Count)>, MaxLanes> lane_stats {};
 	std::atomic<uint64_t>                fixups_needed_total {0};
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): per lane and reason, turn waits and their time; time
+	// with 2+ / 3+ lanes active; the most lists out at once; Thread_Gpu's own work under the lanes'
+	// lock; garbage collections deferred.
+	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(TurnReason::Count)>, MaxLanes>
+	    turn_waits {};
+	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(TurnReason::Count)>, MaxLanes>
+	                      turn_ns {};
+	std::atomic<uint64_t> overlap2_ns {0};
+	std::atomic<uint64_t> overlap3_ns {0};
+	std::atomic<uint64_t> flights_max {0};
+	std::atomic<uint64_t> own_work_locked {0};
+	std::atomic<uint64_t> gc_deferred {0};
 	// KYTY_CP_PAR=1b3: run-ahead starts and ops, promotions by reason, merges and insertions with
 	// their fix-ups, op lock waits per thread, time both threads were busy (overlap).
 	std::atomic<uint64_t> runahead_starts {0};
@@ -135,6 +147,18 @@ thread_local uint32_t t_serving_lane = UINT32_MAX;
 // (SetListUnfinished); it is giving the token for a RunOnGpuThread request.
 thread_local bool t_list_unfinished = false;
 thread_local bool t_giving_request  = false;
+// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): Thread_Gpu waits here for a lane's slice end or request,
+// or a new submission (WakeDispatcher / WaitDispatchEvent).
+std::mutex              g_dispatch_mutex;
+std::condition_variable g_dispatch_wake;
+uint64_t                g_dispatch_events = 0;
+void                    WakeDispatcherImpl() {
+	{
+		std::lock_guard lock(g_dispatch_mutex);
+		g_dispatch_events++;
+	}
+	g_dispatch_wake.notify_one();
+}
 thread_local bool t_busy      = false; // Astro Bot PC (KYTY_CP_PAR=1b3): NoteBusy's last state
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): image state bookkeeping (cpParallel.h). An image's state is a
@@ -241,6 +265,44 @@ public:
 		Take();
 	}
 
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 4): Thread_Gpu hands the lane a slice and
+	// goes on (no hook on its side: GuestGpu manages its own segment, HookGive / HookTake).
+	void Dispatch(Task task, void* argument) {
+		EXIT_IF(t_lane != 0);
+		std::lock_guard lock(m_mutex);
+		EXIT_IF(m_state != State::Idle);
+		m_task     = task;
+		m_argument = argument;
+		m_state    = State::Slice;
+		m_wake_b.notify_one();
+	}
+	// Thread_Gpu: serves a pending request of the lane (as RunSlice does: its take hook, the
+	// request, its give hook, Thread_Gpu serving the lane, hence the lanes' lock's delegated holder
+	// from the take hook on); true once the slice has ended (the lane is idle again).
+	bool Poll() {
+		EXIT_IF(t_lane != 0);
+		std::unique_lock lock(m_mutex);
+		if (m_state == State::SliceDone) {
+			m_state = State::Idle;
+			return true;
+		}
+		if (m_state != State::Request) {
+			return false;
+		}
+		const auto request          = m_request;
+		auto*      request_argument = m_request_argument;
+		lock.unlock();
+		t_serving_lane = m_lane;
+		Take();
+		request(request_argument);
+		GiveToLane();
+		t_serving_lane = UINT32_MAX;
+		lock.lock();
+		m_state = State::Slice;
+		m_wake_b.notify_one();
+		return false;
+	}
+
 	// Resolver #2, inside a slice.
 	void RunOnGpuThread(Task task, void* argument) {
 		EXIT_IF(t_lane != m_lane);
@@ -254,6 +316,9 @@ public:
 			m_request_argument = argument;
 			m_state            = State::Request;
 			m_wake_a.notify_one();
+			if (g_lane_concurrent) {
+				WakeDispatcherImpl(); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): Thread_Gpu polls
+			}
 			m_wake_b.wait(lock, [this] { return m_state == State::Slice; });
 		}
 		Take();
@@ -300,6 +365,9 @@ private:
 			lock.lock();
 			m_state = State::SliceDone;
 			m_wake_a.notify_one();
+			if (g_lane_concurrent) {
+				WakeDispatcherImpl(); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): Thread_Gpu polls
+			}
 		}
 	}
 
@@ -318,6 +386,8 @@ private:
 
 // Astro Bot PC (KYTY_CP_PAR=2a, N lanes): index = lane (1..N-1); [0] unused.
 std::array<std::unique_ptr<Resolver2>, MaxLanes> g_resolvers;
+// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the token's hooks, called by Thread_Gpu directly.
+Hooks g_hooks;
 
 // Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the CP op lock. FIFO (tickets), so that two
 // contending threads alternate op by op; `last` is the previous holder.
@@ -946,6 +1016,7 @@ void Start(const Hooks& hooks) {
 	EXIT_IF(g_resolvers[1] != nullptr || hooks.take == nullptr || hooks.give == nullptr);
 	// Astro Bot PC (KYTY_CP_PAR=2a): one resolver per lane after A (one outside 2a).
 	const uint32_t count = ContextCount();
+	g_hooks              = hooks; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1: HookGive / HookTake)
 	for (uint32_t lane = 1; lane < count; lane++) {
 		g_resolvers[lane] = std::make_unique<Resolver2>(hooks, lane);
 	}
@@ -977,6 +1048,154 @@ void RunSlice(uint32_t lane, Task task, void* argument) {
 void RunOnGpuThread(Task task, void* argument) {
 	EXIT_IF(t_resolver == nullptr);
 	t_resolver->RunOnGpuThread(task, argument);
+}
+
+// ---- Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacles 4 and 5, cpParallel.h) ----
+
+namespace {
+thread_local TurnReason t_turn_reason = TurnReason::Submit;
+thread_local bool       t_lane_active = false;
+// Lanes active now (SetLaneActive), and since when 2+ / 3+ are.
+std::mutex g_active_mutex;
+uint32_t   g_active_count = 0;
+uint64_t   g_active2_since = 0;
+uint64_t   g_active3_since = 0;
+thread_local uint64_t t_active_since = 0;
+// The last visible op's sequence (lanes' lock held).
+uint64_t g_last_visible = 0;
+} // namespace
+
+bool LaneConcurrentConfigured() {
+	static const bool on = [] {
+		if (GetMode() != Mode::Lanes2b) {
+			return false;
+		}
+		const auto* value = std::getenv("KYTY_CP_PAR_CONCURRENT");
+		const bool  set   = value != nullptr && std::strcmp(value, "1") == 0;
+		std::printf("Kyty CpPar: 2b lanes run their lists at the same time: %s (KYTY_CP_PAR_CONCURRENT)\n",
+		            set ? "requested" : "off");
+		return set;
+	}();
+	return on;
+}
+
+void SetTurnReason(TurnReason reason) noexcept {
+	t_turn_reason = reason;
+}
+
+TurnReason CurrentTurnReason() noexcept {
+	return t_turn_reason;
+}
+
+void NoteTurnWait(uint32_t lane, TurnReason reason, uint64_t ns) {
+	const auto r = std::min<size_t>(static_cast<size_t>(reason), static_cast<size_t>(TurnReason::Other));
+	auto&      stats = GetStats();
+	stats.turn_waits[LaneIndex(lane)][r].fetch_add(1, std::memory_order_relaxed);
+	stats.turn_ns[LaneIndex(lane)][r].fetch_add(ns, std::memory_order_relaxed);
+}
+
+void SetLaneActive(bool active) {
+	if (t_lane_active == active || t_lane == 0) {
+		return;
+	}
+	t_lane_active  = active;
+	const auto now = NowNs();
+	if (active) {
+		t_active_since = now;
+	} else {
+		NoteLaneStat(t_lane, LaneStat::ActiveNs, now - t_active_since);
+	}
+	std::lock_guard lock(g_active_mutex);
+	const uint32_t  before = g_active_count;
+	g_active_count         = active ? before + 1u : before - 1u;
+	if (before < 2u && g_active_count >= 2u) {
+		g_active2_since = now;
+	} else if (before >= 2u && g_active_count < 2u) {
+		GetStats().overlap2_ns.fetch_add(now - g_active2_since, std::memory_order_relaxed);
+	}
+	if (before < 3u && g_active_count >= 3u) {
+		g_active3_since = now;
+	} else if (before >= 3u && g_active_count < 3u) {
+		GetStats().overlap3_ns.fetch_add(now - g_active3_since, std::memory_order_relaxed);
+	}
+}
+
+bool LaneActive() noexcept {
+	return t_lane_active;
+}
+
+void NoteVisibleOp(uint32_t lane, uint64_t sequence, bool oldest) {
+	if (!oldest) {
+		NoteLaneStat(lane, LaneStat::VisibleNotOldest, 1);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+			std::printf("Kyty CpPar 2b concurrent: lane %c executed visible op %" PRIu64
+			            " while an older segment was open\n",
+			            LaneLetter(lane), sequence);
+		}
+	}
+	if (sequence < g_last_visible) {
+		NoteLaneStat(lane, LaneStat::VisibleOutOfOrder, 1);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+			std::printf("Kyty CpPar 2b concurrent: lane %c executed visible op %" PRIu64
+			            " after visible op %" PRIu64 " (out of list order)\n",
+			            LaneLetter(lane), sequence, g_last_visible);
+		}
+	}
+	g_last_visible = std::max(g_last_visible, sequence);
+}
+
+void NoteFlightsOut(uint32_t count) {
+	auto& max     = GetStats().flights_max;
+	auto  current = max.load(std::memory_order_relaxed);
+	while (count > current && !max.compare_exchange_weak(current, count, std::memory_order_relaxed)) {
+	}
+}
+
+void NoteOwnWorkLocked() {
+	GetStats().own_work_locked.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteGcDeferred() {
+	GetStats().gc_deferred.fetch_add(1, std::memory_order_relaxed);
+}
+
+void HookGive(uint32_t target) {
+	EXIT_IF(t_lane != 0 || g_hooks.give == nullptr);
+	g_handoff_target.store(target, std::memory_order_relaxed);
+	g_hooks.give(g_hooks.context);
+}
+
+void HookTake() {
+	EXIT_IF(t_lane != 0 || g_hooks.take == nullptr);
+	g_hooks.take(g_hooks.context);
+}
+
+void RunSliceAsync(uint32_t lane, void (*task)(void*), void* argument) {
+	EXIT_IF(lane == 0 || lane >= MaxLanes || g_resolvers[lane] == nullptr);
+	GetStats().slices_b.fetch_add(1, std::memory_order_relaxed);
+	NoteLaneStat(lane, LaneStat::Dispatched, 1);
+	g_resolvers[lane]->Dispatch(task, argument);
+}
+
+bool PollSlice(uint32_t lane) {
+	EXIT_IF(lane == 0 || lane >= MaxLanes || g_resolvers[lane] == nullptr);
+	return g_resolvers[lane]->Poll();
+}
+
+void WakeDispatcher() {
+	WakeDispatcherImpl();
+}
+
+void WaitDispatchEvent(uint64_t timeout_ns) {
+	static uint64_t  seen = 0; // Thread_Gpu only
+	std::unique_lock lock(g_dispatch_mutex);
+	if (g_dispatch_events == seen) {
+		g_dispatch_wake.wait_for(lock, std::chrono::nanoseconds(timeout_ns),
+		                         [] { return g_dispatch_events != seen; });
+	}
+	seen = g_dispatch_events;
 }
 
 bool OnResolver2() noexcept {
@@ -1217,6 +1436,7 @@ void LaneLockAcquire() {
 	std::unique_lock lock(state.mutex);
 	const auto       ticket = state.next++;
 	if (state.serving != ticket) {
+		const LaneIdleScope idle; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): not translating meanwhile
 		HangWatchdog::Scope wait("cp-par-2b-lane-lock", reinterpret_cast<uint64_t>(&state), t_lane);
 		state.wake.wait(lock, [&state, ticket] { return state.serving == ticket; });
 	}

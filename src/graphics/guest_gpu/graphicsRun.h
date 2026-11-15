@@ -160,6 +160,34 @@ private:
 	// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2): Thread_Gpu, at the end of an A list: lane A's
 	// segment ends (hand-off submit, Switch with its order) and a new one begins.
 	void        CpParCloseLaneA();
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 4, cpParallel.h): the lists handed to their
+	// lanes without waiting ("flights", in list order; Thread_Gpu only), whether Thread_Gpu has run
+	// its take hook (its own segment open, or the kept segment of the unfinished head adopted:
+	// "home"), and a garbage collection deferred until no list is out.
+	struct CpParFlight {
+		Submission        submission;
+		CommandProcessor* cp      = nullptr;
+		uint32_t          lane    = 0;
+		bool              done    = false;
+		bool              handoff = false;
+		Pm4ProcessResult  result  = Pm4ProcessResult::Complete;
+	};
+	enum class CpParStep { Run, Progress, Wait };
+	// Thread_Gpu, m_queue_mutex not held: polls the flights (serving their requests), collects the
+	// ended ones in list order, hands out the next lists. Run: Thread_Gpu may do its own work now
+	// (after CpParGoHome); Wait: lists are out and it may not.
+	CpParStep   CpParConcurrentStep();
+	bool        CpParTryDispatch();
+	void        CpParCollect(CpParFlight& flight);
+	[[nodiscard]] bool CpParCanGoHome() const;
+	// m_queue_mutex held: queue 0 is not for Thread_Gpu's own work (lists out, or a lane list at
+	// its front: handed out by CpParConcurrentStep).
+	[[nodiscard]] bool CpParQueue0Held() const;
+	void        CpParGoHome();
+	static void CpParFlightTask(void* argument);
+	std::deque<std::unique_ptr<CpParFlight>> m_cp_par_flights;
+	bool                                     m_cp_par_home       = true;
+	bool                                     m_cp_par_gc_pending = false;
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_submission_mutex;

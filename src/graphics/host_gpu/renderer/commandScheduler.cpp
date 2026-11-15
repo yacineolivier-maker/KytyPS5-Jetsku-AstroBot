@@ -1172,7 +1172,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	EXIT_IF(command.IsInvalid());
 	// Astro Bot PC (KYTY_CP_PAR=2a): in turn, only the submitting lane names a native buffer; a
 	// younger lane's unsubmitted work would otherwise be overtaken by this tick.
-	if (m_lanes) {
+	// (KYTY_CP_PAR_CONCURRENT=1: lanes record at the same time; the tick ranges and the replay's
+	// order gate keep the queue order instead.)
+	if (m_lanes && !CpPar::LaneConcurrent()) {
 		for (uint32_t lane = 0; lane < m_lane_count; lane++) {
 			EXIT_IF(&LaneCmd(lane) != &command && !LaneCmd(lane).IsInvalid());
 		}

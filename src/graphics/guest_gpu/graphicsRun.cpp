@@ -787,6 +787,23 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 									// (needs the lanes' lock: ops are exclusive).
 									CpPar::g_lane_overlay =
 									    CpPar::LaneLockEnabled() && CpPar::LaneOverlayConfigured();
+									// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, cpParallel.h): the lanes
+									// at the same time, on top of everything the in-turn 2b set up.
+									if (CpPar::LaneConcurrentConfigured()) {
+										if (CpPar::g_lane_overlay && CpPar::LaneReserveEnabled() &&
+										    CpPar::LaneKeepEnabled()) {
+											CpPar::g_lane_concurrent = true;
+											std::printf("Kyty CpPar: 2b concurrent lanes: on (lists on "
+											            "lanes B.. only, %u lane(s) translating; "
+											            "Thread_Gpu hands them out without waiting)\n",
+											            lanes - 1u);
+										} else {
+											std::printf("Kyty CpPar: 2b concurrent lanes need "
+											            "KYTY_CP_PAR_LOCK, KYTY_CP_PAR_OVERLAY, "
+											            "KYTY_CP_PAR_RESERVE and KYTY_CP_PAR_KEEP on; "
+											            "lanes stay in turn\n");
+										}
+									}
 									std::printf("Kyty CpPar: 2b: each lane has its own replay thread; "
 									            "native buffers are handed to the queue in list "
 									            "order\n");
@@ -836,10 +853,18 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 			hooks.take    = [](void* context) {
 				auto* gpu = static_cast<GuestGpu*>(context);
 				if (CpPar::OnResolver2()) {
-					g_gpu_thread = true;
+					// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): several lanes at once: none borrows
+					// the GPU thread's identity (IsGpuThread: the lanes' lock's holder).
+					g_gpu_thread = !CpPar::LaneConcurrent();
 					g_gpu_state  = gpu;
 				}
 				gpu->m_renderer.GetMutex().BecomeOwner();
+				// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the segment's begin (scheduler, image book)
+				// under the lanes' lock (delegated when Thread_Gpu serves a lane's request).
+				std::optional<CpPar::LaneLockScope> concurrent_lock;
+				if (CpPar::LaneConcurrent() && CpPar::StreamsActive()) {
+					concurrent_lock.emplace();
+				}
 				if (CpPar::StreamsActive()) {
 					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context begins a segment (2a: in
 					// a new native buffer of its own pool; GetRenderExecutor is then the lane's).
@@ -874,6 +899,13 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					if (CpPar::Lanes2b()) {
 						CommandScheduler::SetThreadTickLane(stream); // Astro Bot PC (2b: tick ranges)
 					}
+					if (CpPar::LaneConcurrent() && stream == 0) {
+						// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1) control: Thread_Gpu begins its own
+						// segment only with no lane list out (it would be younger than them).
+						for (uint32_t lane = 1; lane < CpPar::ContextCount(); lane++) {
+							EXIT_IF(gpu->m_renderer.GetCommandScheduler().LaneOrderOpen(lane));
+						}
+					}
 					gpu->m_renderer.GetCommandScheduler().BeginContextSegment();
 					gpu->m_renderer.GetRenderExecutor().CpParForgetCommandShadows();
 					CpPar::BeginSegment(stream);
@@ -882,6 +914,20 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 			hooks.give = [](void* context) {
 				auto* gpu = static_cast<GuestGpu*>(context);
 				bool  end = CpPar::StreamsActive();
+				// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 5): a lane ends its slice (list
+				// complete, or unfinished: its segment kept) only as the oldest open segment, waited
+				// for outside the lanes' lock (a request bounce holds it and waited before); then
+				// the whole end (overlay merge, hand-off submit, turn moving on) under the lock, so
+				// that no younger op runs between the merge and the end of the segment.
+				std::optional<CpPar::LaneLockScope> concurrent_lock;
+				if (CpPar::LaneConcurrent() && end) {
+					if (CpPar::ThreadLane() != 0 && !CpPar::LaneLockHeld()) {
+						const CpPar::TurnReasonScope why(CpPar::ListUnfinished() ? CpPar::TurnReason::Slice
+						                                                         : CpPar::TurnReason::ListEnd);
+						gpu->m_renderer.GetCommandScheduler().WaitSegmentTurn();
+					}
+					concurrent_lock.emplace();
+				}
 				if (end && CpPar::Lanes2b() && t_cp_par_adopted != UINT32_MAX) {
 					// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): Thread_Gpu gives the kept segment
 					// back to its lane (which resumes it); nothing ends, nothing is reserved.
@@ -2262,7 +2308,11 @@ void GuestGpu::Enqueue(Submission submission) {
 	    submission.type == SubmissionType::Graphics) {
 		m_cp_par_rank = submission.reset_processor ? 1u : m_cp_par_rank + 1u;
 		// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): rank r -> context (r - 1) % N (N = 2: even -> B).
-		const uint32_t context = (m_cp_par_rank - 1u) % CpPar::ContextCount();
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): lanes B.. only (rank r -> 1 + (r - 1) % (N - 1)):
+		// Thread_Gpu hands the lists out; an A list would wait for every lane to come back.
+		const uint32_t context = CpPar::LaneConcurrent()
+		                             ? 1u + (m_cp_par_rank - 1u) % (CpPar::ContextCount() - 1u)
+		                             : (m_cp_par_rank - 1u) % CpPar::ContextCount();
 		if (context != 0) {
 			if (m_sequencer == nullptr) {
 				CpPar::NoteFallback(CpPar::Fallback::NoSequencer);
@@ -2302,6 +2352,9 @@ void GuestGpu::Enqueue(Submission submission) {
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
+	if (CpPar::LaneConcurrent()) {
+		CpPar::WakeDispatcher(); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): Thread_Gpu may hand it out
+	}
 }
 
 void GuestGpu::WaitForIdle() {
@@ -2348,6 +2401,18 @@ void GuestGpu::ThreadRun(void* data) {
 	const bool wakeups       = CpWakeupsEnabled();
 	uint64_t   spin_deadline = 0; // 0: not spinning on blocked queues
 	for (;;) {
+		if (CpPar::LaneConcurrent()) {
+			// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 4): the lists out first (requests,
+			// ends in list order, next hand-outs); the loop below runs only Thread_Gpu's own work.
+			const auto step = gpu->CpParConcurrentStep();
+			if (step == CpParStep::Progress) {
+				continue;
+			}
+			if (step == CpParStep::Wait) {
+				CpPar::WaitDispatchEvent(1'000'000);
+				continue;
+			}
+		}
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -2379,6 +2444,9 @@ void GuestGpu::ThreadRun(void* data) {
 					auto&      queue = gpu->m_queues[id];
 					if (queue.empty() || queue.front().blocked) {
 						continue;
+					}
+					if (id == 0 && CpPar::LaneConcurrent() && gpu->CpParQueue0Held()) {
+						continue; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): handed out above
 					}
 					if (!gpu->FrameFencePassed(queue.front())) {
 						HangWatchdog::NoteQueue(id, queue.front().sequence, "frame-fence-held",
@@ -2464,6 +2532,9 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				CpPar::OpLockRelease(0);
 			}
+			if (CpPar::LaneConcurrent()) {
+				gpu->CpParGoHome(); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): no list out any more
+			}
 			gpu->m_gfx_cp->BufferWait();
 			// Deferred label writes still queued on the completion runner write the backing
 			// directly once commands are refused; finish them while this GuestGpu exists.
@@ -2472,6 +2543,18 @@ void GuestGpu::ThreadRun(void* data) {
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
 			return;
+		}
+
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): Thread_Gpu's own work in its own segment (no list
+		// out) or in the unfinished head's kept segment, then under the lanes' lock while younger
+		// lists are out (CpParConcurrentStep allowed it: CpParCanGoHome).
+		std::optional<CpPar::LaneLockScope> own_work_lock;
+		if (CpPar::LaneConcurrent()) {
+			gpu->CpParGoHome();
+			if (!gpu->m_cp_par_flights.empty()) {
+				own_work_lock.emplace();
+				CpPar::NoteOwnWorkLocked();
+			}
 		}
 
 		if (command) {
@@ -2776,6 +2859,8 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 			Pm4ProcessResult  result;
 			uint32_t          lane;
 		} slice {&cp, &submission, false, Pm4ProcessResult::Complete, submission.cp_par_context};
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): lane lists are handed out by CpParTryDispatch.
+		EXIT_IF(CpPar::LaneConcurrent());
 		CpPar::RunSlice(
 		    slice.lane,
 		    [](void* argument) {
@@ -7039,6 +7124,13 @@ void GuestGpu::CpParCloseLaneA() {
 	EXIT_IF(CpPar::OnResolver2() || CommandRecorder::ThreadStream() != 0 ||
 	        t_cp_par_adopted != UINT32_MAX ||
 	        g_cp_par_kept_lane.load(std::memory_order_relaxed) != UINT32_MAX);
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): an A list runs only with no lane list out; its end
+	// under the lanes' lock all the same (uncontended).
+	EXIT_IF(CpPar::LaneConcurrent() && !m_cp_par_flights.empty());
+	std::optional<CpPar::LaneLockScope> concurrent_lock;
+	if (CpPar::LaneConcurrent()) {
+		concurrent_lock.emplace();
+	}
 	if (!CpPar::LaneLockHeld()) {
 		scheduler.WaitSegmentTurn(); // never waits in turn (A is the only open segment)
 	}
@@ -7052,6 +7144,213 @@ void GuestGpu::CpParCloseLaneA() {
 	m_renderer.GetRenderExecutor().CpParForgetCommandShadows();
 	CpPar::BeginSegment(0);
 	CpPar::NoteLaneStat(0, CpPar::LaneStat::ListEndClosures, 1);
+}
+
+// ---- Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 4, cpParallel.h): lists handed out without
+// waiting ------------------------------------------------------------------------------------------
+
+// The slice of a list on its lane (as the RunSlice task of ProcessSequenced).
+void GuestGpu::CpParFlightTask(void* argument) {
+	auto& flight = *static_cast<CpParFlight*>(argument);
+	CpPar::SetLaneActive(true);
+	const auto start = CpPar::NowNs();
+	flight.result    = flight.cp->ResolveSubmission(flight.submission.command_execution,
+	                                                flight.submission.sequence, flight.submission.commands,
+	                                                flight.handoff, flight.lane);
+	CpPar::NoteResolveTime(flight.lane, CpPar::NowNs() - start);
+	CpPar::SetLaneActive(false);
+	// Obstacle 3: the give hook that follows keeps the lane's segment open while its list is
+	// unfinished (after waiting for its turn: concurrent mode).
+	CpPar::SetListUnfinished(flight.result != Pm4ProcessResult::Complete);
+}
+
+bool GuestGpu::CpParCanGoHome() const {
+	if (m_cp_par_flights.empty()) {
+		return true;
+	}
+	// The unfinished head (its kept segment, the oldest) is back in queue 0: Thread_Gpu works in
+	// that segment, under the lanes' lock (a lane kept for a request is still out: not this case).
+	const auto kept = g_cp_par_kept_lane.load(std::memory_order_acquire);
+	if (kept == UINT32_MAX) {
+		return false;
+	}
+	for (const auto& flight: m_cp_par_flights) {
+		if (flight->lane == kept) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool GuestGpu::CpParQueue0Held() const {
+	if (!m_cp_par_flights.empty()) {
+		return true;
+	}
+	const auto& queue = m_queues[0];
+	return !queue.empty() && queue.front().type == SubmissionType::Graphics &&
+	       queue.front().cp_par_context != 0;
+}
+
+void GuestGpu::CpParGoHome() {
+	if (!m_cp_par_home) {
+		EXIT_IF(!CpParCanGoHome());
+		// The take hook: Thread_Gpu's own segment begins (no list out), or it adopts the kept
+		// segment of the unfinished head.
+		CpPar::HookTake();
+		m_cp_par_home = true;
+	}
+	if (m_cp_par_gc_pending && m_cp_par_flights.empty()) {
+		// Deferred from the ends of the lists (CpParCollect): with no list out, in Thread_Gpu's
+		// own segment or the head's, as after a slice in turn.
+		m_cp_par_gc_pending = false;
+		m_renderer.RunGarbageCollector();
+	}
+}
+
+bool GuestGpu::CpParTryDispatch() {
+	std::unique_ptr<CpParFlight> flight;
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		auto&             queue = m_queues[0];
+		if (queue.empty() || m_sequencer == nullptr) {
+			return false;
+		}
+		auto& front = queue.front();
+		if (front.blocked || front.type != SubmissionType::Graphics || front.cp_par_context == 0 ||
+		    front.handoff) {
+			return false;
+		}
+		const uint32_t lane = front.cp_par_context;
+		for (const auto& out: m_cp_par_flights) {
+			if (out->lane == lane) {
+				return false; // its lane is busy with an earlier list
+			}
+		}
+		// Nothing is handed out past an unfinished list: its kept segment is the oldest, and
+		// every later list must get a younger order (obstacle 3). Only that list itself resumes.
+		const auto kept = g_cp_par_kept_lane.load(std::memory_order_acquire);
+		if (kept != UINT32_MAX && kept != lane) {
+			return false;
+		}
+		if (!FrameFencePassed(front)) {
+			return false;
+		}
+		flight             = std::make_unique<CpParFlight>();
+		flight->submission = std::move(front);
+		queue.pop_front();
+		flight->lane = lane;
+		flight->cp   = m_gfx_cp.get();
+		// m_submission_count still counts it until it is collected (WaitForIdle, shutdown).
+	}
+	auto&      submission = flight->submission;
+	const auto lane       = flight->lane;
+	auto&      scheduler  = m_renderer.GetCommandScheduler();
+	SyncEpoch::Advance();
+	if (DrawRun::Enabled()) {
+		DrawRun::NoteForeignActivity(submission.started ? "submission resume" : "submission start");
+	}
+	if (!submission.started) {
+		// ProcessSequenced's first-slice part, on Thread_Gpu, in list order.
+		SyncEpoch::AdvanceSubmission();
+		submission.started = true;
+		PaceLog::NoteCpSubmission(submission.pace_enqueue_ns, submission.reset_processor);
+		m_gfx_cp->SetSubmitId(++m_submit_id, lane);
+		m_sequencer->NoteStarted(submission.sequence);
+		if (submission.reset_processor) {
+			const CpPar::LaneLockScope stats_lock; // other lanes may be translating
+			CommitStats::OnFrameBoundary();
+			CpGaps::NoteFrame();
+			Common::PrepPhases::NoteFrame();
+		}
+	}
+	const bool resume = g_cp_par_kept_lane.load(std::memory_order_acquire) == lane;
+	if (m_cp_par_home) {
+		// Thread_Gpu's own segment ends and the lane's order is reserved (give hook, obstacle 2),
+		// or the head's kept segment it adopted goes back to its lane (resume).
+		EXIT_IF(!m_cp_par_flights.empty() && !resume);
+		CpPar::HookGive(lane);
+		m_cp_par_home = false;
+	} else if (!resume) {
+		scheduler.ReserveLaneOrder(lane); // in list order: after every list out
+	}
+	CpPar::RunSliceAsync(lane, &CpParFlightTask, flight.get());
+	m_cp_par_flights.push_back(std::move(flight));
+	CpPar::NoteFlightsOut(static_cast<uint32_t>(m_cp_par_flights.size()));
+	return true;
+}
+
+void GuestGpu::CpParCollect(CpParFlight& flight) {
+	auto& submission = flight.submission;
+	// Lane lists never hand off (constant-engine lists stay on A at admission).
+	EXIT_IF(flight.handoff);
+	const bool complete   = flight.result == Pm4ProcessResult::Complete;
+	const bool progressed = submission.command_execution.MadeProgress();
+	submission.slice_progress = progressed;
+	if (complete) {
+		if (m_renderer.GetCommandScheduler().LaneOrderOpen(flight.lane)) {
+			CpPar::NoteLaneStat(flight.lane, CpPar::LaneStat::OpenAtListEnd, 1); // 0 expected
+		}
+		CpPar::NoteCompleted(flight.lane);
+		if (progressed) {
+			// The lane's hand-off submit took its work (no flush here); the collection waits for a
+			// moment with no list out (CpParGoHome).
+			m_cp_par_gc_pending = true;
+			if (!m_cp_par_flights.empty()) {
+				CpPar::NoteGcDeferred();
+			}
+		}
+		Common::LockGuard lock(m_queue_mutex);
+		for (auto& queue: m_queues) {
+			if (!queue.empty()) {
+				queue.front().blocked = false;
+			}
+		}
+		m_in_flight.erase(submission.sequence);
+		if (m_done_waiters != 0) {
+			m_done_progress.SignalAll();
+		}
+		EXIT_IF(m_submission_count == 0);
+		m_submission_count--;
+		if (m_commands.empty() && m_submission_count == 0) {
+			m_idle.SignalAll();
+		}
+		return;
+	}
+	// Unfinished (suspended wait, starved, yielded): its segment is kept (obstacle 3; it waited to
+	// be the oldest first), it goes back to the front of queue 0 and is handed out again from there
+	// (nothing past it meanwhile).
+	EXIT_IF(g_cp_par_kept_lane.load(std::memory_order_acquire) != flight.lane);
+	CpPar::NoteLaneStat(flight.lane, CpPar::LaneStat::CollectedUnfinished, 1);
+	Common::LockGuard lock(m_queue_mutex);
+	if (!submission.command_execution.Yielded()) {
+		submission.blocked = true;
+		m_has_blocked.store(true, std::memory_order_release);
+	}
+	m_queues[0].push_front(std::move(submission));
+}
+
+GuestGpu::CpParStep GuestGpu::CpParConcurrentStep() {
+	CpPar::MaybeReport();
+	bool progress = false;
+	// Requests served, ends noted (any order); collected in list order.
+	for (auto& flight: m_cp_par_flights) {
+		if (!flight->done && CpPar::PollSlice(flight->lane)) {
+			flight->done = true;
+		}
+	}
+	while (!m_cp_par_flights.empty() && m_cp_par_flights.front()->done) {
+		auto flight = std::move(m_cp_par_flights.front());
+		m_cp_par_flights.pop_front();
+		CpParCollect(*flight);
+		progress = true;
+	}
+	while (CpParTryDispatch()) {
+		progress = true;
+	}
+	if (progress) {
+		return CpParStep::Progress;
+	}
+	return CpParCanGoHome() ? CpParStep::Run : CpParStep::Wait;
 }
 
 // Astro Bot PC (KYTY_CP_PAR=1b5, cpParallel.h): Thread_Gpu, op lock held, right after the oldest
@@ -8077,8 +8376,13 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				// ordered by the token in turn; to revisit once lanes overlap.)
 				EXIT_IF(begin.verify != 0);
 				uint64_t foreign = 0;
-				for (const auto& other: m_lane_cp) {
-					foreign += other.retry_op != 0 ? 1u : 0u;
+				for (uint32_t other = 0; other < m_lane_cp.size(); other++) {
+					// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): only this lane's own field (the other
+					// lanes write theirs meanwhile; a younger list may begin while an older one
+					// waits).
+					if (!CpPar::LaneConcurrent() || other == context) {
+						foreign += m_lane_cp[other].retry_op != 0 ? 1u : 0u;
+					}
 				}
 				if (foreign != 0) {
 					CpPar::NoteLaneStat(context, CpPar::LaneStat::ForeignRetries, foreign);
