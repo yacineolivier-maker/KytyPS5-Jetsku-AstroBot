@@ -340,8 +340,8 @@ StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler
                            bool host_cached)
     : Buffer(graphics, scheduler, usage, 0, AllFlags | extra_flags, size, transfer_shared,
              host_cached),
-      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE),
-      m_transfer_shared(transfer_shared), m_extra_flags(extra_flags), m_host_cached(host_cached) {}
+      m_transfer_shared(transfer_shared), m_extra_flags(extra_flags), m_host_cached(host_cached),
+      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 // Astro Bot PC (KYTY_CP_PAR_LANE_STREAM=1, streamBuffer.h).
 StreamBuffer& StreamBuffer::LaneSlow() {
