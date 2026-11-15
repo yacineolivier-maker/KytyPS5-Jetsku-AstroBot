@@ -114,6 +114,33 @@ voie, `RenderMutex` (propriétaire unique donné avec le jeton), compteur d'opé
 services renvoyés à Thread_Gpu (`RunOnGpuThread`) s'exécutent pendant que la voie tient le verrou : sans risque
 à tour de rôle, à revoir en 3b-3 (Thread_Gpu ne doit pas prendre le verrou pour eux, ou la voie doit le lâcher).
 
+### Passation (15/11 soir) : morceaux suivants, à tour de rôle, non commencés
+
+État du code au commit `8aae2d32`. Pistes relevées pour l'agent suivant (vérifiées dans le code, non écrites) :
+
+- **(a) `RenderMutex`** (`renderer/renderContext.h`) : verrou asymétrique à **un seul propriétaire** (`t_owner`,
+  `BecomeOwner`/`ResignOwner` dans les crochets du jeton, `graphicsRun.cpp` ~l. 828/858). À tour de rôle, rien à
+  changer (le détenteur du jeton est le propriétaire). Pour la simultanéité, le plus sûr : en mode simultané,
+  **personne ne devient propriétaire** (tous les `Lock()` passent par `RequesterLock`, mutex symétrique) ;
+  l'asymétrie n'a de sens qu'avec un seul fil de traduction. Ne pas faire `BecomeOwner` par opération.
+- **(a) compteur du séquenceur** (`cpSequencer.h`, `NoteExecuted(next_op)`, `m_executed`) : sens « toutes les
+  opérations avant `next_op` sont exécutées », numérotation globale des opérations sur tous les anneaux. À tour de
+  rôle il reste exact. En simultané : position par voie (prochaine opération non exécutée de chaque anneau), et
+  `Executed()` = minimum sur les voies qui ont des opérations émises non exécutées (les seuils d'attente du
+  séquenceur, fenêtres et écritures en attente, restent globaux).
+- **(b) occlusion** (`renderer/occlusion.cpp`) : lot en cours (`m_batch_count`, requêtes en attente, `m_prepared`,
+  emplacements `m_slot_ticks`) partagé ; vidé par le crochet de pré-soumission (`SetPreSubmitHook`, appelé aussi à
+  la passation d'une voie). Piste : un objet d'état de lot par voie (indice `EffectiveLane`), le crochet vidant
+  celui de la voie qui soumet ; `m_issued`/emplacements restent communs sous le verrou des voies.
+- **(c) services renvoyés à Thread_Gpu** (`Resolver2::RunSlice`, boucle des requêtes, `cpParallel.cpp`) :
+  `t_serving_lane` y est déjà posé ; ajouter un « détenteur délégué » : pendant la requête, Thread_Gpu compte comme
+  détenteur du verrou des voies (`LaneLockHeld()` vrai via `t_serving_lane` quand la voie servie tient le verrou),
+  sans prendre le verrou (la voie le tient et attend dans `RunOnGpuThread`).
+- **(d) surcouche d'état d'image** : celle de 1b3 (`Image::CpParTouch`, `t_overlay`, fusion dans
+  `GuestGpu::CpParMerge`/`CpParInsert`) est à deux contextes (A et la course en avant) ; à généraliser à N voies
+  (une surcouche par segment ouvert, correctifs enregistrés à la fin du segment plus ancien). À tour de rôle le
+  livre d'états de 1b2 (`CpPar::NoteImageState`, « not no-ops ») doit rester à 0 : c'est le contrôle.
+
 ### Variables pour l'essai en jeu
 
 Base (comme P1) : `KYTY_CP_SEQ=1`, `KYTY_CP_RECORDER=1` (sans `KYTY_CP_RECORDER_VERIFY`),
