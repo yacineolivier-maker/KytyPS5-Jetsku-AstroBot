@@ -262,7 +262,7 @@ of turn » (part des opérations hors tour) et « rest of the lock » (temps ten
 crochets, services et flips servis, vidages d'occlusion, travail propre de Thread_Gpu). Sans réglage
 (une lecture d'horloge par opération, déjà payée par le verrou). Pour détailler l'intérieur d'un dessin
 (cache de tampons, de textures, descripteurs, flux, enregistrement), les outils existants restent :
-`KYTY_CP_GAP_STATS` (temps du fil par cause) et `KYTY_CP_COMMIT_STATS` (étapes du dessin).
+`KYTY_CP_GAP_STATS=1` (temps du fil par cause, présent dans cette build) ; `KYTY_CP_COMMIT_STATS` (étapes du dessin) demande une build avec `KYTY_CP_DIAGNOSTICS=ON` (`build_mc.cmd` le coupe).
 
 **« list … ended unfinished behind list … still out »** (une fois, 4 voies, 19 h 45) : **normal**. Une
 voie ne passe « finie » (`SliceDone`) qu'après le retour de son crochet `give` ; entre la fin de son
