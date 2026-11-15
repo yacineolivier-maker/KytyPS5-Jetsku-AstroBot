@@ -34,6 +34,7 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `9e05e27b` | blocage 15/11 | délai de sécurité de la barrière de trame rétabli ; tranche inachevée soumise | BUILD_OK |
 | `1ff2bee9` | chien de garde | état de chaque voie après 20 s sans image | BUILD_OK |
 | `63f97b56` | blocage 19 h 23 | liste reprise placée avant les listes plus jeunes dehors | BUILD_OK |
+| `390956fe` | arrêt 19 h 30 | une voie commence son segment à côté d'un segment gardé ; messages d'arrêt détaillés | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
 
@@ -244,6 +245,34 @@ qui tourne est toujours le plus ancien), « dumps outside the lock » doit tombe
 
 
 
+
+### Arrêt au démarrage (essai du 15/11, 19 h 30) : segment gardé pris pour le sien
+
+**Version** : la chaîne « 33f6d59-dirty » de cet essai était bien le contenu de `63f97b56` (compilé à
+19 h 29 min 07 s avant le commit de 19 h 29 min 43 s, d'où « dirty » sur le commit précédent). Désormais
+le commit précède la compilation : la build actuelle affiche `390956fe`.
+
+**Arrêt** : « condition (stream != 0 || t_cp_par_adopted != UINT32_MAX) » dans le crochet `take`.
+**Cause** : Thread_Gpu confie une liste à la voie X pendant que la voie Y, plus ancienne, est encore
+dehors ; X prend son crochet `take` plus tard, sur son propre fil (après le verrou des voies). Si entre-
+temps Y a fini sa tranche inachevée et gardé son segment, X voyait `g_cp_par_kept_lane = Y` et entrait
+dans la branche « adoption », réservée à Thread_Gpu. À tour de rôle c'était impossible (une seule voie à
+la fois). Le réordonnancement de `63f97b56` n'y est pour rien ; c'est la remise sans attente elle-même.
+**Correctif** (`390956fe`) : en mode simultané, seule la voie gardée reprend son segment et seul
+Thread_Gpu adopte ; toute autre voie commence son propre segment (ordre réservé à la remise, plus jeune
+que le segment gardé), exactement comme les listes déjà dehors pendant une tête gardée. Compteur
+« began beside a kept segment » (> 0 possible). Les arrêts sur les invariants des segments gardés
+(adoption, garde double, segment adopté rendu à une autre voie) écrivent maintenant « Kyty CpPar 2b:
+… calling thread lane, lane, kept lane, adopted by Thread_Gpu, concurrent, lists out (last
+published) … ».
+
+**Cas voisins vérifiés** : garde pour un renvoi (flip, services) — la voie tient le verrou des voies
+pendant tout le renvoi et reprend son segment avant de le lâcher, donc une autre voie (dont le crochet
+prend ce verrou) ne voit jamais ce segment gardé ; Thread_Gpu sert le renvoi en détenteur délégué et
+adopte ce segment (voulu). Garde double : seule la plus ancienne garde (après son tour), donc jamais deux.
+Thread_Gpu « chez lui » avec un segment adopté ne reçoit pas de renvoi (seule la plus ancienne en
+envoie, et c'est la tête gardée, qui n'est pas dehors). Une voie commencée à côté d'un segment gardé
+reste plus jeune : ses opérations visibles, sa fin, ses renvois attendent la fin de la tête gardée.
 
 ### Deuxième blocage (essai du 15/11, 19 h 23, après 4 images) : tour jamais rendu
 
