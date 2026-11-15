@@ -7796,14 +7796,26 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		// Service commands run between ops: every op before this one has executed and no later
 		// one has, the serial point (P3-SEQUENCER.md 2.4).
 		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands() && service_allowed()) {
+			// Astro Bot PC (KYTY_CP_PAR=2b, morceau (c)): under the lanes' global lock, like an op;
+			// bounced to Thread_Gpu, which runs them as the lock's delegated holder.
+			const bool lane_lock = CpPar::Lanes2b() && CpPar::LaneLockEnabled();
+			if (lane_lock) {
+				CpPar::LaneLockAcquire();
+			}
 			if (CpPar::OnResolver2()) {
 				// Astro Bot PC (KYTY_CP_PAR=1a): service commands stay on Thread_Gpu.
 				auto* gpu  = g_gpu_state;
 				auto  body = [gpu] { gpu->ProcessCommands(); };
 				RunOnGpuThreadScoped(body);
 				CpPar::NoteBounce(false);
+				if (lane_lock) {
+					CpPar::NoteLaneStat(CpPar::ThreadLane(), CpPar::LaneStat::LockedBounces, 1);
+				}
 			} else {
 				g_gpu_state->ProcessCommands();
+			}
+			if (lane_lock) {
+				CpPar::LaneLockRelease();
 			}
 		}
 		CpSeq::OpView view;
@@ -7985,7 +7997,17 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		    (kind == CpSeq::OpKind::Flip || kind == CpSeq::OpKind::WaitFlipDone)) {
 			// Astro Bot PC (KYTY_CP_PAR=1a): flips stay on Thread_Gpu (presentation, live switches).
 			auto body = [&] { result = ExecuteOp(kind, view.payload, view.data); };
+			// Astro Bot PC (KYTY_CP_PAR=2b, morceau (c)): the lane holds the lanes' global lock
+			// meanwhile; Thread_Gpu runs the flip as its delegated holder (LaneLockHeld).
+			const bool lane_lock = CpPar::Lanes2b() && CpPar::LaneLockEnabled();
+			if (lane_lock) {
+				CpPar::LaneLockAcquire();
+			}
 			RunOnGpuThreadScoped(body);
+			if (lane_lock) {
+				CpPar::NoteLaneStat(CpPar::ThreadLane(), CpPar::LaneStat::LockedBounces, 1);
+				CpPar::LaneLockRelease();
+			}
 			CpPar::NoteBounce(true);
 		} else if (CpPar::Lanes2b() && CpPar::LaneLockEnabled()) {
 			// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): the op under the lanes' global lock.

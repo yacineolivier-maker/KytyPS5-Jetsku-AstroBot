@@ -141,6 +141,20 @@ services renvoyés à Thread_Gpu (`RunOnGpuThread`) s'exécutent pendant que la 
   (une surcouche par segment ouvert, correctifs enregistrés à la fin du segment plus ancien). À tour de rôle le
   livre d'états de 1b2 (`CpPar::NoteImageState`, « not no-ops ») doit rester à 0 : c'est le contrôle.
 
+### Morceaux de la passation faits le 15/11 soir (toujours à tour de rôle)
+
+**(c) Services renvoyés à Thread_Gpu sous le verrou des voies.** En réalité (vérifié dans le code) les services
+(`ProcessCommands`) et les flips renvoyés par une voie à Thread_Gpu (`RunOnGpuThreadScoped`) n'étaient **pas** sous
+le verrou (contrairement à ce que disait la note 3b-2). En 2b (verrou actif), la voie prend désormais le verrou
+autour de ces renvois, comme autour d'une opération ; Thread_Gpu sert la requête en **détenteur délégué** :
+`LaneLockHeld()` est vrai sur lui quand la voie servie (`t_serving_lane`) est celle qui tient le verrou
+(`g_lane_lock_holder`, posé à la prise), et un `LaneLockAcquire` de sa part pendant la requête ne passe pas par la
+file FIFO (sinon interblocage dès que les voies se chevaucheront). Les services exécutés par Thread_Gpu pour sa
+propre voie A, à la frontière d'opérations, sont aussi pris sous le verrou. Ligne 2b : « bounces under it n
+(delegated takes n) ». À tour de rôle rien ne change (le verrou n'est jamais disputé). Reste hors verrou : les
+services que Thread_Gpu exécute dans sa boucle principale, hors `ResolveSubmission` (à prendre sous le verrou en
+3b-3).
+
 ### Variables pour l'essai en jeu
 
 Base (comme P1) : `KYTY_CP_SEQ=1`, `KYTY_CP_RECORDER=1` (sans `KYTY_CP_RECORDER_VERIFY`),

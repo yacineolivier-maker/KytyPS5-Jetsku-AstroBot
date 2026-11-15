@@ -529,6 +529,8 @@ enum class LaneStat : uint32_t {
 	LockTakes,        // 3b-2: the lanes' global lock taken around one op
 	LockWaitNs,       //       time waiting for it
 	LockHoldNs,       //       time holding it
+	LockedBounces,    // morceau (c): a service / flip bounced to Thread_Gpu with the lane lock held
+	LockDelegated,    //       Thread_Gpu re-took the lock as the delegated holder while serving it
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

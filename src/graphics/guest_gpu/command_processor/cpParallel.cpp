@@ -1092,6 +1092,16 @@ LaneLockState& GetLaneLock() {
 }
 thread_local uint32_t t_lane_lock_depth = 0;
 thread_local uint64_t t_lane_lock_since = 0;
+// Astro Bot PC (KYTY_CP_PAR=2b, morceau (c)): the lane whose thread holds the lock (UINT32_MAX:
+// none), and whether the calling thread's outermost acquisition was a delegated one (Thread_Gpu
+// serving a RunOnGpuThread request of the holding lane: the lane holds the lock and waits in
+// RunOnGpuThread, so Thread_Gpu runs the request as the holder, without taking the lock).
+std::atomic<uint32_t> g_lane_lock_holder {UINT32_MAX};
+thread_local bool     t_lane_lock_delegated = false;
+bool LaneLockDelegated() noexcept {
+	return t_serving_lane != UINT32_MAX &&
+	       g_lane_lock_holder.load(std::memory_order_acquire) == t_serving_lane;
+}
 } // namespace
 
 bool LaneLockEnabled() {
@@ -1112,6 +1122,13 @@ void LaneLockAcquire() {
 	if (t_lane_lock_depth++ != 0) {
 		return;
 	}
+	if (LaneLockDelegated()) {
+		// Morceau (c): Thread_Gpu serving the holding lane's request; never wait for the FIFO
+		// (the holder waits for this request: that would be a deadlock once lanes overlap).
+		t_lane_lock_delegated = true;
+		NoteLaneStat(t_serving_lane, LaneStat::LockDelegated, 1);
+		return;
+	}
 	auto&            state = GetLaneLock();
 	const auto       start = NowNs();
 	std::unique_lock lock(state.mutex);
@@ -1121,6 +1138,7 @@ void LaneLockAcquire() {
 		state.wake.wait(lock, [&state, ticket] { return state.serving == ticket; });
 	}
 	lock.unlock();
+	g_lane_lock_holder.store(t_lane, std::memory_order_release);
 	t_lane_lock_since = NowNs();
 	NoteLaneStat(t_lane, LaneStat::LockTakes, 1);
 	NoteLaneStat(t_lane, LaneStat::LockWaitNs, t_lane_lock_since - start);
@@ -1131,6 +1149,11 @@ void LaneLockRelease() {
 	if (--t_lane_lock_depth != 0) {
 		return;
 	}
+	if (t_lane_lock_delegated) {
+		t_lane_lock_delegated = false;
+		return;
+	}
+	g_lane_lock_holder.store(UINT32_MAX, std::memory_order_release);
 	NoteLaneStat(t_lane, LaneStat::LockHoldNs, NowNs() - t_lane_lock_since);
 	auto& state = GetLaneLock();
 	{
@@ -1141,7 +1164,7 @@ void LaneLockRelease() {
 }
 
 bool LaneLockHeld() noexcept {
-	return t_lane_lock_depth != 0;
+	return t_lane_lock_depth != 0 || LaneLockDelegated();
 }
 
 // Astro Bot PC (KYTY_CP_PAR=2b, cpParallel.h).
@@ -1404,20 +1427,22 @@ void MaybeReport() {
 				return static_cast<double>(v[static_cast<size_t>(stat)]) / 1e6;
 			};
 			const auto n = [&v](LaneStat stat) { return v[static_cast<size_t>(stat)]; };
-			char item[512];
+			char item[768];
 			std::snprintf(item, sizeof(item),
 			              "%s%c: replay %.1f ms busy, turn waits %" PRIu64 " (%.1f ms); submit turn "
 			              "waits %" PRIu64 " (%.1f ms), held operations %" PRIu64
 			              "; dependencies checked %" PRIu64 ", waits %" PRIu64 " (%.1f ms), order "
 			              "violations %" PRIu64 ", early retires avoided %" PRIu64
-			              "; lane lock %" PRIu64 " takes, %.1f ms waiting, %.1f ms held",
+			              "; lane lock %" PRIu64 " takes, %.1f ms waiting, %.1f ms held, bounces "
+			              "under it %" PRIu64 " (delegated takes %" PRIu64 ")",
 			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
 			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs),
 			              n(LaneStat::SubmitTurnWaits), ms(LaneStat::SubmitTurnNs),
 			              n(LaneStat::HeldOperations), n(LaneStat::DependencyChecks),
 			              n(LaneStat::DependencyWaits), ms(LaneStat::DependencyWaitNs),
 			              n(LaneStat::OrderViolations), n(LaneStat::EarlyRetires),
-			              n(LaneStat::LockTakes), ms(LaneStat::LockWaitNs), ms(LaneStat::LockHoldNs));
+			              n(LaneStat::LockTakes), ms(LaneStat::LockWaitNs), ms(LaneStat::LockHoldNs),
+			              n(LaneStat::LockedBounces), n(LaneStat::LockDelegated));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());
