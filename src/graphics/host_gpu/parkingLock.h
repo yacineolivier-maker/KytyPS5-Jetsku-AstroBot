@@ -68,6 +68,9 @@ public:
 		}
 	}
 
+	// Astro Bot PC (KYTY_APPLYSPAN_FAST, pageManager.cpp): nobody holds the lock right now.
+	[[nodiscard]] bool IsFree() const noexcept { return m_state.load(std::memory_order_acquire) == 0; }
+
 	void unlock() noexcept {
 		if (m_state.exchange(0, std::memory_order_release) == 2) [[unlikely]] {
 			m_state.notify_one();

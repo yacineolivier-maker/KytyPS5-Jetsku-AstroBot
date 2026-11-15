@@ -116,6 +116,54 @@ struct DeferCounters {
 DeferCounters         g_defer;
 std::atomic<uint32_t> g_verify_logged {0};
 
+// Astro Bot PC (KYTY_APPLYSPAN_FAST=1, default off): ApplySpan returns without host_lock when its
+// span is already settled and no host update is in flight (see ApplySpan). Every 10 s:
+// "Kyty ApplySpan rapide 10 s : ..." (settled without host_lock / normal path, of which host_lock
+// was held at the check).
+bool ApplySpanFastEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_APPLYSPAN_FAST");
+		const bool  on    = value != nullptr && std::strcmp(value, "1") == 0;
+		if (on) {
+			std::printf("Kyty ApplySpan rapide : etendues deja a jour sans verrou hote "
+			            "(KYTY_APPLYSPAN_FAST)\n");
+			std::fflush(stdout);
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+std::atomic<uint64_t> g_fast_settled {0};
+std::atomic<uint64_t> g_fast_slow {0};
+std::atomic<uint64_t> g_fast_held {0};
+std::atomic<uint64_t> g_fast_report_ns {0};
+
+void ApplySpanFastNote(bool settled, bool held) noexcept {
+	(settled ? g_fast_settled : g_fast_slow).fetch_add(1, std::memory_order_relaxed);
+	if (held) {
+		g_fast_held.fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	auto last = g_fast_report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_fast_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ull ||
+	    !g_fast_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	std::printf("Kyty ApplySpan rapide 10 s : %" PRIu64 " a jour sans verrou hote, %" PRIu64
+	            " par le chemin normal dont %" PRIu64 " avec le verrou hote pris\n",
+	            g_fast_settled.exchange(0, std::memory_order_relaxed),
+	            g_fast_slow.exchange(0, std::memory_order_relaxed),
+	            g_fast_held.exchange(0, std::memory_order_relaxed));
+	std::fflush(stdout);
+}
+
 PageManager::DeferMode ReadDeferMode() {
 	const auto* value = std::getenv("KYTY_DEFER_UNPROTECT");
 	auto        mode  = PageManager::DeferMode::On;
@@ -640,6 +688,34 @@ struct PageManager::Impl {
 	// host only for the runs whose recorded protection differs (a run may bridge pages already at
 	// its level). Takes both locks itself. Returns the host calls made.
 	uint32_t ApplySpan(Region& region, uint64_t base_addr, size_t first, size_t last) noexcept {
+		if (ApplySpanFastEnabled()) {
+			// Astro Bot PC (KYTY_APPLYSPAN_FAST=1): a span already settled needs no host call. Under
+			// `lock` alone, and only while no host update is in flight (host_lock free): an update
+			// takes host_lock before it reads the counts and records `applied` after its host call
+			// (ProtectRuns), so with host_lock free `applied` is the host's protection, and an update
+			// that starts later reads the counts after this check. While host_lock is held the
+			// recorded state may be about to change: the normal path below waits for it.
+			bool settled = false;
+			{
+				SpinGuard counts(region.lock);
+				if (region.host_lock.IsFree()) {
+					settled = true;
+					for (size_t page = first; page < last; page++) {
+						if (ToLevel(region.pages[page].Perms()) != region.applied[page]) {
+							settled = false;
+							break;
+						}
+					}
+					if (settled) {
+						ClearPending(region, first, last); // as the loop below does page by page
+					}
+				}
+			}
+			ApplySpanFastNote(settled, !settled && !region.host_lock.IsFree());
+			if (settled) {
+				return 0;
+			}
+		}
 		SpinGuard host(region.host_lock, FaultCost::Split::HostLock);
 		RunList   runs;
 		uint32_t  calls = 0;
