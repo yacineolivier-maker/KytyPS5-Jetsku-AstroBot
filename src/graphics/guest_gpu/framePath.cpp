@@ -111,6 +111,7 @@ enum Stage : uint32_t {
 	LabelRecord,
 	LabelDeferred,
 	AgcDone,
+	MainYield, // one scePthreadYield of the main thread (a yield to a ready thread can cost a slice)
 	StageCount
 };
 
@@ -187,6 +188,7 @@ void Report(uint64_t window_ns) {
 	const auto label_rec = take(LabelRecord);
 	const auto label_def = take(LabelDeferred);
 	const auto agc       = take(AgcDone);
+	const auto yield_one = take(MainYield);
 	const auto frames    = g_agc_done_calls.exchange(0, std::memory_order_relaxed);
 	const auto subs      = g_submissions.exchange(0, std::memory_order_relaxed);
 	const auto misses    = g_tick_misses.exchange(0, std::memory_order_relaxed);
@@ -222,14 +224,15 @@ void Report(uint64_t window_ns) {
 	            "] | etiquettes EOP jeu->ecrite %.2f/%.1f [n=%" PRIu64
 	            "] differees GPU->visible %.2f/%.1f [n=%" PRIu64 "] | AgcSuspendPoint %.0f ms/10 s "
 	            "p95 %.1f | Thread_Main attend %.0f %% (%.1f ms/image) : yield %.0f %% + boucle "
-	            "estimee %.0f %% (%" PRIu64 " yields/s), semaphore %.0f %%, cond %.0f %%, equeue %.0f "
+	            "estimee %.0f %% (%" PRIu64 " yields/s, un yield moy %.3f p95 %.2f ms), semaphore %.0f %%, cond %.0f %%, equeue %.0f "
 	            "%%, sommeil %.0f %%, fautes %.0f %%\n",
 	            static_cast<double>(frames) / seconds, subs, stages[0], stages[1], stages[2],
 	            stages[3], stages[4], stages[5], stages[6], gpu.count, misses, label_rec.mean_ms,
 	            label_rec.p95_ms, label_rec.count, label_def.mean_ms, label_def.p95_ms,
 	            label_def.count, agc.mean_ms * static_cast<double>(agc.count) * (10.0 / seconds),
 	            agc.p95_ms, pct(total_wait), per_frame_ms, pct(yield_ns), pct(spin_ns),
-	            static_cast<uint64_t>(static_cast<double>(yields) / seconds),
+	            static_cast<uint64_t>(static_cast<double>(yields) / seconds), yield_one.mean_ms,
+	            yield_one.p95_ms,
 	            pct(wait[static_cast<size_t>(Wait::Semaphore)]),
 	            pct(wait[static_cast<size_t>(Wait::Cond)]),
 	            pct(wait[static_cast<size_t>(Wait::Equeue)]),
@@ -415,6 +418,7 @@ void NoteMainYield(uint64_t begin_ns, uint64_t end_ns) noexcept {
 	g_main_yields.fetch_add(1, std::memory_order_relaxed);
 	if (end_ns >= begin_ns) {
 		g_main_yield_ns.fetch_add(end_ns - begin_ns, std::memory_order_relaxed);
+		g_hist[MainYield].Add(end_ns - begin_ns);
 	}
 	const auto last = g_main_last_yield_end;
 	if (last != 0 && begin_ns >= last && begin_ns - last < SpinGapNs) {
