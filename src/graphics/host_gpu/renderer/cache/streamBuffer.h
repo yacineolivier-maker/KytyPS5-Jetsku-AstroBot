@@ -5,7 +5,12 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -127,8 +132,41 @@ public:
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
 
+	// Astro Bot PC (KYTY_CP_PAR_LANE_STREAM=1, drawPrep/laneShare.h, C1): this ring is lane A's
+	// (and every thread without a lane); lanes B.. get their own ring, of the same size and memory,
+	// created at the lane's first use. Lane(): the ring of the calling thread's recorder stream
+	// (CommandScheduler::ThreadContext); this ring unless EnableLaneRings ran. Start-up only.
+	void EnableLaneRings() noexcept { m_lane_split = true; }
+	[[nodiscard]] StreamBuffer& Lane() {
+		if (!m_lane_split) [[likely]] {
+			return *this;
+		}
+		return LaneSlow();
+	}
+	// One of the lane rings (or this ring).
+	[[nodiscard]] bool IsRingOf(const Buffer* buffer) const noexcept;
+
 private:
 	friend struct StreamBufferTestAccess;
+
+	[[nodiscard]] StreamBuffer& LaneSlow();
+	// KYTY_CP_PAR_VERIFY with the lane rings: the ranges committed and not yet known free.
+	void VerifyMap(uint64_t begin, uint64_t end, bool wrapped);
+	void VerifyCommit(uint64_t begin, uint64_t end, uint64_t tick);
+	struct LiveRange {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	bool                                              m_transfer_shared = false;
+	vk::BufferUsageFlags                              m_extra_flags {};
+	bool                                              m_host_cached = false;
+	bool                                              m_lane_split  = false;
+	uint32_t                                          m_ring_lane   = 0;
+	std::array<std::atomic<StreamBuffer*>, 4>         m_lane_rings {};
+	std::array<std::unique_ptr<StreamBuffer>, 4>      m_lane_owned;
+	std::mutex                                        m_lane_mutex;
+	std::deque<LiveRange>                             m_live;
 
 	struct Watch {
 		uint64_t tick        = 0;

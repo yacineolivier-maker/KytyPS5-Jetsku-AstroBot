@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
+#include "graphics/host_gpu/renderer/drawPrep/laneShare.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
@@ -1911,6 +1912,7 @@ void Engine::Commit(Slot& slot) {
 	}
 	CommitStats::EndDraw();
 	PrintDrawPrepSummary();
+	LaneShare::MaybePrint(); // Astro Bot PC (P3 prerequisites, laneShare.h)
 	DrawRun::PrintSummary();
 	TexelImageLookup::PrintSummary();
 	XFrameReuse::PrintSummary();

@@ -7,11 +7,14 @@
 #include "common/ramStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drawPrep/laneShare.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/vramStats.h"
 
 #include <array>
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -337,7 +340,88 @@ StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler
                            bool host_cached)
     : Buffer(graphics, scheduler, usage, 0, AllFlags | extra_flags, size, transfer_shared,
              host_cached),
-      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
+      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE),
+      m_transfer_shared(transfer_shared), m_extra_flags(extra_flags), m_host_cached(host_cached) {}
+
+// Astro Bot PC (KYTY_CP_PAR_LANE_STREAM=1, streamBuffer.h).
+StreamBuffer& StreamBuffer::LaneSlow() {
+	const auto lane = CommandScheduler::ThreadContext();
+	if (lane == 0 || lane >= m_lane_rings.size()) {
+		return *this;
+	}
+	if (auto* ring = m_lane_rings[lane].load(std::memory_order_acquire); ring != nullptr) {
+		return *ring;
+	}
+	const std::lock_guard lock(m_lane_mutex);
+	if (auto* ring = m_lane_rings[lane].load(std::memory_order_acquire); ring != nullptr) {
+		return *ring;
+	}
+	m_lane_owned[lane] = std::make_unique<StreamBuffer>(Graphics(), Scheduler(), Usage(), Size(),
+	                                                    m_transfer_shared, m_extra_flags, m_host_cached);
+	m_lane_owned[lane]->m_ring_lane = lane;
+	m_lane_rings[lane].store(m_lane_owned[lane].get(), std::memory_order_release);
+	LaneShare::Note(lane, LaneShare::Stat::StreamRings);
+	return *m_lane_owned[lane];
+}
+
+bool StreamBuffer::IsRingOf(const Buffer* buffer) const noexcept {
+	if (buffer == this) {
+		return true;
+	}
+	if (!m_lane_split || buffer == nullptr) {
+		return false;
+	}
+	for (const auto& ring: m_lane_rings) {
+		if (ring.load(std::memory_order_acquire) == buffer) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// KYTY_CP_PAR_VERIFY with the lane rings (laneShare.h): the ranges in flight form one arc of the
+// ring, from the oldest committed range not known free to the newest; a new range must lie in the
+// free arc. A ring is only used by the threads of its lane (lane A's: by every thread without a
+// lane too).
+void StreamBuffer::VerifyMap(uint64_t begin, uint64_t end, bool wrapped) {
+	const auto thread_lane = CommandScheduler::ThreadContext();
+	if (thread_lane != m_ring_lane && (m_ring_lane != 0 || thread_lane < m_lane_rings.size())) {
+		LaneShare::Note(m_ring_lane, LaneShare::Stat::StreamForeign);
+	}
+	while (!m_live.empty() && Scheduler().IsFree(m_live.front().tick)) {
+		m_live.pop_front();
+	}
+	if (wrapped) {
+		LaneShare::Note(m_ring_lane, LaneShare::Stat::StreamWraps);
+	}
+	if (m_live.empty() || begin == end) {
+		return;
+	}
+	const auto first = m_live.front().begin;
+	const auto last  = m_live.back().end;
+	const bool inside_free =
+	    first <= last ? (begin >= last || end <= first) : (begin >= last && end <= first);
+	if (!inside_free) {
+		LaneShare::Note(m_ring_lane, LaneShare::Stat::StreamOverlaps);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+			std::printf("Kyty CpPar lane share: stream ring of lane %c hands out [0x%" PRIx64 ", 0x%" PRIx64
+			            ") over ranges in flight [0x%" PRIx64 ", 0x%" PRIx64 ") (oldest tick %" PRIu64 ")\n",
+			            static_cast<char>('A' + m_ring_lane), begin, end, first, last, m_live.front().tick);
+		}
+	}
+}
+
+void StreamBuffer::VerifyCommit(uint64_t begin, uint64_t end, uint64_t tick) {
+	if (begin == end) {
+		return;
+	}
+	if (!m_live.empty() && m_live.back().tick == tick && m_live.back().end == begin) {
+		m_live.back().end = end;
+		return;
+	}
+	m_live.push_back({begin, end, tick});
+}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
                                         uint64_t& alignment) {
@@ -398,6 +482,12 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	m_wait_bound  = wait_bound;
 	m_offset      = aligned_offset;
 	m_mapped_size = mapped_size;
+	if (LaneShare::g_stream && (m_ring_lane != 0 || m_lane_split)) [[unlikely]] {
+		LaneShare::Note(m_ring_lane, LaneShare::Stat::StreamMaps);
+		if (LaneShare::g_verify) {
+			VerifyMap(aligned_offset, aligned_offset + mapped_size, wrap);
+		}
+	}
 	return {Mapped().data() + m_offset, m_offset};
 }
 
@@ -408,6 +498,9 @@ void StreamBuffer::Commit() {
 
 	m_offset += m_mapped_size;
 	const auto tick = Scheduler().CurrentTick();
+	if (LaneShare::g_verify && LaneShare::g_stream && (m_ring_lane != 0 || m_lane_split)) [[unlikely]] {
+		VerifyCommit(m_offset - m_mapped_size, m_offset, tick);
+	}
 	if (m_current_watch_cursor != 0 && m_current_watches[m_current_watch_cursor - 1].tick == tick) {
 		m_current_watches[m_current_watch_cursor - 1].upper_bound = m_offset;
 		return;

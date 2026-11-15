@@ -200,11 +200,18 @@ public:
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
-			case MemoryUsage::Stream: return m_stream_buffer;
+			case MemoryUsage::Stream: return m_stream_buffer.Lane(); // Astro Bot PC (C1)
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
+	}
+	// Astro Bot PC (KYTY_CP_PAR_LANE_STREAM=1, drawPrep/laneShare.h, C1): the calling thread's lane's
+	// stream ring (m_stream_buffer unless enabled), and whether a buffer is one of the rings.
+	void EnableLaneStreams() noexcept { m_stream_buffer.EnableLaneRings(); }
+	[[nodiscard]] StreamBuffer& StreamRing() { return m_stream_buffer.Lane(); }
+	[[nodiscard]] bool IsStreamRing(const Buffer* buffer) const noexcept {
+		return m_stream_buffer.IsRingOf(buffer);
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	// Both the first registration and the first consumer clear the table, so unowned entries read as zero.

@@ -50,6 +50,7 @@ static bool ClockLocal() {
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
+#include "graphics/host_gpu/renderer/drawPrep/laneShare.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
@@ -855,6 +856,12 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 											            "KYTY_CP_PAR_RESERVE and KYTY_CP_PAR_KEEP on; "
 											            "lanes stay in turn\n");
 										}
+									}
+									// Astro Bot PC (P3 prerequisites, drawPrep/laneShare.h): read once,
+									// before any lane records.
+									LaneShare::Configure(true);
+									if (LaneShare::g_stream) {
+										m_renderer.GetBufferCache().EnableLaneStreams(); // C1
 									}
 									std::printf("Kyty CpPar: 2b: each lane has its own replay thread; "
 									            "native buffers are handed to the queue in list "

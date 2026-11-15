@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
+#include "graphics/host_gpu/renderer/drawPrep/laneShare.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -3794,7 +3795,7 @@ BufferCache::NativeWindow* BufferCache::NativeTierLookup(uint64_t vaddr, uint64_
 }
 
 void BufferCache::NativeTierLearn(uint64_t vaddr, uint64_t size, const std::pair<Buffer*, uint64_t>& result) {
-	if (result.first == nullptr || result.first == &m_stream_buffer) {
+	if (result.first == nullptr || IsStreamRing(result.first)) {
 		m_n3_draw.stream++;
 		return;
 	}
@@ -4030,7 +4031,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBindingMemo(uint64_t vaddr, 
 		BufferLookupStats::AddMiss(LookupMiss::Signature);
 	} else if (const bool stream = memo.kind == BindingMemoKind::Stream;
 	           memo.guard != (stream ? m_scheduler.CurrentTick()
-	                                 : m_bda_structure_epoch.load(std::memory_order_acquire))) {
+	                                 : m_bda_structure_epoch.load(std::memory_order_acquire)) ||
+	           // Astro Bot PC (KYTY_CP_PAR_LANE_STREAM): a copy in another lane's ring is not this
+	           // lane's (always the same ring otherwise).
+	           (stream && memo.buffer != &StreamRing())) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissGuard);
 		if (stats != nullptr) {
 			stats->guard++;
@@ -4084,7 +4088,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBindingMemo(uint64_t vaddr, 
 			if (stream) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoStreamHits);
 				m_binding_memo_totals.stream_hits++;
-				hit.first = &m_stream_buffer;
+				hit.first = &StreamRing(); // the memo's ring (checked above)
 				BufferLookupStats::SetOutcome(LookupOutcome::MemoStream);
 			} else {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoCachedHits);
@@ -4120,11 +4124,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBindingMemo(uint64_t vaddr, 
 	const auto                   result = ObtainBufferNow(vaddr, size, false, false, id, &obtained);
 	now_scope.Stop();
 	if (stats != nullptr) {
-		stats->slow_stream += result.first == &m_stream_buffer ? 1u : 0u;
+		stats->slow_stream += IsStreamRing(result.first) ? 1u : 0u;
 		PrintBindingMemoStats();
 	}
-	BufferLookupStats::SetOutcome(result.first == &m_stream_buffer ? LookupOutcome::MissStream
-	                                                               : LookupOutcome::MissCached);
+	BufferLookupStats::SetOutcome(IsStreamRing(result.first) ? LookupOutcome::MissStream
+	                                                         : LookupOutcome::MissCached);
 	const BufferLookupStats::PartScope record_scope(BufferLookupStats::Part::ReadRecord);
 	RecordBinding(vaddr, size, epoch, before, result, obtained);
 	return result;
@@ -4210,7 +4214,7 @@ void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, u
 	entry.epoch  = epoch;
 	entry.offset = result.second;
 	entry.buffer = result.first;
-	if (result.first == &m_stream_buffer) {
+	if (IsStreamRing(result.first)) {
 		// The decision and the copy saw one tracker state: no transition since `before`.
 		if (m_memory_tracker.RangeSignature(vaddr, size) != before) {
 			return;
@@ -4268,9 +4272,9 @@ std::pair<Buffer*, uint64_t> BufferCache::VerifyBindingHit(const BindingMemo&   
 	if (memo.kind == BindingMemoKind::Stream) {
 		if (!decides_stream) {
 			problem = "a stream-copy hit whose range is no longer copied";
-		} else if (fresh.first == &m_stream_buffer) {
-			race = std::memcmp(m_stream_buffer.Mapped().data() + hit.second,
-			                   m_stream_buffer.Mapped().data() + fresh.second,
+		} else if (IsStreamRing(fresh.first)) {
+			auto& ring = StreamRing(); // the hit's and the fresh copy's (this lane's)
+			race = std::memcmp(ring.Mapped().data() + hit.second, ring.Mapped().data() + fresh.second,
 			                   static_cast<size_t>(size)) != 0;
 		}
 		// Otherwise the ring could not take the copy without waiting: the normal path bound the
@@ -4489,10 +4493,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 			stream = decide();
 		}
 		if (stream) {
-			FastCheck::Fail(FastCheck::Cause::BufferStream); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
+			// Astro Bot PC (KYTY_CP_PAR_FASTCHECK): with a stream ring per lane
+			// (KYTY_CP_PAR_LANE_STREAM) the copy is the lane's own: not a fast-path failure.
+			if (!LaneShare::g_stream) {
+				FastCheck::Fail(FastCheck::Cause::BufferStream);
+			}
 			const auto alignment = std::max<uint64_t>(
 			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-			auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+			auto& ring            = StreamRing(); // Astro Bot PC (KYTY_CP_PAR_LANE_STREAM)
+			auto [mapped, offset] = ring.Map(size, alignment, false);
 			bool read = false;
 			if (mapped != nullptr && StreamDirectReadEnabled()) {
 				std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
@@ -4511,8 +4520,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 				}
 			}
 			if (read) {
-				m_stream_buffer.Commit();
-				return {&m_stream_buffer, offset};
+				ring.Commit();
+				return {&ring, offset};
 			}
 		}
 	}

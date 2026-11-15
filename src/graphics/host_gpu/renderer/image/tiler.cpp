@@ -459,13 +459,13 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 	const uint64_t stride = Common::AlignUp<uint64_t>(sizeof(Push), uniform_alignment);
 	EXIT_NOT_IMPLEMENTED(dispatches.size() > UINT64_MAX / stride);
 	const uint64_t bytes  = dispatches.size() * stride;
-	auto [mapped, offset] = m_stream_buffer.Map(bytes, uniform_alignment);
+	auto [mapped, offset] = m_stream_buffer.Lane().Map(bytes, uniform_alignment);
 	EXIT_IF(mapped == nullptr);
 	for (size_t index = 0; index < dispatches.size(); index++) {
 		std::memcpy(mapped + index * stride, &dispatches[index].push, sizeof(Push));
 		dispatches[index].params_offset = offset + index * stride;
 	}
-	m_stream_buffer.Commit();
+	m_stream_buffer.Lane().Commit();
 }
 
 vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
@@ -548,7 +548,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	barriers[2]               = barriers[0];
 	barriers[2].srcAccessMask = vk::AccessFlagBits::eHostWrite;
 	barriers[2].dstAccessMask = vk::AccessFlagBits::eUniformRead;
-	barriers[2].buffer        = m_stream_buffer.Handle();
+	barriers[2].buffer        = m_stream_buffer.Lane().Handle();
 	barriers[2].offset        = dispatches.front().params_offset;
 	barriers[2].size =
 	    dispatches.back().params_offset - dispatches.front().params_offset + sizeof(Push);
@@ -569,7 +569,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	const vk::DescriptorBufferInfo source_info {source, source_descriptor_offset, source_range};
 	const vk::DescriptorBufferInfo target_info {target, target_descriptor_offset, target_range};
 	for (auto& dispatch: dispatches) {
-		const vk::DescriptorBufferInfo        params_info {m_stream_buffer.Handle(),
+		const vk::DescriptorBufferInfo        params_info {m_stream_buffer.Lane().Handle(),
 		                                                   dispatch.params_offset, sizeof(Push)};
 		const vk::DescriptorBufferInfo        infos[] {source_info, target_info, params_info};
 		std::array<vk::WriteDescriptorSet, 3> writes {};
@@ -1050,7 +1050,7 @@ void TileManager::RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_
 	before[1].srcAccessMask = vk::AccessFlagBits2::eHostWrite;
 	before[1].dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	before[1].dstAccessMask = vk::AccessFlagBits2::eUniformRead;
-	before[1].buffer        = m_stream_buffer.Handle();
+	before[1].buffer        = m_stream_buffer.Lane().Handle();
 	before[1].offset        = dispatches.front().params_offset;
 	before[1].size = dispatches.back().params_offset - dispatches.front().params_offset + sizeof(Push);
 	vk::DependencyInfo dependency {};
@@ -1065,7 +1065,7 @@ void TileManager::RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_
 		const auto& dispatch = dispatches[index];
 		const auto  view     = find_view(regions[index])->view;
 		const vk::DescriptorImageInfo  image_info {nullptr, view, vk::ImageLayout::eGeneral};
-		const vk::DescriptorBufferInfo params_info {m_stream_buffer.Handle(),
+		const vk::DescriptorBufferInfo params_info {m_stream_buffer.Lane().Handle(),
 		                                            dispatch.params_offset, sizeof(Push)};
 		std::array<vk::WriteDescriptorSet, 3> writes {};
 		for (uint32_t binding = 0; binding < writes.size(); binding++) {
