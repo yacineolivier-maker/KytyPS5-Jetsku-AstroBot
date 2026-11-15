@@ -7375,7 +7375,21 @@ bool GuestGpu::CpParTryDispatch() {
 		scheduler.ReserveLaneOrder(lane); // in list order: after every list out
 	}
 	CpPar::RunSliceAsync(lane, &CpParFlightTask, flight.get());
-	m_cp_par_flights.push_back(std::move(flight));
+	// The flights stay in list order (they are collected from the front only): a resumed list (the
+	// unfinished head, the oldest) goes before the younger lists handed out while it was back in
+	// queue 0. Appended, it was collected after them only: its end (unfinished again, or complete)
+	// was never seen, its kept segment never resumed or ended, and the younger lists waited for
+	// their turn for good (blocking of 15/11 19 h 23: lists out [32 C] [30 B ended], turn 25 = B).
+	const auto sequence = flight->submission.sequence;
+	auto       position = std::find_if(m_cp_par_flights.begin(), m_cp_par_flights.end(),
+	                                   [sequence](const std::unique_ptr<CpParFlight>& out) {
+		                                   return out->submission.sequence > sequence;
+	                                   });
+	if (position != m_cp_par_flights.end()) {
+		EXIT_IF(!resume); // only the resumed head may be older than a list out
+		CpPar::NoteLaneStat(lane, CpPar::LaneStat::ResumedBeforeYounger, 1);
+	}
+	m_cp_par_flights.insert(position, std::move(flight));
 	CpPar::NoteFlightsOut(static_cast<uint32_t>(m_cp_par_flights.size()));
 	return true;
 }
@@ -7444,6 +7458,23 @@ GuestGpu::CpParStep GuestGpu::CpParConcurrentStep() {
 		m_cp_par_flights.pop_front();
 		CpParCollect(*flight);
 		progress = true;
+	}
+	// Control (0 expected): a lane keeps an unfinished segment only as the oldest, so every list
+	// before it has ended too. One ended unfinished behind a list still out means the flights are
+	// out of list order (see CpParTryDispatch): it would never be collected. Counted, logged once.
+	if (!m_cp_par_flights.empty() && !m_cp_par_flights.front()->done) {
+		for (size_t i = 1; i < m_cp_par_flights.size(); i++) {
+			if (m_cp_par_flights[i]->done && m_cp_par_flights[i]->result != Pm4ProcessResult::Complete) {
+				CpPar::NoteLaneStat(m_cp_par_flights[i]->lane, CpPar::LaneStat::OutOfOrderEnds, 1);
+				static std::atomic_bool logged {false};
+				if (!logged.exchange(true)) {
+					std::printf("Kyty CpPar 2b concurrent: list %" PRIu64 " ended unfinished behind list %" PRIu64
+					            " still out (flights out of list order)\n",
+					            m_cp_par_flights[i]->submission.sequence,
+					            m_cp_par_flights.front()->submission.sequence);
+				}
+			}
+		}
 	}
 	while (CpParTryDispatch()) {
 		progress = true;

@@ -577,6 +577,8 @@ enum class LaneStat : uint32_t {
 	FenceHolds,         //       the head list (for this lane) held by the frame fence at a hand-out try
 	FenceTimeouts,      //       ... handed out after the fence's 2 s safety timeout
 	UnfinishedFlushes,  //       an unfinished slice's recording submitted at its end
+	ResumedBeforeYounger, //     a resumed unfinished list placed before younger lists already out
+	OutOfOrderEnds,     //       a list out ended (and is kept) while not at the front of the flights (0 expected)
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

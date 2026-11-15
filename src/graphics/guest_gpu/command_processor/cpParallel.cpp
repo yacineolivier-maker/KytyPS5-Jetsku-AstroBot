@@ -1592,6 +1592,9 @@ void StartStallWatchdog(void (*dump)(void*), void* context) {
 			            " frames so far); state:\n",
 			            static_cast<double>(now - last_change) / 1e9, frames);
 			for (int slot = 0; slot < WaitSlots; slot++) {
+				if (slot >= 1 && slot <= 3 && static_cast<uint32_t>(slot) >= g_lane_count) {
+					continue; // no such lane (KYTY_CP_PAR_LANES): its slot is never written
+				}
 				const auto& s     = g_wait_slots[static_cast<size_t>(slot)];
 				const char* what  = s.what.load(std::memory_order_acquire);
 				const auto  since = s.since.load(std::memory_order_relaxed);
@@ -1966,14 +1969,15 @@ void MaybeReport() {
 			              "%s%c: active %.1f ms, slices handed out %" PRIu64 " (back unfinished %" PRIu64
 			              "); turn waits:%s; out-of-turn submits %" PRIu64 ", visible ops not oldest %" PRIu64
 			              ", out of order %" PRIu64 ", dependency hazards %" PRIu64
-			              ", services left to the oldest %" PRIu64 ", retires held for younger %" PRIu64 ", fence holds %" PRIu64 " (timeouts %" PRIu64 "), unfinished-slice flushes %" PRIu64,
+			              ", services left to the oldest %" PRIu64 ", retires held for younger %" PRIu64 ", fence holds %" PRIu64 " (timeouts %" PRIu64 "), unfinished-slice flushes %" PRIu64 ", resumed before younger %" PRIu64 ", out-of-order ends %" PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane),
 			              static_cast<double>(n(LaneStat::ActiveNs)) / 1e6, n(LaneStat::Dispatched),
 			              n(LaneStat::CollectedUnfinished), waits.empty() ? " none" : waits.c_str(),
 			              n(LaneStat::OutOfTurnSubmits), n(LaneStat::VisibleNotOldest),
 			              n(LaneStat::VisibleOutOfOrder), n(LaneStat::DependencyHazards),
 			              n(LaneStat::YoungerServices), n(LaneStat::RetiresHeld), n(LaneStat::FenceHolds), n(LaneStat::FenceTimeouts),
-			              n(LaneStat::UnfinishedFlushes));
+			              n(LaneStat::UnfinishedFlushes), n(LaneStat::ResumedBeforeYounger),
+			              n(LaneStat::OutOfOrderEnds));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b concurrent (%u): overlap 2+ lanes %.1f ms, 3+ lanes %.1f ms; most "
