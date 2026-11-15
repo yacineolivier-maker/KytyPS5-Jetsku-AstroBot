@@ -706,6 +706,9 @@ static void TraceCpLabel(const char* kind, const void* dst, uint64_t value, uint
 	}
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d)): defined with the 1b3 run-ahead below.
+static void CpParLaneOverlayAtEnd(CommandScheduler& scheduler, uint32_t lane);
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -775,6 +778,10 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 								if (m_renderer.GetCommandScheduler().EnableLanes2b()) {
 									CpPar::g_lanes_2b = true;
 									(void)CpPar::LaneLockEnabled(); // step 3b-2: read once, printed
+									// Morceau (d): the image state overlay of younger segments
+									// (needs the lanes' lock: ops are exclusive).
+									CpPar::g_lane_overlay =
+									    CpPar::LaneLockEnabled() && CpPar::LaneOverlayConfigured();
 									std::printf("Kyty CpPar: 2b: each lane has its own replay thread; "
 									            "native buffers are handed to the queue in list "
 									            "order\n");
@@ -848,6 +855,10 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					// owning the renderer), the merge point of its image states.
 					const uint32_t stream = CpPar::ThreadLane(); // Astro Bot PC (2a: N lanes)
 					CommandRecorder::SetThreadStream(stream);
+					if (CpPar::Lanes2b()) {
+						// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d)): overlay merge point.
+						CpParLaneOverlayAtEnd(gpu->m_renderer.GetCommandScheduler(), stream);
+					}
 					const auto counts = gpu->m_renderer.GetCommandScheduler().EndContextSegment();
 					CpPar::EndSegment(stream, counts.packets, counts.submits,
 					                  counts.new_command_buffer);
@@ -6867,9 +6878,9 @@ static void RunOnGpuThreadScoped(Body& body) {
 // global memory barrier, recorded in the calling thread's context (the end of the oldest
 // context's segment, before its Switch).
 static void CpParRecordFixUps(CommandScheduler& scheduler, uint64_t& fixups, uint64_t& images,
-                              uint64_t& impossible) {
+                              uint64_t& impossible, uint32_t lane = 0) {
 	Image::Barriers barriers;
-	Image::CpParMergeOverlay(barriers, images, impossible);
+	Image::CpParMergeOverlay(barriers, images, impossible, lane); // Astro Bot PC (2b: lane's)
 	fixups = barriers.size();
 	if (!scheduler.Active() || !scheduler.CurrentValid()) {
 		// No native buffer to record into (never seen): counted as impossible fix-ups.
@@ -6889,6 +6900,41 @@ static void CpParRecordFixUps(CommandScheduler& scheduler, uint64_t& fixups, uin
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
 	scheduler.Current().Sink().pipelineBarrier2(dependency);
+}
+
+// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d), cpParallel.h): the end of lane `lane`'s segment
+// (the give hook, its recording stream set, before EndContextSegment's hand-off submit). Ended as
+// the oldest open segment (always in turn), its successor's overlay, if it holds images, is merged
+// with its fix-ups recorded here. A segment ending while an older one is open is counted ("left";
+// in simultaneous execution it will have to wait for its turn): its own overlay, if any, is merged
+// without fix-ups (counted impossible).
+static void CpParLaneOverlayAtEnd(CommandScheduler& scheduler, uint32_t lane) {
+	if (!CpPar::g_lane_overlay) {
+		return;
+	}
+	CpPar::LaneLockAcquire();
+	if (!scheduler.LaneSegmentOldest(lane)) {
+		CpPar::NoteLaneStat(lane, CpPar::LaneStat::OverlayLeft, 1);
+		if (Image::CpParOverlayHolds(lane)) {
+			Image::Barriers barriers;
+			uint64_t        images     = 0;
+			uint64_t        impossible = 0;
+			Image::CpParMergeOverlay(barriers, images, impossible, lane);
+			CpPar::NoteLaneStat(lane, CpPar::LaneStat::OverlayImages, images);
+			CpPar::NoteLaneStat(lane, CpPar::LaneStat::OverlayImpossible,
+			                    impossible + barriers.size());
+		}
+	} else if (const auto next = scheduler.LaneSuccessor(lane);
+	           next != UINT32_MAX && Image::CpParOverlayHolds(next)) {
+		uint64_t fixups     = 0;
+		uint64_t images     = 0;
+		uint64_t impossible = 0;
+		CpParRecordFixUps(scheduler, fixups, images, impossible, next);
+		CpPar::NoteLaneStat(next, CpPar::LaneStat::OverlayImages, images);
+		CpPar::NoteLaneStat(next, CpPar::LaneStat::OverlayFixups, fixups);
+		CpPar::NoteLaneStat(next, CpPar::LaneStat::OverlayImpossible, impossible);
+	}
+	CpPar::LaneLockRelease();
 }
 
 // Astro Bot PC (KYTY_CP_PAR=1b5, cpParallel.h): Thread_Gpu, op lock held, right after the oldest
@@ -8019,7 +8065,20 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		} else if (CpPar::Lanes2b() && CpPar::LaneLockEnabled()) {
 			// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): the op under the lanes' global lock.
 			CpPar::LaneLockAcquire();
+			// Morceau (d): an op of a younger segment runs on its lane's image state overlay
+			// (never in turn: the running segment is always the oldest).
+			const bool overlay =
+			    CpPar::g_lane_overlay && !GetScheduler().LaneSegmentOldest(context);
+			if (overlay) {
+				CpPar::t_overlay_lane = context;
+				CpPar::t_overlay      = true;
+				CpPar::NoteLaneStat(context, CpPar::LaneStat::OverlayOps, 1);
+			}
 			result = ExecuteOp(kind, view.payload, view.data);
+			if (overlay) {
+				CpPar::t_overlay = false;
+				Image::CpParEndOp(context);
+			}
 			CpPar::LaneLockRelease();
 		} else {
 			result = ExecuteOp(kind, view.payload, view.data);

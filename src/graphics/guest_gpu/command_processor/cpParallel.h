@@ -389,6 +389,20 @@ inline uint32_t           g_lane_count = 2;
 // The calling thread executes a run-ahead op before its merge: image accesses use its overlay
 // (Image::CpParTouch).
 inline thread_local bool t_overlay = false;
+// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d)): the overlay generalized to N lanes. g_lane_overlay:
+// set once at start-up in 2b with the lanes' lock (KYTY_CP_PAR_OVERLAY=0 turns it off), before
+// Thread_Gpu starts. t_overlay_lane: the lane whose overlay the calling thread's op uses while
+// t_overlay is set (1b3: 0). The oldest open segment works on the global image states (as 1b3's
+// oldest context); an op of a younger segment works on its lane's overlay (entry requirement at
+// the first touch, its own state swapped in for the op, swapped back at the op's end, lanes' lock
+// held). At the end of the oldest segment (its hand-off, lanes' lock held), its successor's
+// overlay is merged: fix-up barriers from the global states to the successor's entry
+// requirements are recorded at the end of the oldest segment's buffer (which the queue runs right
+// before the successor's), then the successor's states become the global ones. In turn there is
+// never a younger open segment: no overlay is ever used (the 1b2 book's "not no-ops" stays 0).
+inline bool                  g_lane_overlay = false;
+inline thread_local uint32_t t_overlay_lane = 0;
+[[nodiscard]] bool LaneOverlayConfigured(); // 2b: KYTY_CP_PAR_OVERLAY (default on), read once
 // The run-ahead has begun a recorder segment the replay has not reached ("dirty"): set and
 // cleared under the op lock; read by the native submit and drain hooks and by Thread_Gpu's
 // optional work (deferred while it is set).
@@ -534,6 +548,11 @@ enum class LaneStat : uint32_t {
 	OcclusionRebatches, // morceau (b): a lane's occlusion batch reduced early (another lane's slots in between)
 	OcclusionUnlocked,  //       an occlusion dump outside the lanes' global lock
 	SeqPositionBelow,   // morceau (a): the sequencer's per-lane position below the former global counter
+	OverlayOps,         // morceau (d): ops of a younger segment run on its lane's image overlay
+	OverlayImages,      //       overlay images merged (at the end of the older segment)
+	OverlayFixups,      //       fix-up barriers recorded there (not no-ops)
+	OverlayImpossible,  //       fix-ups no barrier can express, or with no buffer to record into
+	OverlayLeft,        //       a segment ended with its overlay unmerged (its older one still open)
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

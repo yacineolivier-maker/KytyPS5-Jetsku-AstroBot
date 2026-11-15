@@ -886,6 +886,32 @@ void CommandScheduler::EndOrderLocked(uint64_t order) {
 	m_turn_changed.notify_all();
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d), commandScheduler.h).
+bool CommandScheduler::LaneSegmentOldest(uint32_t lane) {
+	if (!m_lanes_2b || lane >= MaxLanes) {
+		return true;
+	}
+	std::lock_guard lock(m_operation_mutex);
+	return m_lane_order[lane] == UINT64_MAX || m_lane_order[lane] == m_turn;
+}
+
+uint32_t CommandScheduler::LaneSuccessor(uint32_t lane) {
+	if (!m_lanes_2b || lane >= MaxLanes) {
+		return UINT32_MAX;
+	}
+	std::lock_guard lock(m_operation_mutex);
+	const auto order = m_lane_order[lane];
+	if (order == UINT64_MAX) {
+		return UINT32_MAX;
+	}
+	for (uint32_t other = 0; other < m_lane_count && other < MaxLanes; other++) {
+		if (other != lane && m_lane_order[other] == order + 1u) {
+			return other;
+		}
+	}
+	return UINT32_MAX;
+}
+
 void CommandScheduler::WaitLaneTurn(uint32_t lane) {
 	std::unique_lock lock(m_operation_mutex);
 	if (lane >= MaxLanes || m_lane_order[lane] == UINT64_MAX || m_lane_order[lane] == m_turn) {

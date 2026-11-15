@@ -585,13 +585,18 @@ public:
 	// context left) to its entry requirement, then makes the run-ahead's states the global ones and
 	// clears the overlay; counts the images, and the subresources whose entry requirement is
 	// "undefined" against defined contents (no barrier can express it: left out).
+	// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d)): one overlay per lane (`lane`; at a touch, the
+	// calling thread's CpPar::t_overlay_lane); 1b3 uses overlay 0 only. CpParOverlayHolds: lane
+	// `lane`'s overlay holds images.
 	void CpParTouch() const noexcept {
-		if (CpPar::g_concurrent && CpPar::t_overlay) [[unlikely]] {
+		if ((CpPar::g_concurrent || CpPar::g_lane_overlay) && CpPar::t_overlay) [[unlikely]] {
 			const_cast<Image*>(this)->CpParTouchSlow();
 		}
 	}
-	static void CpParEndOp();
-	static void CpParMergeOverlay(Barriers& fixups, uint64_t& images, uint64_t& impossible);
+	static void CpParEndOp(uint32_t lane = 0);
+	static void CpParMergeOverlay(Barriers& fixups, uint64_t& images, uint64_t& impossible,
+	                              uint32_t lane = 0);
+	[[nodiscard]] static bool CpParOverlayHolds(uint32_t lane) noexcept;
 	// Fix-up barriers of this image from its current state to `entry` (and `entry_subresources`).
 	void CpParFixUpBarriers(const VulkanImageState&              entry,
 	                        const std::vector<VulkanImageState>& entry_subresources,

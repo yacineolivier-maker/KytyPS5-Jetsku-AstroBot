@@ -232,6 +232,11 @@ public:
 	// violated); without it the registry costs nothing (lanes in turn need none). Images and render
 	// targets are not registered yet.
 	void NoteLaneBuffer(uint64_t address, uint64_t size, bool written);
+	// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d)): lane `lane` has no open segment or its open
+	// segment is the oldest (always in turn); the lane whose open segment follows lane `lane`'s
+	// (its order + 1), or UINT32_MAX.
+	[[nodiscard]] bool     LaneSegmentOldest(uint32_t lane);
+	[[nodiscard]] uint32_t LaneSuccessor(uint32_t lane);
 	[[nodiscard]] bool Lanes() const noexcept { return m_lanes; }
 	[[nodiscard]] uint32_t LaneCount() const noexcept { return m_lane_count; }
 	// The calling thread's context (0 unless it records into stream 1).

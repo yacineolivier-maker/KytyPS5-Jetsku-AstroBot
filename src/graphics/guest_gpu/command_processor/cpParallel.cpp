@@ -224,8 +224,10 @@ public:
 				Take();
 				t_serving_lane = m_lane; // Astro Bot PC (2b: EffectiveLane)
 				request(request_argument);
-				t_serving_lane = UINT32_MAX;
+				// Astro Bot PC (KYTY_CP_PAR=2b, morceaux (c), (d)): still serving through the give
+				// hook (it takes the lanes' lock, which the waiting lane holds: delegated).
 				GiveToLane();
+				t_serving_lane = UINT32_MAX;
 				lock.lock();
 				m_state = State::Slice;
 				m_wake_b.notify_one();
@@ -1104,6 +1106,21 @@ bool LaneLockDelegated() noexcept {
 }
 } // namespace
 
+bool LaneOverlayConfigured() {
+	// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d), cpParallel.h).
+	static const bool on = [] {
+		if (GetMode() != Mode::Lanes2b) {
+			return false;
+		}
+		const auto* value = std::getenv("KYTY_CP_PAR_OVERLAY");
+		const bool  set   = value == nullptr || std::strcmp(value, "0") != 0;
+		std::printf("Kyty CpPar: 2b image state overlay of younger segments: %s "
+		            "(KYTY_CP_PAR_OVERLAY)\n", set ? "on" : "off");
+		return set;
+	}();
+	return on;
+}
+
 bool LaneLockEnabled() {
 	static const bool enabled = [] {
 		if (GetMode() != Mode::Lanes2b) {
@@ -1427,7 +1444,7 @@ void MaybeReport() {
 				return static_cast<double>(v[static_cast<size_t>(stat)]) / 1e6;
 			};
 			const auto n = [&v](LaneStat stat) { return v[static_cast<size_t>(stat)]; };
-			char item[768];
+			char item[1024];
 			std::snprintf(item, sizeof(item),
 			              "%s%c: replay %.1f ms busy, turn waits %" PRIu64 " (%.1f ms); submit turn "
 			              "waits %" PRIu64 " (%.1f ms), held operations %" PRIu64
@@ -1435,7 +1452,9 @@ void MaybeReport() {
 			              "violations %" PRIu64 ", early retires avoided %" PRIu64
 			              "; lane lock %" PRIu64 " takes, %.1f ms waiting, %.1f ms held, bounces "
 			              "under it %" PRIu64 " (delegated takes %" PRIu64 "); occlusion early batches %"
-			              PRIu64 ", dumps outside the lock %" PRIu64 "; seq position below %" PRIu64,
+			              PRIu64 ", dumps outside the lock %" PRIu64 "; seq position below %" PRIu64
+			              "; overlay ops %" PRIu64 ", images %" PRIu64 ", fix-ups %" PRIu64
+			              ", impossible %" PRIu64 ", left %" PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
 			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs),
 			              n(LaneStat::SubmitTurnWaits), ms(LaneStat::SubmitTurnNs),
@@ -1445,7 +1464,9 @@ void MaybeReport() {
 			              n(LaneStat::LockTakes), ms(LaneStat::LockWaitNs), ms(LaneStat::LockHoldNs),
 			              n(LaneStat::LockedBounces), n(LaneStat::LockDelegated),
 			              n(LaneStat::OcclusionRebatches), n(LaneStat::OcclusionUnlocked),
-			              n(LaneStat::SeqPositionBelow));
+			              n(LaneStat::SeqPositionBelow), n(LaneStat::OverlayOps),
+			              n(LaneStat::OverlayImages), n(LaneStat::OverlayFixups),
+			              n(LaneStat::OverlayImpossible), n(LaneStat::OverlayLeft));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());

@@ -4,7 +4,7 @@ Branche `cp-voies` (partie de `mt-liaisons`). Conception : `docs\CONCEPTION-MULT
 étapes P1 et P2). Les essais en jeu sont faits par la session principale ; rien de ce qui suit n'a encore été
 essayé en jeu.
 
-## P2 « voies simultanées » (`KYTY_CP_PAR=2b`) — état au 15/11/2026 soir
+## P2 « voies simultanées » (`KYTY_CP_PAR=2b`) — état au 15/11/2026 soir (morceaux (a)–(d) faits, à tour de rôle)
 
 **Ce qui est fait : les étapes 1, 2, 4 et 5. Ce qui n'est pas fait : l'étape 3 (les voies traduisent encore à
 tour de rôle, par le jeton de 2a ; il n'y a pas encore de verrou global des caches).** 2b ne peut donc pas encore
@@ -20,6 +20,10 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `ae518a8e` | 3b-1 | retraits « au tick du fil appelant » relevés ; dépendance de soumission UploadDma par voie ; compteur « early retires avoided » | BUILD_OK |
 | `36a6a7ee` | 3b-2 (partielle) | verrou global FIFO des voies autour de chaque opération (`KYTY_CP_PAR_LOCK=0` le coupe), `IsGpuThread` vrai pour son détenteur ; compteurs prises/attente/temps tenu | BUILD_OK |
 | `8aae2d32` | 3b-2 (suite) | état du `CommandProcessor` gardé d'une opération à l'autre, par voie (`LaneCpState`, indice = voie effective) ; `m_resolve_lane` remplacé en 2b | BUILD_OK |
+| `a2c83dea` | (c) | services et flips renvoyés à Thread_Gpu sous le verrou des voies, Thread_Gpu détenteur délégué | BUILD_OK |
+| `f2e94af8` | (b) | occlusion : état de lot par flux (pool, requêtes, fenêtre, lot) ; émission et emplacements communs | BUILD_OK |
+| `492ed57b` | (a) | `RenderMutex` sans propriétaire en 2b ; position des opérations exécutées du séquenceur par voie | BUILD_OK |
+| (ce commit) | (d) | surcouche d'état d'image par voie (segments plus jeunes), fusion à la fin du plus ancien | BUILD_OK |
 | `ba1b4058` | 4–5 | registre des plages liées/écrites par segment ouvert, attente de dépendance, violations d'ordre (`KYTY_CP_PAR_VERIFY=1`), ligne « CpPar 10s: 2b » complète | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
@@ -114,9 +118,11 @@ voie, `RenderMutex` (propriétaire unique donné avec le jeton), compteur d'opé
 services renvoyés à Thread_Gpu (`RunOnGpuThread`) s'exécutent pendant que la voie tient le verrou : sans risque
 à tour de rôle, à revoir en 3b-3 (Thread_Gpu ne doit pas prendre le verrou pour eux, ou la voie doit le lâcher).
 
-### Passation (15/11 soir) : morceaux suivants, à tour de rôle, non commencés
+### Passation (15/11 soir) : morceaux (a)–(d) — faits (voir la section suivante)
 
-État du code au commit `8aae2d32`. Pistes relevées pour l'agent suivant (vérifiées dans le code, non écrites) :
+Pistes laissées au commit `8aae2d32` par l'agent précédent ; toutes codées le 15/11 soir, dans l'ordre (c), (b), (a),
+(d), avec deux écarts justifiés plus bas (occlusion indexée par flux d'enregistrement et non par voie effective ;
+position du séquenceur par séries d'opérations et non minimum brut). Texte d'origine :
 
 - **(a) `RenderMutex`** (`renderer/renderContext.h`) : verrou asymétrique à **un seul propriétaire** (`t_owner`,
   `BecomeOwner`/`ResignOwner` dans les crochets du jeton, `graphicsRun.cpp` ~l. 828/858). À tour de rôle, rien à
@@ -189,6 +195,27 @@ par voie est sous l'ancien compteur (une liste plus récente aurait exécuté av
 **0 attendu à tour de rôle**. Les seuils d'attente du séquenceur (écritures en attente, fenêtres, instantanés)
 restent globaux.
 
+**(d) Surcouche d'état d'image à N voies.** La surcouche de 1b3 (`Image::CpParTouch`, entrée à la première
+touche, état propre échangé pour la durée d'une opération, rendu à la fin de l'opération) existe maintenant en
+un exemplaire par voie (`GetCpParOverlay(lane)`, `CpPar::t_overlay_lane` ; 1b3 n'utilise que l'exemplaire 0,
+inchangé). Active en 2b avec le verrou des voies (`CpPar::g_lane_overlay`, `KYTY_CP_PAR_OVERLAY=0` la coupe).
+Règle, généralisation exacte de 1b3 : **le segment ouvert le plus ancien travaille sur l'état global** (comme le
+contexte le plus ancien de 1b3) ; une opération d'un segment plus jeune (`!LaneSegmentOldest`) travaille sur la
+surcouche de sa voie, sous le verrou. À la fin du segment le plus ancien (crochet de passation, avant la
+soumission de passation, verrou pris), la surcouche de son **successeur** (ordre + 1, `LaneSuccessor`) est
+fusionnée : correctifs (état global → exigence d'entrée du successeur) enregistrés à la fin du tampon du plus
+ancien, que la file exécute juste avant celui du successeur ; puis les états du successeur deviennent globaux.
+Les correctifs du segment s ne peuvent donc aller que dans le tampon de s−1 : **un segment plus jeune ne doit
+pas finir avant d'être le plus ancien** (en simultané, sa fin devra attendre son tour) ; compté « left » (avec
+fusion sans correctifs, comptée « impossible »). À tour de rôle aucun segment plus jeune n'est jamais ouvert :
+la surcouche n'est jamais utilisée (overlay ops 0, images 0, fix-ups 0, left 0 attendus) et le livre de 1b2
+(« not no-ops ») reste à 0 par construction ; ce morceau prépare la simultanéité mais n'est **pas exercé** à
+tour de rôle. Correction annexe : Thread_Gpu reste « au service » de la voie (`t_serving_lane`) jusqu'après le
+crochet de passation qui suit une requête (sinon ce crochet, qui prend le verrou, attendrait la voie qui le
+tient : interblocage). Hors opérations, les services et flips d'un segment plus jeune toucheraient l'état global
+(à faire attendre leur tour en 3b-3).
+
+
 
 
 ### Variables pour l'essai en jeu
@@ -208,8 +235,12 @@ par 10 s.
 3. Une fois chacun : ajouter `KYTY_CP_PAR_VERIFY=1` (auto-contrôle, un peu plus lent).
 
 Au démarrage : « Kyty CpPar: KYTY_CP_PAR=2b … », « 2a lanes (N): … », « 2b: each lane has its own replay
-thread … ». Attendus toutes les 10 s : « not no-ops A 0 B 0 » ; dans la ligne 2b : **submit turn waits 0, held
-operations 0, dependency waits 0, order violations 0** (à tour de rôle) ; « turn waits » du rejeu > 0 est normal
+thread … », « 2b global lane lock … on », « 2b image state overlay of younger segments: on ». Attendus toutes
+les 10 s : « not no-ops A 0 B 0 » ; dans la ligne 2b : **submit turn waits 0, held operations 0, dependency waits 0,
+order violations 0** (à tour de rôle) ; depuis les morceaux (a)–(d) aussi **occlusion early batches 0, seq position
+below 0, overlay ops 0, images 0, fix-ups 0, impossible 0, left 0** ; « bounces under it » > 0 (flips et services
+renvoyés) avec « delegated takes » > 0 (le crochet de passation pris par Thread_Gpu pour la voie servie) ; « dumps
+outside the lock » : à relever (vidages d'occlusion hors opération, sans danger à tour de rôle) ; « turn waits » du rejeu > 0 est normal
 (le rejeu d'une voie attend le `Switch` de la précédente). i/s attendus : comme 2a (aucun gain prévu tant que
 l'étape 3 manque) ; un léger gain est possible si le rejeu de A était chargé, une légère perte si les fils de
 rejeu supplémentaires (attente active de 30 µs, `KYTY_CP_RECORDER_SPIN_US`) gênent un processeur déjà chargé.
@@ -236,8 +267,28 @@ Comparer image, i/s (3 tours), stabilité (5 min) à 2a.
 4. **Fils sans voie** : leur `CurrentTick()` est celui du segment le plus ancien (ou la base de plage suivante
    entre deux segments) : un mémo daté par eux est au pire manqué (repli lent, correct).
 5. Hérités de P1 : fil hors jeton qui enregistrerait (`EXIT_IF`), début paresseux (voir plus bas).
+6. **Morceaux (a)–(d)** (15/11 soir), à tour de rôle : (c) le verrou des voies est maintenant tenu pendant les
+   flips et services renvoyés à Thread_Gpu et pris par les crochets de passation (morceau (d)) ; un oubli de
+   délégation donnerait un **interblocage** (chien de garde « cp-par-2b-lane-lock »), pas une perte du GPU.
+   (b) chaque voie a son pool de requêtes d'occlusion : une erreur de remise à zéro donnerait des valeurs
+   d'occlusion fausses (objets qui clignotent) ou une erreur de validation ; « Occlusion counter: batch slot check
+   failed » le signalerait. (a) un `Executed()` trop petit bloquerait le séquenceur (chien de garde
+   « sequencer-progress ») ; trop grand, il lirait des octets de commande avant une écriture du CP ; « seq position
+   below » 0 attendu. `RenderMutex` : mutex ordinaire, interblocage possible seulement si une voie le tenait au
+   moment d'un renvoi à Thread_Gpu (avant, `ResignOwner` l'aurait arrêté). (d) jamais exercé à tour de rôle.
 
 ### Suite
+
+**Après les morceaux (a)–(d) (15/11 soir), ce qui reste avant de lever le jeton** (ordre conseillé) :
+1. Essai en jeu, à tour de rôle, des commits `a2c83dea`…(d) : mêmes attendus que plus haut, plus les nouveaux
+   compteurs à 0. Si « delegated takes » reste à 0 alors que « bounces under it » > 0, ou si le chien de garde
+   nomme « cp-par-2b-lane-lock », la délégation (c) est à revoir.
+2. Fin de segment à son tour : un segment plus jeune doit attendre d'être le plus ancien avant sa passation
+   (règle de (d), compteur « left ») et avant tout flip ou service renvoyé à Thread_Gpu (ils touchent l'état
+   global hors surcouche, et la passation du renvoi termine le segment) : réutiliser `WaitLaneTurn`.
+3. Services de Thread_Gpu hors `ResolveSubmission` (sa boucle principale) sous le verrou des voies ; vidages
+   d'occlusion hors opération (« dumps outside the lock ») idem.
+4. Puis l'étape 1 de 3b-3 ci-dessous (boucle des files sans attente de la tranche).
 
 **Étape 3b-3 (non faite) — exécution simultanée, opération entière sous le verrou.** Seule la préparation 3a est faite
 (`48d04f8c`). La simultanéité réelle n'a pas été écrite : elle change la boucle des files de Thread_Gpu, le

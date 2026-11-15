@@ -1176,15 +1176,17 @@ struct CpParOverlay {
 	std::atomic<size_t>                         size {0};
 };
 
-CpParOverlay& GetCpParOverlay() {
-	static CpParOverlay overlay;
-	return overlay;
+// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d)): one per lane (index = lane; 1b3: 0 only).
+constexpr uint32_t CpParOverlayCount = 4; // CpPar::MaxLanes
+CpParOverlay& GetCpParOverlay(uint32_t lane = 0) {
+	static std::array<CpParOverlay, CpParOverlayCount> overlays;
+	return overlays[lane < CpParOverlayCount ? lane : CpParOverlayCount - 1];
 }
 
 } // namespace
 
 void Image::CpParTouchSlow() {
-	auto&           overlay = GetCpParOverlay();
+	auto&           overlay = GetCpParOverlay(CpPar::t_overlay_lane);
 	std::lock_guard lock(overlay.mutex);
 	auto [found, inserted] = overlay.entries.try_emplace(this);
 	auto& entry            = found->second;
@@ -1209,8 +1211,8 @@ void Image::CpParTouchSlow() {
 	}
 }
 
-void Image::CpParEndOp() {
-	auto& overlay = GetCpParOverlay();
+void Image::CpParEndOp(uint32_t lane) {
+	auto& overlay = GetCpParOverlay(lane);
 	if (overlay.size.load(std::memory_order_relaxed) == 0) {
 		return;
 	}
@@ -1289,8 +1291,13 @@ void Image::CpParFixUpBarriers(const VulkanImageState&              entry,
 	}
 }
 
-void Image::CpParMergeOverlay(Barriers& fixups, uint64_t& images, uint64_t& impossible) {
-	auto&           overlay = GetCpParOverlay();
+bool Image::CpParOverlayHolds(uint32_t lane) noexcept {
+	return GetCpParOverlay(lane).size.load(std::memory_order_relaxed) != 0;
+}
+
+void Image::CpParMergeOverlay(Barriers& fixups, uint64_t& images, uint64_t& impossible,
+                              uint32_t lane) {
+	auto&           overlay = GetCpParOverlay(lane);
 	std::lock_guard lock(overlay.mutex);
 	EXIT_IF(!overlay.swapped.empty());
 	for (auto& [image, entry]: overlay.entries) {
@@ -1310,15 +1317,18 @@ Image::~Image() {
 	if (CpPar::HashBookActive()) {
 		CpPar::ForgetImage(this); // Astro Bot PC (KYTY_CP_PAR=1b2)
 	}
-	if (CpPar::Concurrent()) {
-		// Astro Bot PC (KYTY_CP_PAR=1b3): out of the run-ahead's overlay.
-		auto& overlay = GetCpParOverlay();
-		if (overlay.size.load(std::memory_order_relaxed) != 0) {
-			std::lock_guard lock(overlay.mutex);
-			if (overlay.entries.erase(this) != 0) {
-				overlay.size.store(overlay.entries.size(), std::memory_order_relaxed);
+	if (CpPar::Concurrent() || CpPar::g_lane_overlay) {
+		// Astro Bot PC (KYTY_CP_PAR=1b3): out of the run-ahead's overlay (2b: every lane's).
+		const uint32_t count = CpPar::Concurrent() ? 1u : CpParOverlayCount;
+		for (uint32_t lane = 0; lane < count; lane++) {
+			auto& overlay = GetCpParOverlay(lane);
+			if (overlay.size.load(std::memory_order_relaxed) != 0) {
+				std::lock_guard lock(overlay.mutex);
+				if (overlay.entries.erase(this) != 0) {
+					overlay.size.store(overlay.entries.size(), std::memory_order_relaxed);
+				}
+				std::erase(overlay.swapped, this);
 			}
-			std::erase(overlay.swapped, this);
 		}
 	}
 	for (const auto& cached: views) {
