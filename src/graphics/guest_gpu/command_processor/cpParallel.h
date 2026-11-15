@@ -360,6 +360,9 @@ inline uint32_t           g_lane_count = 2;
 // The calling thread's resolver context: 0 for Thread_Gpu (and any other thread), k for CP
 // resolver #k+1 (the 1b3 run-ahead thread: 1).
 [[nodiscard]] uint32_t ThreadLane() noexcept;
+// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): the lane whose work the calling thread executes: the
+// lane of the request Thread_Gpu is serving (RunOnGpuThread, inside RunSlice), else ThreadLane().
+[[nodiscard]] uint32_t EffectiveLane() noexcept;
 // The lane that takes the token at the hand-off in progress (set before the giver's give hook):
 // a lane always gives it back to Thread_Gpu (0); Thread_Gpu gives it to the slice's lane. The
 // giver's Switch packet names it (2a).

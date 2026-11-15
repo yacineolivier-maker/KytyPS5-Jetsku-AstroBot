@@ -1379,7 +1379,7 @@ DrawPrep::Engine* CommandProcessor::EmitPrep() const {
 
 DrawPrep::Engine* CommandProcessor::ResolvePrep() const {
 	// Astro Bot PC (KYTY_CP_PAR=1b3): the calling thread's context (two resolvers at once).
-	const uint32_t lane   = CpPar::Concurrent() ? (t_cp_par_resolve_b ? 1u : 0u) : m_resolve_lane;
+	const uint32_t lane   = CpPar::Concurrent() ? (t_cp_par_resolve_b ? 1u : 0u) : ResolveLaneIndex();
 	auto*          engine = lane != 0 ? LanePrep(lane) : nullptr;
 	return engine != nullptr ? engine : m_draw_prep.get();
 }
@@ -1390,7 +1390,7 @@ CpSeq::SnapshotRing& CommandProcessor::EmitSnapshots() const {
 
 CpSeq::SnapshotRing& CommandProcessor::ResolveSnapshots() const {
 	// Astro Bot PC (1b3: the calling thread's context; 2a: N lanes).
-	const uint32_t lane = CpPar::Concurrent() ? (t_cp_par_resolve_b ? 1u : 0u) : m_resolve_lane;
+	const uint32_t lane = CpPar::Concurrent() ? (t_cp_par_resolve_b ? 1u : 0u) : ResolveLaneIndex();
 	return m_sequencer->Snapshots(lane);
 }
 
@@ -1421,10 +1421,10 @@ bool CommandProcessor::TrySubmitPreparedDraw(const DrawIndexArgs* index_args,
 			return false;
 		}
 		auto& command = CurrentBuffer();
-		return engine->Submit(m_submit_id, index_args, auto_args, command.GetRegisters(),
+		return engine->Submit(LaneCp().submit_id, index_args, auto_args, command.GetRegisters(),
 		                      command.GetUserConfig(), command.GetShaders());
 	}
-	return engine->Submit(m_submit_id, index_args, auto_args, m_ctx, m_ucfg, m_sh_ctx);
+	return engine->Submit(LaneCp().submit_id, index_args, auto_args, m_ctx, m_ucfg, m_sh_ctx);
 }
 
 void CommandProcessor::DrainPreparedDraws() {
@@ -1519,8 +1519,8 @@ static bool OptionalSubmitAllowed() {
 
 void CommandProcessor::BufferFlush() {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	m_deferred_eop_flushes     = 0;
-	m_packets_since_eop_request = 0;
+	LaneCp().deferred_eop_flushes     = 0;
+	LaneCp().packets_since_eop_request = 0;
 	if (SubmitMinIntervalNs() != 0) {
 		g_last_submit_ns = CpNowNs();
 	}
@@ -1571,7 +1571,7 @@ uint32_t CommandProcessor::EopFlushPacketLimit() {
 }
 
 void CommandProcessor::BufferFlushForEop() {
-	if (++m_deferred_eop_flushes >= static_cast<uint32_t>(g_eop_flush_batch.Get()) && OptionalSubmitAllowed()) {
+	if (++LaneCp().deferred_eop_flushes >= static_cast<uint32_t>(g_eop_flush_batch.Get()) && OptionalSubmitAllowed()) {
 		BufferFlush();
 	}
 }
@@ -1610,22 +1610,22 @@ void CommandProcessor::MaybeFlushIdleGpu() {
 	}
 	auto&      scheduler = GetScheduler();
 	const auto current   = scheduler.CurrentTick();
-	if (current != m_idle_flush_tick) {
+	if (current != LaneCp().idle_flush_tick) {
 		// Something else submitted since the last count: restart the bound.
-		m_idle_flush_tick  = current;
-		m_idle_flush_draws = 0;
+		LaneCp().idle_flush_tick  = current;
+		LaneCp().idle_flush_draws = 0;
 	}
-	if (++m_idle_flush_draws < min_draws) {
+	if (++LaneCp().idle_flush_draws < min_draws) {
 		return;
 	}
 	const bool in_pass = CurrentBuffer().ActiveRenderingSerial() != 0;
-	if (in_pass && m_idle_flush_draws < min_draws * 4u) {
+	if (in_pass && LaneCp().idle_flush_draws < min_draws * 4u) {
 		return;
 	}
 	auto& master = scheduler.GetMasterSemaphore();
 	if (master.KnownGpuTick() + 1u < current) {
 		// Refresh the timeline value only every few draws (a driver query).
-		if ((m_idle_flush_draws % 4u) != 0) {
+		if ((LaneCp().idle_flush_draws % 4u) != 0) {
 			return;
 		}
 		master.Refresh();
@@ -1664,7 +1664,7 @@ void CommandProcessor::MaybeYieldSlice() {
 	    g_gpu_state == nullptr || g_current_processor != this) {
 		return;
 	}
-	if (++m_slice_draws < limit || (m_slice_draws % limit) != 0) {
+	if (++LaneCp().slice_draws < limit || (LaneCp().slice_draws % limit) != 0) {
 		return;
 	}
 	if (!g_gpu_state->HasRunnableComputeWork()) {
@@ -2623,7 +2623,7 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		SyncEpoch::AdvanceSubmission();
 		submission.started = true;
 		PaceLog::NoteCpSubmission(submission.pace_enqueue_ns, submission.reset_processor);
-		cp.SetSubmitId(++m_submit_id);
+		cp.SetSubmitId(++m_submit_id, submission.cp_par_context); // Astro Bot PC (2b: its lane)
 		// The frame fence's ordering point: the sequencer reads a fenced submission's command
 		// bytes only from here on.
 		m_sequencer->NoteStarted(submission.sequence);
@@ -2781,7 +2781,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	execution.m_made_progress = false;
 	execution.m_yield         = false;
 	execution.m_yielded       = false;
-	m_slice_draws             = 0;
+	LaneCp().slice_draws             = 0;
 	// The draw-prep packet hook, decided once per slice instead of per packet: with draw prep on
 	// it is on for the process (PacketHookEnabled); only the Tracy-gated fence histogram of draw
 	// prep off can change, and it now follows a connection at the next slice.
@@ -2927,7 +2927,7 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 			           ? packet[i]
 			           : 0u;
 		};
-		HangWatchdog::NotePacket(q, m_submit_id, guest_packet, packet_header, word(1), word(2),
+		HangWatchdog::NotePacket(q, LaneCp().submit_id, guest_packet, packet_header, word(1), word(2),
 		                         word(3), word(4));
 	}
 
@@ -3078,8 +3078,8 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	CountPacket(execution, packet, packet_dw, execution.m_packets, execution.m_packets_hash,
 	            guest_packet);
 	TrackAdoptPacket(packet, packet_dw, guest_packet);
-	if (!reference && !sequencer && m_deferred_eop_flushes != 0 &&
-	    ++m_packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
+	if (!reference && !sequencer && LaneCp().deferred_eop_flushes != 0 &&
+	    ++LaneCp().packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
 		// Bound how long a batched end-of-pipe interrupt can wait inside a long slice.
 		BufferFlush();
 	}
@@ -3511,7 +3511,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 		// Thread mode: the sequencer published the draw; commit its prepared slot now, in order.
 		const NativeLeanScope native_lean(m_renderer.GetRenderExecutor(), op.flags, m_native_lean_op);
 		ResolvePrep()->CommitPublished(
-		    op.window, m_submit_id,
+		    op.window, LaneCp().submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
 		MaybeYieldSlice();
 		CommitStats::StepMark(CommitStats::Step::GapRetire);
@@ -3535,7 +3535,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 		(void)RepeatTrace::TakeDrawPacket();
 		RepeatTrace::OnUnpreparedDraw();
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	m_renderer.GetRenderExecutor().DrawIndex(LaneCp().submit_id, CurrentBuffer(), args);
 	MaybeFlushIdleGpu();
 	MaybeYieldSlice();
 }
@@ -3670,7 +3670,7 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 		}
 	}
 
-	if (!m_renderer.GetRenderExecutor().DrawIndirectNative(m_submit_id, CurrentBuffer(), source)) {
+	if (!m_renderer.GetRenderExecutor().DrawIndirectNative(LaneCp().submit_id, CurrentBuffer(), source)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallback);
 		return false;
 	}
@@ -4046,7 +4046,7 @@ void CommandProcessor::ExecDispatchDirect(const CpSeq::DispatchDirectOp& op) {
 				     " groups=%ux%ux%u local=%ux%ux%u mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64
 				     " oa_index=%u oa_enabled=%s oa_addr=0x%04" PRIx32 " oa_space=0x%08" PRIx32
 				     "\n",
-				     frame_num, m_submit_id, thread_group_x, thread_group_y, thread_group_z,
+				     frame_num, LaneCp().submit_id, thread_group_x, thread_group_y, thread_group_z,
 				     std::max(cs.num_thread_x, 1u), std::max(cs.num_thread_y, 1u),
 				     std::max(cs.num_thread_z, 1u), mode, static_cast<uint32_t>(cs.wave_size),
 				     cs.data_addr, user_config.GetGdsOaState().GetIndex(),
@@ -4059,7 +4059,7 @@ void CommandProcessor::ExecDispatchDirect(const CpSeq::DispatchDirectOp& op) {
 			RepeatTrace::OnDispatch(static_cast<uint32_t>(m_interrupt_event_id), shaders.GetCs(),
 			                        thread_group_x, thread_group_y, thread_group_z, mode);
 		}
-		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, command, thread_group_x,
+		m_renderer.GetRenderExecutor().DispatchDirect(LaneCp().submit_id, command, thread_group_x,
 		                                              thread_group_y, thread_group_z, mode,
 		                                              IsAsyncComputeQueue());
 		MaybeFlushIdleGpu();
@@ -4119,7 +4119,7 @@ void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op)
 		ExecDispatchDirect(direct);
 		return;
 	}
-	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), op.args_addr,
+	m_renderer.GetRenderExecutor().DispatchIndirect(LaneCp().submit_id, CurrentBuffer(), op.args_addr,
 	                                                op.mode, IsAsyncComputeQueue());
 	MaybeFlushIdleGpu();
 }
@@ -4187,7 +4187,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
 		const NativeLeanScope native_lean(m_renderer.GetRenderExecutor(), op.flags, m_native_lean_op);
 		ResolvePrep()->CommitPublished(
-		    op.window, m_submit_id,
+		    op.window, LaneCp().submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
 		MaybeYieldSlice();
 		CommitStats::StepMark(CommitStats::Step::GapRetire);
@@ -4205,7 +4205,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 		(void)RepeatTrace::TakeDrawPacket();
 		RepeatTrace::OnUnpreparedDraw();
 	}
-	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	m_renderer.GetRenderExecutor().DrawAuto(LaneCp().submit_id, CurrentBuffer(), args);
 	MaybeFlushIdleGpu();
 	MaybeYieldSlice();
 }
@@ -4722,9 +4722,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		if (TryDeferLabel(dst, data, sizeof(data), with_interrupt, interrupt_context_id)) {
 			// The deferred write raises the interrupt itself, after the label is visible.
 			if (with_writeback) {
-				Sync::WriteAtEndOfPipeWithWriteBack32(m_submit_id, command, dst, data);
+				Sync::WriteAtEndOfPipeWithWriteBack32(LaneCp().submit_id, command, dst, data);
 			} else {
-				Sync::WriteAtEndOfPipe32(m_submit_id, command, dst, data);
+				Sync::WriteAtEndOfPipe32(LaneCp().submit_id, command, dst, data);
 			}
 			return;
 		}
@@ -4744,17 +4744,17 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 
 		if (with_interrupt) {
 			if (with_writeback) {
-				Sync::WriteAtEndOfPipeWithInterruptWriteBack32(m_submit_id, command, dst,
+				Sync::WriteAtEndOfPipeWithInterruptWriteBack32(LaneCp().submit_id, command, dst,
 				                                               data, m_interrupt_event_id,
 				                                               interrupt_context_id);
 			} else {
-				Sync::WriteAtEndOfPipeWithInterrupt32(m_submit_id, command, dst, data,
+				Sync::WriteAtEndOfPipeWithInterrupt32(LaneCp().submit_id, command, dst, data,
 				                                      m_interrupt_event_id, interrupt_context_id);
 			}
 		} else if (with_writeback) {
-			Sync::WriteAtEndOfPipeWithWriteBack32(m_submit_id, command, dst, data);
+			Sync::WriteAtEndOfPipeWithWriteBack32(LaneCp().submit_id, command, dst, data);
 		} else {
-			Sync::WriteAtEndOfPipe32(m_submit_id, command, dst, data);
+			Sync::WriteAtEndOfPipe32(LaneCp().submit_id, command, dst, data);
 		}
 	};
 
@@ -4766,7 +4766,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					Profiler::CountFrameEvent(Profiler::FrameEvent::GdsEopReads);
 					if (TryDeferGdsRead(dst, value & 0xffffu, value >> 16u, with_interrupt,
 					                    interrupt_context_id)) {
-						Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
+						Sync::WriteAtEndOfPipeGds32(LaneCp().submit_id, command, dst, value & 0xffffu,
 						                            value >> 16u);
 						return;
 					}
@@ -4777,7 +4777,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					              value >> 16u);
 					NoteCpWrite(reinterpret_cast<uint64_t>(dst), uint64_t {value >> 16u} * 4u);
 					TraceCpLabel("label-gds", dst, *dst, value >> 16u);
-					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
+					Sync::WriteAtEndOfPipeGds32(LaneCp().submit_id, command, dst, value & 0xffffu,
 					                            value >> 16u);
 					if (with_interrupt) {
 						m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
@@ -4814,10 +4814,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					                  interrupt_context_id, timestamp_slot)) {
 						// The deferred write raises the interrupt itself, after the label.
 						if (with_writeback) {
-							Sync::WriteAtEndOfPipeWithWriteBack64(m_submit_id, command, dst,
+							Sync::WriteAtEndOfPipeWithWriteBack64(LaneCp().submit_id, command, dst,
 							                                      value);
 						} else {
-							Sync::WriteAtEndOfPipe64(m_submit_id, command, dst, value);
+							Sync::WriteAtEndOfPipe64(LaneCp().submit_id, command, dst, value);
 						}
 						return;
 					}
@@ -4838,18 +4838,18 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					if (with_interrupt) {
 						if (with_writeback) {
 							Sync::WriteAtEndOfPipeWithInterruptWriteBack64(
-							    m_submit_id, command, dst, value, m_interrupt_event_id,
+							    LaneCp().submit_id, command, dst, value, m_interrupt_event_id,
 							    interrupt_context_id);
 						} else {
-							Sync::WriteAtEndOfPipeWithInterrupt64(m_submit_id, command, dst,
+							Sync::WriteAtEndOfPipeWithInterrupt64(LaneCp().submit_id, command, dst,
 							                                      value, m_interrupt_event_id,
 							                                      interrupt_context_id);
 						}
 					} else if (with_writeback) {
-						Sync::WriteAtEndOfPipeWithWriteBack64(m_submit_id, command, dst,
+						Sync::WriteAtEndOfPipeWithWriteBack64(LaneCp().submit_id, command, dst,
 						                                      value);
 					} else {
-						Sync::WriteAtEndOfPipe64(m_submit_id, command, dst, value);
+						Sync::WriteAtEndOfPipe64(LaneCp().submit_id, command, dst, value);
 					}
 				};
 
@@ -5313,7 +5313,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			auto& command = CurrentBuffer();
 			auto  request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 			                                          flip.flip_mode, flip.flip_arg);
-			Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, flip.handle, flip.index,
+			Sync::WriteAtEndOfPipeOnlyFlip(LaneCp().submit_id, command, flip.handle, flip.index,
 			                               flip.flip_mode, flip.flip_arg, request);
 			GetScheduler().Flush();
 			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); // the frame boundary: live switches (KYTY_LIVE_FILE)
@@ -5338,7 +5338,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			}
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 			                                         flip.flip_mode, flip.flip_arg);
-			Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command,
+			Sync::WriteAtEndOfPipeWithFlip32(LaneCp().submit_id, command,
 			                                 static_cast<uint32_t*>(dst_gpu_addr), value,
 			                                 flip.handle, flip.index, flip.flip_mode,
 			                                 flip.flip_arg, request);
@@ -5370,7 +5370,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 				// The deferred label raises the flip's interrupt after its write.
 				auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 				                                         flip.flip_mode, flip.flip_arg);
-				Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command,
+				Sync::WriteAtEndOfPipeWithFlip32(LaneCp().submit_id, command,
 				                                 static_cast<uint32_t*>(dst_gpu_addr), value,
 				                                 flip.handle, flip.index, flip.flip_mode,
 				                                 flip.flip_arg, request);
@@ -5384,7 +5384,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 			                                         flip.flip_mode, flip.flip_arg);
 			Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
-			    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, flip.handle,
+			    LaneCp().submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, flip.handle,
 			    flip.index, flip.flip_mode, flip.flip_arg, request, m_interrupt_event_id);
 			GetScheduler().Flush();
 			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
@@ -7585,10 +7585,10 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 		bool       suspended       = false; // Astro Bot PC (KYTY_CP_PAR=1b4): a wait that did not pass
 		const auto saved_packets   = m_resolver_packets;
 		const auto saved_retry     = m_retry_op;
-		const auto saved_submit_id = m_submit_id;
+		const auto saved_submit_id = LaneCp().submit_id;
 		m_resolver_packets         = run.resolver_packets;
 		m_retry_op                 = run.retry_op;
-		m_submit_id                = run.submit_id;
+		LaneCp().submit_id                = run.submit_id;
 		CpPar::t_overlay           = true;
 		const auto  sequence       = view.header->sequence;
 		const auto  packet         = view.header->packet;
@@ -7695,10 +7695,10 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 		}
 		run.resolver_packets = m_resolver_packets;
 		run.retry_op         = m_retry_op;
-		run.submit_id        = m_submit_id;
+		run.submit_id        = LaneCp().submit_id;
 		m_resolver_packets   = saved_packets;
 		m_retry_op           = saved_retry;
-		m_submit_id          = saved_submit_id;
+		LaneCp().submit_id          = saved_submit_id;
 		if (suspended) {
 			CpParLogStop(Promotion::ForeignWait, kind, submission, view.As<CpSeq::WaitRegMemOp>().addr,
 			             "executed, did not pass (suspended)"); // Astro Bot PC (KYTY_CP_PAR=1b5)
@@ -7751,7 +7751,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 	execution.m_yield         = false;
 	execution.m_yielded       = false;
 	execution.m_stream_id     = submission;
-	m_slice_draws             = 0;
+	LaneCp().slice_draws             = 0;
 	struct Scope {
 		Scope(CommandProcessor& processor, Pm4Execution& execution)
 		    : previous_processor(g_current_processor), previous_execution(g_current_execution) {
@@ -7945,10 +7945,10 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			SyncEpoch::Advance();
 		}
 		if (packet > m_resolver_packets) {
-			if (m_deferred_eop_flushes != 0) {
-				m_packets_since_eop_request +=
+			if (LaneCp().deferred_eop_flushes != 0) {
+				LaneCp().packets_since_eop_request +=
 				    static_cast<uint32_t>(std::min<uint64_t>(packet - m_resolver_packets, 1u << 20u));
-				if (m_packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
+				if (LaneCp().packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
 					// Bound how long a batched end-of-pipe interrupt waits (at an op, not a packet).
 					BufferFlush();
 				}

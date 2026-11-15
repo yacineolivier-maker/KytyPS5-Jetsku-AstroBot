@@ -129,6 +129,8 @@ inline size_t LaneIndex(uint32_t context) noexcept {
 }
 // The lane taking the token at the hand-off in progress (CpPar::HandoffTarget).
 std::atomic<uint32_t> g_handoff_target {0};
+// Astro Bot PC (KYTY_CP_PAR=2b): the lane whose request Thread_Gpu is serving (UINT32_MAX: none).
+thread_local uint32_t t_serving_lane = UINT32_MAX;
 thread_local bool t_busy      = false; // Astro Bot PC (KYTY_CP_PAR=1b3): NoteBusy's last state
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): image state bookkeeping (cpParallel.h). An image's state is a
@@ -220,7 +222,9 @@ public:
 				auto*      request_argument = m_request_argument;
 				lock.unlock();
 				Take();
+				t_serving_lane = m_lane; // Astro Bot PC (2b: EffectiveLane)
 				request(request_argument);
+				t_serving_lane = UINT32_MAX;
 				GiveToLane();
 				lock.lock();
 				m_state = State::Slice;
@@ -918,6 +922,10 @@ uint32_t RequestedLanes() {
 
 uint32_t ThreadLane() noexcept {
 	return t_lane;
+}
+
+uint32_t EffectiveLane() noexcept {
+	return t_serving_lane != UINT32_MAX ? t_serving_lane : t_lane;
 }
 
 uint32_t HandoffTarget() noexcept {

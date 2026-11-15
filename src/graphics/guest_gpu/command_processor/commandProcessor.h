@@ -8,7 +8,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "loader/gameCapture.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR=2b)
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <deque>
@@ -243,8 +245,12 @@ public:
 
 	void SetFlip(const FlipInfo& flip) { m_flip = flip; }
 
-	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
-	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
+	[[nodiscard]] uint64_t GetSubmitId() const { return LaneCp().submit_id; }
+	// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): `lane` is the submission's lane (2b only; the
+	// state of the other modes is lane 0's).
+	void SetSubmitId(uint64_t submit_id, uint32_t lane = 0) {
+		m_lane_cp[CpPar::Lanes2b() ? std::min<uint32_t>(lane, 3u) : 0u].submit_id = submit_id;
+	}
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 	[[nodiscard]] FrontMode GetFrontMode() const noexcept { return m_front_mode; }
@@ -521,20 +527,32 @@ private:
 
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
-	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
-	uint32_t  m_deferred_eop_flushes        = 0;
-	uint32_t  m_packets_since_eop_request   = 0;
 	// A visibility-proxy end dump was recorded: defer the next end-of-pipe label (defer-label).
 	bool      m_defer_next_label            = false;
 	// The current WAIT_FLIP_DONE packet already flushed and suspended (retries skip the flush).
 	bool      m_flip_wait_suspended         = false;
-	// MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far.
-	uint64_t  m_idle_flush_tick             = 0;
-	uint32_t  m_idle_flush_draws            = 0;
-	// Draws recorded in the current graphics slice (MaybeYieldSlice).
-	uint32_t  m_slice_draws                 = 0;
+	// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): the resolver state kept from one op to the next,
+	// per lane in 2b (index: CpPar::EffectiveLane(), the lane whose op runs on the calling thread,
+	// also while Thread_Gpu serves a lane's request); always [0] in the other modes (unchanged).
+	//  submit_id; deferred end-of-pipe flushes and packets since the first request;
+	//  MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far;
+	//  draws recorded in the current graphics slice (MaybeYieldSlice).
+	struct LaneCpState {
+		uint64_t submit_id                 = 0;
+		uint32_t deferred_eop_flushes      = 0;
+		uint32_t packets_since_eop_request = 0;
+		uint64_t idle_flush_tick           = 0;
+		uint32_t idle_flush_draws          = 0;
+		uint32_t slice_draws               = 0;
+	};
+	std::array<LaneCpState, 4> m_lane_cp {};
+	[[nodiscard]] static uint32_t LaneCpIndex() noexcept {
+		return CpPar::Lanes2b() ? std::min<uint32_t>(CpPar::EffectiveLane(), 3u) : 0u;
+	}
+	[[nodiscard]] LaneCpState&       LaneCp() noexcept { return m_lane_cp[LaneCpIndex()]; }
+	[[nodiscard]] const LaneCpState& LaneCp() const noexcept { return m_lane_cp[LaneCpIndex()]; }
 
 	struct DrawPrepDeleter {
 		void operator()(DrawPrep::Engine* engine) const noexcept;
@@ -551,6 +569,11 @@ private:
 	std::array<std::unique_ptr<DrawPrep::Engine, DrawPrepDeleter>, 4> m_draw_prep_more;
 	uint32_t                                                           m_emit_lane    = 0;
 	uint32_t                                                           m_resolve_lane = 0;
+	// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): in 2b a lane resolves only its own context, so the
+	// resolving lane is the calling thread's effective lane (not a shared field).
+	[[nodiscard]] uint32_t ResolveLaneIndex() const noexcept {
+		return CpPar::Lanes2b() ? CpPar::EffectiveLane() : m_resolve_lane;
+	}
 	[[nodiscard]] DrawPrep::Engine* LanePrep(uint32_t context) const noexcept {
 		return context == 1 ? m_draw_prep_b.get() : (context >= 2 && context < 4 ? m_draw_prep_more[context].get() : nullptr);
 	}
