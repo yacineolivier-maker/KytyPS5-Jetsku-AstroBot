@@ -6335,6 +6335,11 @@ bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
 	if (auto* ring = lane_ring != nullptr ? lane_ring : m_ops.get(); ring != m_emit_ops) {
 		ring->SetNextSequence(m_emit_ops->Emitted());
 		m_emit_ops = ring;
+		if (CpPar::Lanes2b()) {
+			// Astro Bot PC (KYTY_CP_PAR=2b, morceau (a)): the sequencer's executed-op position
+			// becomes per lane (cpSequencer.h).
+			sequencer.NoteLaneRun(lane_ring != nullptr ? intake.context : 0u, ring->Emitted());
+		}
 		if (CpPar::SeparateWindows()) {
 			// Astro Bot PC (KYTY_CP_PAR=1b1): the draws and snapshots of this submission go to its
 			// context's window and ring, with that context's pending-op lists (speculative slots
@@ -7766,6 +7771,8 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		Pm4Execution*     previous_execution;
 	} scope(*this, execution);
 	auto& sequencer = *m_sequencer;
+	// Astro Bot PC (KYTY_CP_PAR=2b, morceau (a)): the ring of this context (per-lane position).
+	const uint32_t executed_lane = CpPar::Lanes2b() ? context : CpSeq::Sequencer::NoLane;
 	// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): Thread_Gpu is busy here (overlap statistics);
 	// a submission the run-ahead started continues from its resolver state.
 	const bool concurrent = CpPar::Concurrent();
@@ -7904,7 +7911,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				m_verifier->Detach();
 			}
 			ops.Pop();
-			sequencer.NoteExecuted(sequence + 1u);
+			sequencer.NoteExecuted(sequence + 1u, executed_lane);
 			continue;
 		}
 		if (kind == CpSeq::OpKind::StreamEnd) {
@@ -7914,7 +7921,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				m_verifier->Finish();
 			}
 			ops.Pop();
-			sequencer.NoteExecuted(sequence + 1u);
+			sequencer.NoteExecuted(sequence + 1u, executed_lane);
 			execution.m_made_progress = true;
 			if (concurrent && g_cp_par_run.offered && g_cp_par_run.oldest == submission) {
 				// Astro Bot PC (KYTY_CP_PAR=1b3): the merge point of the run-ahead (cpParallel.h).
@@ -7934,7 +7941,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		if (kind == CpSeq::OpKind::Handoff) {
 			EXIT_IF(view.As<CpSeq::HandoffOp>().submission != submission);
 			ops.Pop();
-			sequencer.NoteExecuted(sequence + 1u);
+			sequencer.NoteExecuted(sequence + 1u, executed_lane);
 			handoff = true;
 			return Pm4ProcessResult::Complete;
 		}
@@ -7943,7 +7950,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			EXIT_IF(ResolvePrep() == nullptr);
 			ResolvePrep()->SkipPublished(view.As<CpSeq::SkipSlotsOp>().count);
 			ops.Pop();
-			sequencer.NoteExecuted(sequence + 1u);
+			sequencer.NoteExecuted(sequence + 1u, executed_lane);
 			execution.m_made_progress = true;
 			continue;
 		}
@@ -8058,7 +8065,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		if (CpSeq::IsLockstep(kind)) {
 			sequencer.Answer(sequence, result.value);
 		}
-		sequencer.NoteExecuted(sequence + 1u);
+		sequencer.NoteExecuted(sequence + 1u, executed_lane);
 		execution.m_made_progress = true;
 		if (execution.m_yield) {
 			execution.m_yield   = false;

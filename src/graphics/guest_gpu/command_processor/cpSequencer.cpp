@@ -122,7 +122,23 @@ void Sequencer::Answer(uint64_t op_sequence, uint64_t value) {
 	Bump();
 }
 
-void Sequencer::NoteExecuted(uint64_t next_op) {
+void Sequencer::NoteExecuted(uint64_t next_op, uint32_t lane) {
+	if (lane < MaxContexts) {
+		// Astro Bot PC (KYTY_CP_PAR=2b, morceau (a)): the lane's position first (seq_cst, like
+		// the global word below). A parked sequencer is woken once the per-lane minimum reaches
+		// its threshold (computed here only while it is parked).
+		m_lane_next[lane].store(next_op, std::memory_order_seq_cst);
+		if (m_lane_positions.load(std::memory_order_acquire)) {
+			m_executed.store(next_op, std::memory_order_seq_cst);
+			if (m_parked.load(std::memory_order_seq_cst) != 0) {
+				const auto wake_at = m_wake_at.load(std::memory_order_seq_cst);
+				if (wake_at == 0 || (wake_at != UINT64_MAX && LaneExecuted() >= wake_at)) {
+					Bump();
+				}
+			}
+			return;
+		}
+	}
 	// Only a parked sequencer needs the bump (a spinning one reads the words directly). The
 	// seq_cst store keeps the load of m_parked after it: either the sequencer's re-check after
 	// announcing itself sees the new value, or this thread sees the announcement.
@@ -131,6 +147,50 @@ void Sequencer::NoteExecuted(uint64_t next_op) {
 	    next_op >= m_wake_at.load(std::memory_order_seq_cst)) {
 		Bump();
 	}
+}
+
+// Astro Bot PC (KYTY_CP_PAR=2b, morceau (a), cpSequencer.h).
+void Sequencer::NoteLaneRun(uint32_t lane, uint64_t start) {
+	EXIT_IF(lane >= MaxContexts);
+	{
+		std::lock_guard lock(m_lane_mutex);
+		if (m_lane_runs.empty()) {
+			// Until now every op went to context A's ring (from op 0), executed in order.
+			m_lane_runs.push_back({0, 0});
+		}
+		EXIT_IF(start < m_lane_runs.back().start);
+		if (m_lane_runs.back().start == start) {
+			m_lane_runs.back().lane = lane; // the previous run is empty
+		} else if (m_lane_runs.back().lane != lane) {
+			m_lane_runs.push_back({lane, start});
+		}
+	}
+	m_lane_positions.store(true, std::memory_order_release);
+}
+
+uint64_t Sequencer::LaneExecuted() const noexcept {
+	// The first op of the oldest run its lane has not finished (runs are in op order, so every op
+	// before it has executed); every run finished: the last executed op's successor.
+	// Self-check: read before the lane positions (stored after them), the former counter (the
+	// last op's successor, whichever lane) can only be below the result unless a later list's op
+	// executed before an earlier list finished: never in turn (counted, "seq position below").
+	const auto      former = m_executed.load(std::memory_order_seq_cst);
+	std::lock_guard lock(m_lane_mutex);
+	while (!m_lane_runs.empty()) {
+		const auto& run  = m_lane_runs.front();
+		const auto  next = m_lane_next[run.lane].load(std::memory_order_seq_cst);
+		const bool  last = m_lane_runs.size() == 1;
+		const auto  end  = last ? UINT64_MAX : m_lane_runs[1].start;
+		if (next < end) {
+			const auto position = std::max(next, run.start);
+			if (position < former) {
+				CpPar::NoteLaneStat(run.lane, CpPar::LaneStat::SeqPositionBelow, 1);
+			}
+			return position;
+		}
+		m_lane_runs.pop_front();
+	}
+	return m_executed.load(std::memory_order_seq_cst);
 }
 
 void Sequencer::NoteHandoffDone(uint64_t submission) {

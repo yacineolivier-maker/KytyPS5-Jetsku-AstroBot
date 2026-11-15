@@ -1435,7 +1435,7 @@ void MaybeReport() {
 			              "violations %" PRIu64 ", early retires avoided %" PRIu64
 			              "; lane lock %" PRIu64 " takes, %.1f ms waiting, %.1f ms held, bounces "
 			              "under it %" PRIu64 " (delegated takes %" PRIu64 "); occlusion early batches %"
-			              PRIu64 ", dumps outside the lock %" PRIu64,
+			              PRIu64 ", dumps outside the lock %" PRIu64 "; seq position below %" PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
 			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs),
 			              n(LaneStat::SubmitTurnWaits), ms(LaneStat::SubmitTurnNs),
@@ -1444,7 +1444,8 @@ void MaybeReport() {
 			              n(LaneStat::OrderViolations), n(LaneStat::EarlyRetires),
 			              n(LaneStat::LockTakes), ms(LaneStat::LockWaitNs), ms(LaneStat::LockHoldNs),
 			              n(LaneStat::LockedBounces), n(LaneStat::LockDelegated),
-			              n(LaneStat::OcclusionRebatches), n(LaneStat::OcclusionUnlocked));
+			              n(LaneStat::OcclusionRebatches), n(LaneStat::OcclusionUnlocked),
+			              n(LaneStat::SeqPositionBelow));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());

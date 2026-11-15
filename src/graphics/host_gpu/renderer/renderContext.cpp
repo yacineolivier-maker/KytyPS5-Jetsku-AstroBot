@@ -56,6 +56,12 @@ void FlushOtherProcessorsStores() {
 } // namespace
 
 void RenderMutex::BecomeOwner() {
+	if (CpPar::Lanes2b()) {
+		// Astro Bot PC (KYTY_CP_PAR=2b, morceau (a)): no owner at all; every Lock() goes through
+		// RequesterLock, a plain (re-entrant) mutex: the asymmetric fast path only makes sense with
+		// one translating thread, and lanes will overlap (decided before Thread_Gpu starts).
+		return;
+	}
 	EXIT_IF(t_owner);
 	m_mutex.Lock(); // no requester inside: a later one finds the owner
 	m_owner_exists = true;
@@ -67,6 +73,9 @@ void RenderMutex::BecomeOwner() {
 }
 
 void RenderMutex::ResignOwner() {
+	if (CpPar::Lanes2b()) {
+		return; // Astro Bot PC (KYTY_CP_PAR=2b, morceau (a)): see BecomeOwner
+	}
 	EXIT_IF(!t_owner || m_owner_depth != 0);
 	m_mutex.Lock();
 	t_owner        = false;

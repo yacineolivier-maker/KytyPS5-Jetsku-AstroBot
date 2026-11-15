@@ -172,6 +172,24 @@ vidages faits hors verrou en 2b (à surveiller : une course une fois les voies s
 mêmes requêtes, mêmes lots qu'avant (la passation vide déjà le lot de la voie qui finit), mais chaque voie
 utilise son propre pool.
 
+**(a) `RenderMutex` sans propriétaire, position du séquenceur par voie.** En 2b, `BecomeOwner`/`ResignOwner` ne
+font plus rien (2b est décidé dans le constructeur de `GuestGpu`, avant le démarrage de Thread_Gpu) : tout
+`Lock()` passe par `RequesterLock`, mutex ordinaire ré-entrant. Sans `KYTY_RENDER_LOCK_ASYMMETRIC=1` (absent du
+préréglage U59), le propriétaire prenait déjà ce mutex à chaque prise : même coût. Séquenceur
+(`cpSequencer.{h,cpp}`) : `NoteExecuted(next_op, lane)` (voie = contexte de l'anneau, passée seulement en 2b)
+garde la position de chaque voie ; `NoteLaneRun(lane, start)`, appelé par le fil du séquenceur à chaque
+changement d'anneau, note les séries d'opérations consécutives émises dans un même anneau. `Executed()` devient
+la première opération (numérotation globale) que sa voie n'a pas encore exécutée : première série non terminée
+par sa voie, `max(position de la voie, début de la série)` (la passation demandait « minimum sur les voies en
+attente » ; le minimum brut des positions serait faux : une voie inactive garde la position de la fin de sa
+série précédente, plus petite que tout ce qui est en cours, ce qui pouvait bloquer le séquenceur). À tour de rôle
+c'est exactement l'ancien compteur. Le réveil d'un séquenceur garé calcule ce minimum (sous un petit mutex,
+seulement quand il est garé). Auto-contrôle : « seq position below » (ligne 2b) compte les fois où la position
+par voie est sous l'ancien compteur (une liste plus récente aurait exécuté avant la fin d'une plus ancienne) :
+**0 attendu à tour de rôle**. Les seuils d'attente du séquenceur (écritures en attente, fenêtres, instantanés)
+restent globaux.
+
+
 
 ### Variables pour l'essai en jeu
 

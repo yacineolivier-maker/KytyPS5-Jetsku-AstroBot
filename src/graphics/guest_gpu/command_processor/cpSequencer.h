@@ -124,7 +124,15 @@ public:
 	void NoteStarted(uint64_t submission);
 	void Answer(uint64_t op_sequence, uint64_t value);
 	// Every op before `next_op` has executed (and released its snapshot and window slot).
-	void NoteExecuted(uint64_t next_op);
+	// Astro Bot PC (KYTY_CP_PAR=2b, morceau (a)): `lane` (2b only, else NoLane) is the resolver
+	// context whose ring the op came from: then only the ops before `next_op` in that ring.
+	static constexpr uint32_t NoLane = UINT32_MAX;
+	void NoteExecuted(uint64_t next_op, uint32_t lane = NoLane);
+	// Astro Bot PC (KYTY_CP_PAR=2b, morceau (a)), sequencer thread: from op `start` on, the ops go
+	// to context `lane`'s ring (a ring switch). The first call turns on per-lane positions:
+	// Executed() is then the first op, in the global numbering, not yet executed by its lane
+	// (with lanes in turn, exactly the former counter).
+	void NoteLaneRun(uint32_t lane, uint64_t start);
 	void NoteHandoffDone(uint64_t submission);
 	// Astro Bot PC (KYTY_CP_PAR=1b3): a resolver freed window or snapshot slots without moving the
 	// executed-op counter (the run-ahead): a parked sequencer re-checks what it waits for.
@@ -166,6 +174,9 @@ public:
 	// The result of lockstep op `op_sequence` (waits for it).
 	[[nodiscard]] uint64_t AwaitAnswer(uint64_t op_sequence);
 	[[nodiscard]] uint64_t Executed() const noexcept {
+		if (m_lane_positions.load(std::memory_order_acquire)) {
+			return LaneExecuted(); // Astro Bot PC (KYTY_CP_PAR=2b, morceau (a))
+		}
 		return m_executed.load(std::memory_order_seq_cst);
 	}
 	// Lockstep op `op_sequence` has been answered (P3c: the speculative parse polls it).
@@ -198,6 +209,7 @@ private:
 		bool (*m_call)(void*);
 	};
 	bool WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewake_at);
+	[[nodiscard]] uint64_t LaneExecuted() const noexcept;
 	void Bump() noexcept;
 	void Run();
 
@@ -223,6 +235,18 @@ private:
 	uint64_t              m_answer_value = 0;
 	std::atomic<uint64_t> m_started {0};
 	std::atomic<uint64_t> m_handoff_done {0};
+	// Astro Bot PC (KYTY_CP_PAR=2b, morceau (a)): per context, the op after the last one its
+	// resolver executed; the runs of consecutive ops emitted into one ring (lane, first op), in
+	// emission order (a run ends where the next one starts; the last one is open), the fully
+	// executed ones dropped from the front by LaneExecuted.
+	struct LaneRun {
+		uint32_t lane  = 0;
+		uint64_t start = 0;
+	};
+	std::atomic<bool>                                 m_lane_positions {false};
+	std::array<std::atomic<uint64_t>, MaxContexts>    m_lane_next {};
+	mutable std::mutex                                m_lane_mutex;
+	mutable std::deque<LaneRun>                       m_lane_runs;
 };
 
 // Thread-mode switches (read once).

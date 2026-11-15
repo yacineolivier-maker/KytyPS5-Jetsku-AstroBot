@@ -533,6 +533,7 @@ enum class LaneStat : uint32_t {
 	LockDelegated,    //       Thread_Gpu re-took the lock as the delegated holder while serving it
 	OcclusionRebatches, // morceau (b): a lane's occlusion batch reduced early (another lane's slots in between)
 	OcclusionUnlocked,  //       an occlusion dump outside the lanes' global lock
+	SeqPositionBelow,   // morceau (a): the sequencer's per-lane position below the former global counter
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

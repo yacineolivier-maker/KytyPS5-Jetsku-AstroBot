@@ -49,7 +49,8 @@ public:
 	KYTY_CLASS_NO_COPY(RenderMutex);
 
 	// The calling thread (the GPU thread) takes the owner's side from now on, until it resigns
-	// (outside any acquisition).
+	// (outside any acquisition). Astro Bot PC (KYTY_CP_PAR=2b): both are no-ops (no owner; a
+	// plain mutex for every thread).
 	void BecomeOwner();
 	void ResignOwner();
 
