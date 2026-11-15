@@ -1171,7 +1171,7 @@ void TextureCache::DeleteImage(ImageId id) {
 			retiring_bytes = m_graphics.NativeImageBytes(image->backing);
 			m_pressure_retirement_bytes += retiring_bytes;
 		}
-		m_scheduler.DeferOperation([this, id, retiring_bytes] {
+		m_scheduler.DeferRetire([this, id, retiring_bytes] { // Astro Bot PC (concurrent lanes)
 			m_slot_images.erase(id);
 			NoteImageStateChange();
 			EXIT_IF(retiring_bytes > m_pressure_retirement_bytes);

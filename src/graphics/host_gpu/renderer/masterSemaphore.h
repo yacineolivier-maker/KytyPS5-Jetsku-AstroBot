@@ -81,6 +81,10 @@ public:
 	uint64_t                  BeginRange(uint32_t lane);
 	[[nodiscard]] bool        TryReleaseRange(uint32_t lane);
 	uint64_t                  NextLaneTick(uint32_t lane, bool range_end);
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): lane `lane`'s next tick (its CurrentTick()).
+	[[nodiscard]] uint64_t LaneTick(uint32_t lane) const noexcept {
+		return m_lane_tick[lane < MaxRangeLanes ? lane : MaxRangeLanes - 1].load(std::memory_order_acquire);
+	}
 	void SetOldestLane(uint32_t lane) noexcept { m_oldest_lane.store(lane, std::memory_order_relaxed); }
 	static void SetThreadTickLane(uint32_t lane) noexcept { t_tick_lane = lane; }
 	[[nodiscard]] static uint32_t ThreadTickLane() noexcept { return t_tick_lane; }

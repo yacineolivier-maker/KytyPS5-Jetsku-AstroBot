@@ -1250,7 +1250,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+		m_scheduler.DeferRetire([this, id] { m_slot_buffers.erase(id); }); // Astro Bot PC (concurrent lanes)
 	} else {
 		m_slot_buffers.erase(id);
 	}

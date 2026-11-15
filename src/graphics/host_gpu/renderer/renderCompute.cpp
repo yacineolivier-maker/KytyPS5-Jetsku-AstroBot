@@ -329,7 +329,7 @@ bool RenderExecutor::BindComputeLds(const ShaderComputeInputInfo& input, Prepare
 		    std::min(std::max(needed, old_size + old_size / 2u), max_regions * region);
 		if (m_compute_lds != nullptr) {
 			// Recorded commands of the current tick may still use the old buffer.
-			scheduler.DeferOperation([old = std::move(m_compute_lds)]() mutable { old.reset(); });
+			scheduler.DeferRetire([old = std::move(m_compute_lds)]() mutable { old.reset(); }); // Astro Bot PC
 		}
 		m_compute_lds = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
 		                                         vk::BufferUsageFlagBits::eStorageBuffer, size);

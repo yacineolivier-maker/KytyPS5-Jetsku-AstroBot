@@ -71,6 +71,13 @@ public:
 	// KYTY_PRIORITY_WAIT_SPIN_US (default 0): first spin that long for the priority runner.
 	void                      WaitPriorityOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, cpParallel.h): DeferOperation for the destruction of an
+	// object several lanes may use (cached buffers and images, shared scratch). With lanes running
+	// at the same time, a younger open segment may already have recorded a use of it at a later
+	// tick than the caller's: the operation is then held with the youngest open segment and queued
+	// at its tick when it becomes the oldest (nothing waits for these operations). Otherwise, and
+	// outside that mode, exactly DeferOperation.
+	void                      DeferRetire(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(
 	    Common::UniqueFunction<void>&& operation,
 	    PriorityOperationKind kind = PriorityOperationKind::Generic);
@@ -355,6 +362,12 @@ private:
 	std::condition_variable                  m_turn_changed;
 
 	std::atomic<uint64_t>                    m_last_submit_tick {0};
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1; m_operation_mutex): each lane's last submitted tick and
+	// the largest tick submitted by the segments ended so far (all older than any open one): Finish
+	// waits for those, not for a younger lane's out-of-turn submit (which the GPU runs only after
+	// the caller's segment ends: waiting for it there would never end).
+	std::array<uint64_t, MaxLanes>           m_lane_last_submit {};
+	uint64_t                                 m_ended_submit_tick = 0;
 	// Astro Bot PC (KYTY_CP_PAR=2b, steps 4-5; m_operation_mutex): the ranges each open segment
 	// (by order) bound and wrote; whether the registry runs.
 	struct LaneRange {

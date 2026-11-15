@@ -573,6 +573,7 @@ enum class LaneStat : uint32_t {
 	VisibleOutOfOrder,  //       ... with an op sequence below the last visible one (0 expected)
 	DependencyHazards,  //       KYTY_CP_PAR_VERIFY: a dependency wait refused (lock held), counted only
 	YoungerServices,    //       services not run by a younger segment (left to the oldest)
+	RetiresHeld,        //       a shared object's retirement held for a younger open segment (DeferRetire)
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

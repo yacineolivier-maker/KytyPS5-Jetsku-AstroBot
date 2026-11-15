@@ -713,6 +713,8 @@ static void TraceCpLabel(const char* kind, const void* dst, uint64_t value, uint
 
 // Astro Bot PC (KYTY_CP_PAR=2b, morceau (d)): defined with the 1b3 run-ahead below.
 static void CpParLaneOverlayAtEnd(CommandScheduler& scheduler, uint32_t lane);
+// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): defined with OptionalSubmitAllowed below.
+static bool CpParYoungerLane(CommandScheduler& scheduler);
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -1049,6 +1051,12 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	if (m_pending_commands.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	if (CpParYoungerLane(m_renderer.GetCommandScheduler())) {
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 5): services touch global states outside
+		// any overlay: a younger lane (inside an op, e.g. a draw-prep wait) leaves them to the oldest.
+		CpPar::NoteLaneStat(CpPar::ThreadLane(), CpPar::LaneStat::YoungerServices, 1);
 		return;
 	}
 	// Astro Bot PC (KYTY_CP_PAR=2b, suite 2): every caller (Thread_Gpu's main loop, draw-prep
@@ -1636,6 +1644,15 @@ static uint64_t SubmitMinIntervalNs() {
 // GPU thread (every command processor runs there): the last submit, with the interval on.
 static uint64_t g_last_submit_ns = 0;
 
+// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 5, cpParallel.h): the calling thread is a lane
+// whose open segment is younger than the oldest one. Such a lane makes no optional submit (idle,
+// end-of-pipe batch, eager readback flushes), never yields its slice and runs no service: each
+// would wait for its turn or end its slice early (then wait for its turn anyway).
+static bool CpParYoungerLane(CommandScheduler& scheduler) {
+	return CpPar::LaneConcurrent() && CpPar::OnResolver2() &&
+	       !scheduler.LaneSegmentOldest(CpPar::ThreadLane());
+}
+
 static bool OptionalSubmitAllowed() {
 	if (CpPar::Concurrent() && CpPar::RunAheadDirty()) {
 		return false; // Astro Bot PC (KYTY_CP_PAR=1b3): deferred while the run-ahead is dirty
@@ -1704,7 +1721,8 @@ uint32_t CommandProcessor::EopFlushPacketLimit() {
 }
 
 void CommandProcessor::BufferFlushForEop() {
-	if (++LaneCp().deferred_eop_flushes >= static_cast<uint32_t>(g_eop_flush_batch.Get()) && OptionalSubmitAllowed()) {
+	if (++LaneCp().deferred_eop_flushes >= static_cast<uint32_t>(g_eop_flush_batch.Get()) && OptionalSubmitAllowed() &&
+	    !CpParYoungerLane(GetScheduler())) {
 		BufferFlush();
 	}
 }
@@ -1728,6 +1746,9 @@ void CommandProcessor::MaybeFlushIdleGpu() {
 		// Astro Bot PC (KYTY_CP_PAR=1b3): no optional submit by the run-ahead, nor while it is
 		// dirty (cpParallel.h); the request stays pending.
 		return;
+	}
+	if (CpParYoungerLane(GetScheduler())) {
+		return; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): no optional submit out of turn
 	}
 	// A draw or dispatch just recorded writes a page the command processor reads back later (e.g.
 	// indirect arguments): submit it now, outside a rendering instance, so that read waits for
@@ -1802,6 +1823,9 @@ void CommandProcessor::MaybeYieldSlice() {
 	}
 	if (!g_gpu_state->HasRunnableComputeWork()) {
 		return;
+	}
+	if (CpParYoungerLane(GetScheduler())) {
+		return; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the oldest lane yields for the compute work
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GfxSliceYields);
 	g_current_execution->m_yield = true;
@@ -7667,6 +7691,58 @@ void GuestGpu::CpParRunAheadTask(void* argument) {
 	g_gpu_thread = false;
 }
 
+// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 5, cpParallel.h): why an op of a lane waits for
+// its turn (the classification of 1b3-1b5, conservative: every op but the "free" ones of 1b3 is
+// visible to the guest or may read GPU data back), or TurnReason::Count for a free op: transport,
+// direct draws and dispatches carrying their registers (snapshot or prepared slot) and not
+// inheriting the instance count (m_num_instances / m_pending_num_instances are written by indirect
+// draws and read by inheriting draws: both run in turn, in list order).
+static CpPar::TurnReason CpParTurnReason(CpSeq::OpKind kind, const void* payload) {
+	using CpPar::TurnReason;
+	using CpSeq::OpKind;
+	switch (kind) {
+		case OpKind::StreamBegin:
+		case OpKind::StreamEnd:
+		case OpKind::SkipSlots: return TurnReason::Count;
+		case OpKind::DrawIndex:
+		case OpKind::DrawAuto: {
+			const auto flags = kind == OpKind::DrawIndex
+			                       ? static_cast<const CpSeq::DrawIndexOp*>(payload)->flags
+			                       : static_cast<const CpSeq::DrawAutoOp*>(payload)->flags;
+			if ((flags & CpSeq::DrawFlagInheritInstances) != 0 ||
+			    (flags & (CpSeq::DrawFlagPublished | CpSeq::DrawFlagSnapshot)) == 0) {
+				return TurnReason::Draw;
+			}
+			return TurnReason::Count;
+		}
+		case OpKind::DispatchDirect:
+			return (static_cast<const CpSeq::DispatchDirectOp*>(payload)->flags &
+			        CpSeq::DispatchFlagSnapshot) != 0
+			           ? TurnReason::Count
+			           : TurnReason::Draw;
+		case OpKind::DrawIndirect:
+		case OpKind::DrawIndirectMulti:
+		case OpKind::DispatchIndirect: return TurnReason::Indirect;
+		case OpKind::EndOfPipe:
+		case OpKind::ReleaseMem:
+		case OpKind::EventWrite: return TurnReason::Label;
+		case OpKind::WriteData:
+		case OpKind::ReferenceClock:
+		case OpKind::DmaData:
+		case OpKind::LodStats:
+		case OpKind::DumpConstRam: return TurnReason::Write;
+		case OpKind::Flip:
+		case OpKind::WaitFlipDone: return TurnReason::Flip;
+		case OpKind::WaitRegMem:
+		case OpKind::Predication:
+		case OpKind::CondExec:
+		case OpKind::Branch:
+		case OpKind::ReadCheck:
+		case OpKind::LockstepRead: return TurnReason::Wait;
+		default: return TurnReason::Other;
+	}
+}
+
 // The op the run-ahead cannot execute ahead of the oldest context, by kind (cpParallel.h), or
 // Promotion::Count for a free op.
 static CpPar::Promotion RunAheadBlocker(CpSeq::OpKind kind, const void* payload) {
@@ -8268,13 +8344,17 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		CommitStats::StepMark(CommitStats::Step::GapOpExit);
 		// Service commands run between ops: every op before this one has executed and no later
 		// one has, the serial point (P3-SEQUENCER.md 2.4).
-		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands() && service_allowed()) {
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 5): a younger lane leaves the services to
+		// the oldest one (it would wait for its turn here).
+		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands() && service_allowed() &&
+		    !CpParYoungerLane(GetScheduler())) {
 			// Astro Bot PC (KYTY_CP_PAR=2b, morceau (c)): under the lanes' global lock, like an op;
 			// bounced to Thread_Gpu, which runs them as the lock's delegated holder.
 			const bool lane_lock = CpPar::Lanes2b() && CpPar::LaneLockEnabled();
 			if (lane_lock && CpPar::OnResolver2()) {
 				// Astro Bot PC (KYTY_CP_PAR=2b, suite 1): the bounce ends the segment and the
 				// services touch global states: only as the oldest segment.
+				const CpPar::TurnReasonScope why(CpPar::TurnReason::Service);
 				GetScheduler().WaitSegmentTurn();
 			}
 			if (lane_lock) {
@@ -8302,6 +8382,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			// and services run while it parses.
 			Profiler::ScopedFrameWait starved(Profiler::FrameWait::CpSeqResolverStarved);
 			const CpGaps::Scope       starved_gap(CpGaps::Cat::Starved);
+			const CpPar::LaneIdleScope starved_idle; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1: overlap)
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqResolverStarved);
 			const auto start    = CpNowNs();
 			bool       produced = false;
@@ -8318,6 +8399,13 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				}
 				const auto elapsed = CpNowNs() - start;
 				if (elapsed < CpSeq::ResolverSpinNs()) {
+					continue;
+				}
+				if (CpParYoungerLane(GetScheduler())) {
+					// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): a younger lane keeps waiting for its
+					// ops (ending the slice would park it until its turn; services and compute work
+					// are the oldest lane's and Thread_Gpu's).
+					std::this_thread::yield();
 					continue;
 				}
 				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands() && service_allowed()) {
@@ -8446,6 +8534,30 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			execution.m_made_progress = true;
 			continue;
 		}
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 5, cpParallel.h): an op the guest can see
+		// (CpParTurnReason) waits for the lane's turn, outside the lanes' lock (the older segments
+		// need it to end); then the whole op, with its register binding and end-of-pipe flush
+		// bound, under the lock. Direct draws and dispatches carrying their registers run out of
+		// turn (younger segment: on its lane's image overlay, below).
+		struct ConcurrentOpLock {
+			bool held = false;
+			void Release() {
+				if (held) {
+					held = false;
+					CpPar::LaneLockRelease();
+				}
+			}
+			~ConcurrentOpLock() { Release(); }
+		} concurrent_op;
+		if (CpPar::LaneConcurrent()) {
+			const auto reason = CpParTurnReason(kind, view.payload);
+			if (reason != CpPar::TurnReason::Count) {
+				const CpPar::TurnReasonScope why(reason);
+				GetScheduler().WaitSegmentTurn();
+			}
+			CpPar::LaneLockAcquire();
+			concurrent_op.held = true;
+		}
 		// Placement samples (common/cpuPlacement.h), every 256th op: this thread executes the
 		// graphics queue's packets, and ProcessPacket samples only where packets execute.
 		if ((++LaneCp().placement_packets & 255u) == 0u) {
@@ -8459,7 +8571,8 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			if (LaneCp().deferred_eop_flushes != 0) {
 				LaneCp().packets_since_eop_request +=
 				    static_cast<uint32_t>(std::min<uint64_t>(packet - LaneCp().resolver_packets, 1u << 20u));
-				if (LaneCp().packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
+				if (LaneCp().packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed() &&
+				    !CpParYoungerLane(GetScheduler())) {
 					// Bound how long a batched end-of-pipe interrupt waits (at an op, not a packet).
 					BufferFlush();
 				}
@@ -8534,6 +8647,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		if (snapshot != nullptr) {
 			GetScheduler().RestoreRegisters(previous);
 		}
+		concurrent_op.Release(); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1)
 		if (result.suspended) {
 			// A wait that has not passed: the op stays at the ring's head and is executed again
 			// in the next slice. Only lockstep ops suspend; they carry no snapshot.

@@ -291,7 +291,13 @@ void CommandScheduler::Finish() {
 	if (!(m_lanes ? Cmd() : m_command).IsInvalid()) { // Astro Bot PC (KYTY_CP_PAR=2a)
 		Submit({}, true);
 	}
-	m_master.Wait(LastSubmittedTick()); // Astro Bot PC (KYTY_CP_PAR=2b: tick ranges have gaps)
+	uint64_t target = LastSubmittedTick(); // Astro Bot PC (KYTY_CP_PAR=2b: tick ranges have gaps)
+	if (m_lanes_2b && CpPar::LaneConcurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the caller's and the older segments' work only.
+		std::lock_guard lock(m_operation_mutex);
+		target = std::max(m_ended_submit_tick, m_lane_last_submit[LaneIndex()]);
+	}
+	m_master.Wait(target);
 	BeginNext();
 	PopPendingOperations();
 }
@@ -804,6 +810,20 @@ void CommandScheduler::NoteLaneBuffer(uint64_t address, uint64_t size, bool writ
 		if (writer == UINT64_MAX) {
 			break;
 		}
+		if (CpPar::LaneConcurrent() && CpPar::LaneLockHeld()) {
+			// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): bindings happen inside ops, lanes' lock held;
+			// the older writer needs that lock to end: not waited for, counted as a hazard (a
+			// younger draw may read the range before the older segment's write; obstacle 6).
+			CpPar::NoteLaneStat(lane, CpPar::LaneStat::DependencyHazards, 1);
+			static std::atomic<uint32_t> hazards {0};
+			if (hazards.fetch_add(1, std::memory_order_relaxed) < 16u) {
+				std::printf("Kyty CpPar 2b concurrent: dependency hazard: segment %" PRIu64 " (lane %c) "
+				            "binds 0x%016" PRIx64 "+0x%" PRIx64 " that older open segment %" PRIu64
+				            " wrote\n",
+				            order, static_cast<char>('A' + lane), address, size, writer);
+			}
+			break;
+		}
 		const auto          start = CpPar::NowNs();
 		HangWatchdog::Scope wait("cp-par-2b-dependency", reinterpret_cast<uint64_t>(this), lane, order,
 		                         writer, address);
@@ -944,12 +964,65 @@ void CommandScheduler::WaitLaneTurn(uint32_t lane) {
 	if (lane >= MaxLanes || m_lane_order[lane] == UINT64_MAX || m_lane_order[lane] == m_turn) {
 		return;
 	}
+	if (CpPar::LaneConcurrent() && CpPar::LaneLockHeld()) {
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): a submit inside an out-of-turn op of a younger
+		// segment (a forced flush in a draw). Waiting here, the lanes' lock held, would block the
+		// older segments for good (they need it to end): the submit goes ahead out of turn. Its tick
+		// is in the segment's own range and the replay hands its buffer to the queue only after every
+		// older order (gate), so the GPU order stays the list order; only the producer-side order of
+		// submits changes. Counted (and the first ones logged).
+		CpPar::NoteLaneStat(lane, CpPar::LaneStat::OutOfTurnSubmits, 1);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+			std::printf("Kyty CpPar 2b concurrent: lane %c submits out of turn inside an op (order %" PRIu64
+			            ", turn %" PRIu64 ")\n",
+			            static_cast<char>('A' + lane), m_lane_order[lane], m_turn);
+		}
+		return;
+	}
+	const CpPar::LaneIdleScope idle; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1: overlap accounting)
 	const auto          start = CpPar::NowNs();
 	HangWatchdog::Scope wait("cp-par-2b-submit-turn", reinterpret_cast<uint64_t>(this), lane,
 	                         m_lane_order[lane], m_turn);
 	m_turn_changed.wait(lock, [this, lane] { return m_lane_order[lane] == m_turn; });
+	const auto waited = CpPar::NowNs() - start;
 	CpPar::NoteLaneStat(lane, CpPar::LaneStat::SubmitTurnWaits, 1);
-	CpPar::NoteLaneStat(lane, CpPar::LaneStat::SubmitTurnNs, CpPar::NowNs() - start);
+	CpPar::NoteLaneStat(lane, CpPar::LaneStat::SubmitTurnNs, waited);
+	if (CpPar::LaneConcurrent()) {
+		CpPar::NoteTurnWait(lane, CpPar::CurrentTurnReason(), waited);
+	}
+}
+
+// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, commandScheduler.h).
+void CommandScheduler::DeferRetire(Common::UniqueFunction<void>&& operation) {
+	if (m_lanes_2b && CpPar::LaneConcurrent()) {
+		std::unique_lock lock(m_operation_mutex);
+		if (m_operation_state == OperationState::Open) {
+			const auto caller = MasterSemaphore::ThreadTickLane();
+			const auto mine   = caller < MaxLanes ? m_lane_order[caller] : UINT64_MAX;
+			uint64_t   youngest      = UINT64_MAX;
+			uint32_t   youngest_lane = 0;
+			for (uint32_t lane = 0; lane < m_lane_count && lane < MaxLanes; lane++) {
+				const auto order = m_lane_order[lane];
+				if (order != UINT64_MAX && (youngest == UINT64_MAX || order > youngest)) {
+					youngest      = order;
+					youngest_lane = lane;
+				}
+			}
+			const auto base = mine != UINT64_MAX ? mine : m_turn;
+			if (youngest != UINT64_MAX && youngest > base && youngest > m_turn) {
+				// A younger open segment may have used the object: retired at its tick, queued
+				// when it becomes the oldest (held, as its own operations are).
+				if (m_graphics.submission_queue.Enabled()) {
+					m_preserve_current_completion = true;
+				}
+				m_held[youngest].normal.push_back({std::move(operation), m_master.LaneTick(youngest_lane)});
+				CpPar::NoteLaneStat(caller < MaxLanes ? caller : 0, CpPar::LaneStat::RetiresHeld, 1);
+				return;
+			}
+		}
+	}
+	DeferOperation(std::move(operation));
 }
 
 CommandBuffer& CommandScheduler::BeginLaneCommand() {
@@ -1088,6 +1161,7 @@ CommandScheduler::SegmentCounts CommandScheduler::EndContextSegment() {
 			m_recorder->EndStreamSegment(CpPar::HandoffTarget(), order);
 			std::lock_guard lock(m_operation_mutex);
 			m_lane_order[context] = UINT64_MAX;
+			m_ended_submit_tick   = std::max(m_ended_submit_tick, m_lane_last_submit[context]);
 			EndOrderLocked(order);
 		} else {
 			m_recorder->EndStreamSegment(CpPar::HandoffTarget());
@@ -1270,6 +1344,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			                         : m_master.NextTick();
 			if (m_lanes_2b) {
 				packet.lane_order = m_lane_order[LaneIndex()]; // the replay's order gate
+				m_lane_last_submit[LaneIndex()] = packet.tick; // Astro Bot PC (concurrent: Finish)
 			}
 			m_last_submit_tick.store(packet.tick, std::memory_order_release);
 			packet.submit.AddSignal(m_master.Handle(), packet.tick);
