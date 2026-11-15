@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/hangWatchdog.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (concurrent watchdog)
 #include "common/debugCounters.h"
@@ -91,6 +92,9 @@ uint64_t MasterSemaphore::NextLaneTick(uint32_t lane, bool range_end) {
 }
 
 MasterSemaphore::~MasterSemaphore() {
+	if (FramePath::Enabled()) {
+		FramePath::Detach(this); // Astro Bot PC (KYTY_FRAME_PATH): the monitor stops first
+	}
 	if (m_semaphore != nullptr) {
 		m_graphics.device.destroySemaphore(m_semaphore, nullptr);
 	}
@@ -122,6 +126,21 @@ void MasterSemaphore::Refresh() {
 		    m_watchdog_timeline, CurrentTick(), counter,
 		    m_submission_progress ? m_submission_progress->dispatched_tick.load() : CurrentTick() - 1);
 	}
+}
+
+int MasterSemaphore::WaitQuiet(uint64_t tick, uint64_t timeout_ns) {
+	if (m_gpu_tick.load(std::memory_order_acquire) >= tick) {
+		return 1;
+	}
+	vk::SemaphoreWaitInfo wait_info {};
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores    = &m_semaphore;
+	wait_info.pValues        = &tick;
+	const auto result        = m_graphics.device.waitSemaphores(&wait_info, timeout_ns);
+	if (result == vk::Result::eSuccess) {
+		return 1;
+	}
+	return result == vk::Result::eTimeout ? 0 : -1;
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {

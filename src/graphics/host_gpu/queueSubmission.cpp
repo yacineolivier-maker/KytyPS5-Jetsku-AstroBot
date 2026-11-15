@@ -4,6 +4,7 @@
 #include "common/hangWatchdog.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/watchdogSubmit.h"
@@ -492,6 +493,11 @@ void QueueSubmissionBroker::SubmitBatch(const QueuedSubmission* records, size_t 
 		EXIT_IF(!record.progress);
 		record.progress->dispatched_tick.store(record.tick, std::memory_order_release);
 		record.progress->dispatched_tick.notify_all();
+		if (FramePath::Enabled()) {
+			FramePath::NoteDispatched(
+			    reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(record.master_semaphore)),
+			    record.tick); // Astro Bot PC (KYTY_FRAME_PATH)
+		}
 	}
 }
 

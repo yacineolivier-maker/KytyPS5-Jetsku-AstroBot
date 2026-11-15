@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/prepPhases.h"
 #include "common/paceLog.h"
+#include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/hangTrace.h"
@@ -1499,7 +1500,12 @@ void GuestGpu::Done() {
 		target              = m_done_boundary;
 		m_done_boundary     = m_next_submission_sequence - 1;
 	}
+	// Astro Bot PC (KYTY_FRAME_PATH): one call per guest frame, and its blocked time.
+	const uint64_t frame_path_start = FramePath::Enabled() && !IsGpuThread() ? FramePath::NowNs() : 0;
 	if (IsGpuThread() || target == 0) {
+		if (frame_path_start != 0) {
+			FramePath::NoteAgcDone(0);
+		}
 		return;
 	}
 	HangWatchdog::Scope blocked("agc-done-prefix", reinterpret_cast<uint64_t>(this), target);
@@ -1526,6 +1532,9 @@ void GuestGpu::Done() {
 	}
 	if (pace_start != 0) {
 		PaceLog::NoteDone(pace_start, PaceLog::NowNs() - pace_start);
+	}
+	if (frame_path_start != 0) {
+		FramePath::NoteAgcDone(FramePath::NowNs() - frame_path_start);
 	}
 }
 
@@ -2391,6 +2400,9 @@ void GuestGpu::Enqueue(Submission submission) {
 	if (PaceLog::Enabled()) {
 		submission.pace_enqueue_ns = PaceLog::NowNs();
 	}
+	if (FramePath::Enabled()) {
+		submission.frame_path_enqueue_ns = FramePath::NowNs(); // Astro Bot PC (KYTY_FRAME_PATH)
+	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	submission.sequence    = m_next_submission_sequence++;
@@ -2712,9 +2724,23 @@ void GuestGpu::ThreadRun(void* data) {
 		HangWatchdog::DebugDelay("queue", submission.queue_id);
 		Live::CpSliceBegin(); // CP busy time in the "Live:" lines (KYTY_LIVE_FILE only)
 		bool complete = false;
+		if (FramePath::Enabled()) {
+			// Astro Bot PC (KYTY_FRAME_PATH): labels written in this slice belong to this submission.
+			FramePath::BeginSlice(submission.frame_path_enqueue_ns);
+		}
 		{
 			const CpGaps::Scope gap(CpGaps::Cat::Slice);
 			complete = gpu->Process(submission);
+		}
+		if (FramePath::Enabled()) {
+			FramePath::BeginSlice(0);
+			if (complete && submission.queue_id == 0 && submission.type == SubmissionType::Graphics) {
+				// The slice end submitted the submission's tail: the last tick allocated (no 2b lanes).
+				auto& scheduler = gpu->m_renderer.GetCommandScheduler();
+				FramePath::NoteSubmission(scheduler.GetMasterSemaphore(), submission.frame_path_enqueue_ns,
+				                          submission.frame_path_start_ns, FramePath::NowNs(),
+				                          scheduler.CurrentTick() - 1u);
+			}
 		}
 		HangWatchdog::NoteQueue(
 		    submission.queue_id, submission.sequence,
@@ -2808,6 +2834,9 @@ bool GuestGpu::Process(Submission& submission) {
 		submission.started = true;
 		if (submission.type == SubmissionType::Graphics) {
 			PaceLog::NoteCpSubmission(submission.pace_enqueue_ns, submission.reset_processor);
+		}
+		if (FramePath::Enabled()) {
+			submission.frame_path_start_ns = FramePath::NowNs(); // Astro Bot PC (KYTY_FRAME_PATH)
 		}
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
@@ -2913,6 +2942,9 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		SyncEpoch::AdvanceSubmission();
 		submission.started = true;
 		PaceLog::NoteCpSubmission(submission.pace_enqueue_ns, submission.reset_processor);
+		if (FramePath::Enabled()) {
+			submission.frame_path_start_ns = FramePath::NowNs(); // Astro Bot PC (KYTY_FRAME_PATH)
+		}
 		cp.SetSubmitId(++m_submit_id, submission.cp_par_context); // Astro Bot PC (2b: its lane)
 		// The frame fence's ordering point: the sequencer reads a fenced submission's command
 		// bytes only from here on.
@@ -4711,9 +4743,11 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 		    // The tick has completed, so a timestamp query's result is final.
 		    const uint64_t written =
 		        timestamps != nullptr ? timestamps->TakeDeferred(timestamp_slot, value) : value;
+		    // Astro Bot PC (KYTY_FRAME_PATH): the completion runner saw the tick complete now.
+		    const uint64_t completed_ns = FramePath::Enabled() ? FramePath::NowNs() : 0;
 		    const bool sent = gpu.TrySendCommand([renderer, &gpu, address, written, size, tick,
 		                                          interrupt, event_id, interrupt_context_id,
-		                                          trace_queue] {
+		                                          trace_queue, completed_ns] {
 			    {
 				    KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteDeferredLabel");
 				    HangWatchdog::Scope write("deferred-label-write", address, written, tick, size);
@@ -4724,6 +4758,9 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 					    StreamCopyDefer::NoteGpuOnlyWrite(address, size); // after its tick completed
 					    std::memcpy(reinterpret_cast<void*>(address), &written, size);
 				    }
+			    }
+			    if (completed_ns != 0) {
+				    FramePath::NoteDeferredLabel(completed_ns, FramePath::NowNs());
 			    }
 			    ReadFaultDiag::NoteLabel("label-deferred-write", address, written);
 			    if (HangTrace::CpTraceEnabled()) {
@@ -4796,6 +4833,9 @@ bool CommandProcessor::WriteDroppedLabel(void* dst, uint64_t value, uint32_t siz
 	NoteCpWrite(reinterpret_cast<uint64_t>(dst), size);
 	QueueEopTimestamp(timestamp_slot, dst, value);
 	TraceCpLabel("label-dropped", dst, value, size);
+	if (FramePath::Enabled()) {
+		FramePath::NoteLabelWrite(); // Astro Bot PC (KYTY_FRAME_PATH)
+	}
 	return false;
 }
 
@@ -5057,6 +5097,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
 		}
 		TraceCpLabel("label-eop", dst, data, sizeof(data));
+		if (FramePath::Enabled()) {
+			FramePath::NoteLabelWrite(); // Astro Bot PC (KYTY_FRAME_PATH)
+		}
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -5150,6 +5193,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					}
 					QueueEopTimestamp(timestamp_slot, dst, value);
 					TraceCpLabel("label-eop", dst, value, sizeof(value));
+					if (FramePath::Enabled()) {
+						FramePath::NoteLabelWrite(); // Astro Bot PC (KYTY_FRAME_PATH)
+					}
 
 					if (with_interrupt) {
 						if (with_writeback) {

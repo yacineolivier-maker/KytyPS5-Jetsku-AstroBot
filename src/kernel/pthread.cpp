@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/condWaitUntil.h"
 #include "common/cpuPlacement.h"
+#include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
 #include "common/hangWatchdog.h"
@@ -3116,6 +3117,8 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	// PRINT_NAME();
+	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
+	    ::Libs::Graphics::FramePath::Wait::Cond); // Astro Bot PC (KYTY_FRAME_PATH)
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3247,6 +3250,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
+	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
+	    ::Libs::Graphics::FramePath::Wait::Cond); // Astro Bot PC (KYTY_FRAME_PATH)
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3901,6 +3906,13 @@ void KYTY_SYSV_ABI PthreadYield() {
 	if ((++placement_yields & 4095u) == 0u) {
 		Common::SamplePlacement(Common::ThreadRole::Guest);
 	}
+	if (::Libs::Graphics::FramePath::Enabled() && ::Libs::Graphics::FramePath::OnMainThread()) {
+		// Astro Bot PC (KYTY_FRAME_PATH): the main thread's yields and the spins between them.
+		const auto begin = ::Libs::Graphics::FramePath::NowNs();
+		SchedulerBackoffOnce();
+		::Libs::Graphics::FramePath::NoteMainYield(begin, ::Libs::Graphics::FramePath::NowNs());
+		return;
+	}
 	SchedulerBackoffOnce();
 }
 
@@ -4134,6 +4146,8 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 	// usleep(0) returns at once, as FreeBSD's nanosleep does for a zero time, after the pending
 	// signal check a system call return makes (SleepMicroWithSignalPoll).
+	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
+	    ::Libs::Graphics::FramePath::Wait::Sleep); // Astro Bot PC (KYTY_FRAME_PATH)
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -4160,7 +4174,11 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
-	SleepNanoWithSignalPoll(nanos);
+	{
+		const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
+		    ::Libs::Graphics::FramePath::Wait::Sleep); // Astro Bot PC (KYTY_FRAME_PATH)
+		SleepNanoWithSignalPoll(nanos);
+	}
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;

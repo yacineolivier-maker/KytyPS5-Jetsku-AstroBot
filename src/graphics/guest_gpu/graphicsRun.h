@@ -116,6 +116,9 @@ private:
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  enqueue_ns        = 0;
 		uint64_t                  pace_enqueue_ns   = 0; // KYTY_PACE_LOG (steady clock)
+		// Astro Bot PC (KYTY_FRAME_PATH, framePath.h): guest submit and CP start (steady clock).
+		uint64_t frame_path_enqueue_ns = 0;
+		uint64_t frame_path_start_ns   = 0;
 		uint64_t                  sequence          = 0; // admission order (m_queue_mutex)
 		// Last sequence admitted before the latest Done at admission (KYTY_FRAME_FENCE): the
 		// submission starts only after all of those have completed. 0 = no fence.
