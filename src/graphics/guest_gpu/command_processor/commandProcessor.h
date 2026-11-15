@@ -529,16 +529,21 @@ private:
 	const int m_interrupt_event_id;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
-	// A visibility-proxy end dump was recorded: defer the next end-of-pipe label (defer-label).
-	bool      m_defer_next_label            = false;
-	// The current WAIT_FLIP_DONE packet already flushed and suspended (retries skip the flush).
-	bool      m_flip_wait_suspended         = false;
+	// A visibility-proxy end dump was recorded: defer the next end-of-pipe label (defer-label):
+	// LaneCp().defer_next_label. The current WAIT_FLIP_DONE packet already flushed and suspended
+	// (retries skip the flush): LaneCp().flip_wait_suspended (Astro Bot PC, 2b obstacle 1).
 	// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): the resolver state kept from one op to the next,
 	// per lane in 2b (index: CpPar::EffectiveLane(), the lane whose op runs on the calling thread,
 	// also while Thread_Gpu serves a lane's request); always [0] in the other modes (unchanged).
 	//  submit_id; deferred end-of-pipe flushes and packets since the first request;
 	//  MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far;
 	//  draws recorded in the current graphics slice (MaybeYieldSlice).
+	// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 1): also the resolver fields written between ops,
+	// outside the lanes' lock (formerly m_resolver_packets, m_retry_op, m_executing,
+	// m_placement_packets) and the per-list op state kept from one op to the next (formerly
+	// m_defer_next_label, set by an event-write op and read by the next end-of-pipe label op;
+	// m_flip_wait_suspended, a suspended WAIT_FLIP_DONE retried later). m_verifier stays common:
+	// 2b never runs with KYTY_CP_SEQ_VERIFY (checked in ResolveSubmission).
 	struct LaneCpState {
 		uint64_t submit_id                 = 0;
 		uint32_t deferred_eop_flushes      = 0;
@@ -546,6 +551,12 @@ private:
 		uint64_t idle_flush_tick           = 0;
 		uint32_t idle_flush_draws          = 0;
 		uint32_t slice_draws               = 0;
+		uint64_t resolver_packets          = 0; // packet count of the last op (EOP flush batching)
+		uint64_t retry_op                  = 0; // a suspended op to retry (sequence + 1)
+		uint32_t placement_packets         = 0; // CP placement samples (common/cpuPlacement.h)
+		bool     executing                 = false; // an op is being executed (Inline check)
+		bool     defer_next_label          = false;
+		bool     flip_wait_suspended       = false;
 	};
 	std::array<LaneCpState, 4> m_lane_cp {};
 	[[nodiscard]] static uint32_t LaneCpIndex() noexcept {
@@ -577,13 +588,12 @@ private:
 	[[nodiscard]] DrawPrep::Engine* LanePrep(uint32_t context) const noexcept {
 		return context == 1 ? m_draw_prep_b.get() : (context >= 2 && context < 4 ? m_draw_prep_more[context].get() : nullptr);
 	}
-	// Packets processed, for the CP's placement samples (common/cpuPlacement.h).
-	uint32_t m_placement_packets = 0;
+	// Packets processed, for the CP's placement samples (common/cpuPlacement.h):
+	// LaneCp().placement_packets (Astro Bot PC, 2b obstacle 1).
 
 	// ---- P3 (cpOps.h) ----
 	FrontMode m_front_mode = FrontMode::Direct;
-	// Inline: an op is being executed (ops never emit ops).
-	bool      m_executing  = false;
+	// Inline: an op is being executed (ops never emit ops): LaneCp().executing.
 	// Streams started on this processor (Pm4Execution::m_stream_id).
 	uint64_t  m_next_stream_id = 0;
 	struct OpStreamDeleter {
@@ -664,14 +674,13 @@ private:
 	// Astro Bot PC (KYTY_CP_PAR=1b3): sequencer, the sequence + 1 of the last op of the current
 	// submission that is not quiet for the oldest context (CpPar::PublishStreamEnd).
 	uint64_t m_cp_par_last_sync = 0;
-	// Resolver (GPU thread): the register files bound outside ops with a snapshot; the packet
-	// count of the last op (EOP flush batching); a suspended op that is retried (sequence + 1;
-	// the verifier compared it at its first execution).
+	// Resolver (GPU thread): the register files bound outside ops with a snapshot. The packet
+	// count of the last op (EOP flush batching) and a suspended op that is retried (sequence + 1;
+	// the verifier compared it at its first execution): LaneCp().resolver_packets / retry_op
+	// (Astro Bot PC, 2b obstacle 1).
 	HW::Context    m_back_ctx;
 	HW::UserConfig m_back_ucfg;
 	HW::Shader     m_back_sh;
-	uint64_t       m_resolver_packets = 0;
-	uint64_t       m_retry_op         = 0;
 	// Process(): the draw-prep packet hook runs for this slice's packets (decided per slice).
 	bool m_packet_hook = false;
 };

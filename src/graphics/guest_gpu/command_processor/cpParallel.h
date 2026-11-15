@@ -553,6 +553,7 @@ enum class LaneStat : uint32_t {
 	OverlayFixups,      //       fix-up barriers recorded there (not no-ops)
 	OverlayImpossible,  //       fix-ups no barrier can express, or with no buffer to record into
 	OverlayLeft,        //       a segment ended with its overlay unmerged (its older one still open)
+	ForeignRetries,     // obstacle 1: suspended ops pending (any lane) when a lane starts a list
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

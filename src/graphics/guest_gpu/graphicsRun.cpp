@@ -2006,11 +2006,11 @@ void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_
 			uint64_t value = 0;
 			std::memcpy(&value, write_one_address ? src + (dw_num - 1u) : src, cpu_bytes);
 			NoteCpAhead(CpAheadKind::WriteDataDeferred, op.dst, value);
-			const bool proxy   = m_defer_next_label;
-			m_defer_next_label = false;
+			const bool proxy   = LaneCp().defer_next_label;
+			LaneCp().defer_next_label = false;
 			const bool deferred =
 			    TryDeferLabel(dst, value, static_cast<uint32_t>(cpu_bytes), false, 0);
-			m_defer_next_label = proxy;
+			LaneCp().defer_next_label = proxy;
 			if (deferred) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataCpu);
 				TraceCpLabel("wd-deferred", dst, value, cpu_bytes);
@@ -2917,7 +2917,7 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 
 	// Placement samples (common/cpuPlacement.h), every 256th packet, on the thread that
 	// executes it: not the sequencer (the resolver samples per op) or a reference front.
-	if (!reference && !sequencer && (++m_placement_packets & 255u) == 0u) {
+	if (!reference && !sequencer && (++LaneCp().placement_packets & 255u) == 0u) {
 		Common::SamplePlacement(Common::ThreadRole::Cp);
 	}
 	const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
@@ -4264,22 +4264,22 @@ CpSeq::Result CommandProcessor::ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op
 		m_renderer.GetVideoOut().WaitFlipDone(handle, index);
 		return {};
 	}
-	if (!m_flip_wait_suspended) {
+	if (!LaneCp().flip_wait_suspended) {
 		// First evaluation of this packet: submit everything recorded before it (as the
 		// blocking form did); retries have nothing new to submit.
 		BufferFlush();
 	}
 	if (m_renderer.GetVideoOut().IsFlipPending(handle, index)) {
-		if (!m_flip_wait_suspended) {
+		if (!LaneCp().flip_wait_suspended) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitSuspends);
 		}
-		m_flip_wait_suspended = true;
+		LaneCp().flip_wait_suspended = true;
 		const auto queue =
 		    m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
 		HangWatchdog::NoteQueueWait(queue, "WAIT_FLIP_DONE", handle, 0, 1, index, 0, 0);
 		return {true, 0};
 	}
-	m_flip_wait_suspended = false;
+	LaneCp().flip_wait_suspended = false;
 	const auto queue =
 	    m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
 	HangWatchdog::ClearQueueWait(queue);
@@ -4365,7 +4365,7 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
                                      uint32_t interrupt_context_id, uint32_t timestamp_slot) {
 	const auto address = reinterpret_cast<uint64_t>(dst);
 	auto&      gpu     = m_renderer.GetGpu();
-	const bool proxy   = m_defer_next_label;
+	const bool proxy   = LaneCp().defer_next_label;
 	const bool all     = LabelCompletionMode();
 	// End-of-pipe writes become visible in order on hardware: while any older deferred write
 	// (label or GDS snapshot) is pending, a later label must not overtake it.
@@ -4388,7 +4388,7 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	if (!proxy && !all && !selected && !ordered) {
 		return false;
 	}
-	m_defer_next_label = false;
+	LaneCp().defer_next_label = false;
 	auto&      scheduler = GetScheduler();
 	const auto tick      = scheduler.CurrentTick();
 	gpu.AddDeferredLabel(address, size, tick, value, LabelSplitMode());
@@ -5142,7 +5142,7 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 						// defer-label: the next end-of-pipe label is written only after this
 						// dump's tick completed and its publication (queued above on the same
 						// completion runner) has run. See TryDeferLabel.
-						m_defer_next_label = true;
+						LaneCp().defer_next_label = true;
 					}
 				}
 				break;
@@ -5313,10 +5313,10 @@ bool CommandProcessor::DeferFlipLabel(void* dst, uint32_t value, bool interrupt)
 		            interrupt ? "with interrupt" : "plain");
 	});
 	NoteCpAhead(CpAheadKind::FlipLabelDeferred, reinterpret_cast<uint64_t>(dst), value);
-	const bool proxy   = m_defer_next_label;
-	m_defer_next_label = false;
+	const bool proxy   = LaneCp().defer_next_label;
+	LaneCp().defer_next_label = false;
 	const bool deferred = TryDeferLabel(dst, value, sizeof(value), interrupt, 0);
-	m_defer_next_label  = proxy;
+	LaneCp().defer_next_label  = proxy;
 	return deferred;
 }
 
@@ -5483,7 +5483,7 @@ CpSeq::Result CommandProcessor::SubmitInline(CpSeq::OpKind kind, const void* pay
                                              uint32_t payload_size, const void* data,
                                              uint32_t data_size) {
 	// An op's execution never emits another op (Exec* bodies call Exec*, not front methods).
-	EXIT_IF(m_executing);
+	EXIT_IF(LaneCp().executing);
 	if (m_ops == nullptr) {
 		m_ops.reset(new CpSeq::OpStream(OpRingBytes()));
 	}
@@ -5500,9 +5500,9 @@ CpSeq::Result CommandProcessor::SubmitInline(CpSeq::OpKind kind, const void* pay
 	if (verify) {
 		m_verifier->Before(view);
 	}
-	m_executing       = true;
+	LaneCp().executing       = true;
 	const auto result = ExecuteOp(view.Kind(), view.payload, view.data);
-	m_executing       = false;
+	LaneCp().executing       = false;
 	if (verify) {
 		m_verifier->After(view, result);
 	}
@@ -7362,7 +7362,7 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 	// address the book allowed; `local_wait`: a wait on this submission's own write.
 	auto&      book           = g_cp_par_book;
 	const auto label_deferred = [this] {
-		return LabelCompletionMode() || LabelRangesConfigured() || m_defer_next_label ||
+		return LabelCompletionMode() || LabelRangesConfigured() || LaneCp().defer_next_label ||
 		       m_renderer.GetGpu().HasDeferredLabels();
 	};
 	// Astro Bot PC (KYTY_CP_PAR=1b5): the op's details for the stop logs (address, why), whether it
@@ -7649,11 +7649,11 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 		}
 		// This context's CP resolver fields (Thread_Gpu's are saved, it is between ops).
 		bool       suspended       = false; // Astro Bot PC (KYTY_CP_PAR=1b4): a wait that did not pass
-		const auto saved_packets   = m_resolver_packets;
-		const auto saved_retry     = m_retry_op;
+		const auto saved_packets   = LaneCp().resolver_packets;
+		const auto saved_retry     = LaneCp().retry_op;
 		const auto saved_submit_id = LaneCp().submit_id;
-		m_resolver_packets         = run.resolver_packets;
-		m_retry_op                 = run.retry_op;
+		LaneCp().resolver_packets         = run.resolver_packets;
+		LaneCp().retry_op                 = run.retry_op;
 		LaneCp().submit_id                = run.submit_id;
 		CpPar::t_overlay           = true;
 		const auto  sequence       = view.header->sequence;
@@ -7662,15 +7662,15 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 		if ((header.flags & CpSeq::FlagAdvanceEpoch) != 0) {
 			SyncEpoch::Advance();
 		}
-		if (packet > m_resolver_packets) {
-			m_resolver_packets = packet; // no end-of-pipe flush here (Thread_Gpu's)
+		if (packet > LaneCp().resolver_packets) {
+			LaneCp().resolver_packets = packet; // no end-of-pipe flush here (Thread_Gpu's)
 		}
 		if (kind == CpSeq::OpKind::StreamBegin) {
 			const auto& begin = view.As<CpSeq::StreamBeginOp>();
 			EXIT_IF(begin.submission != submission || begin.state != 0);
 			ParCensus::NoteBegin(submission); // Astro Bot PC : KYTY_CP_PAR_CENSUS
-			m_resolver_packets = 0;
-			m_retry_op         = 0;
+			LaneCp().resolver_packets = 0;
+			LaneCp().retry_op         = 0;
 			ops.Pop();
 		} else if (kind == CpSeq::OpKind::SkipSlots) {
 			EXIT_IF(ResolvePrep() == nullptr);
@@ -7691,9 +7691,9 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 				g_cp_par_deferred.capture_store = diag.capture_store;
 				CommandScheduler::SetThreadPriorityCapture(&CpParCaptureInterrupt);
 			}
-			m_executing       = true;
+			LaneCp().executing       = true;
 			const auto result = ExecuteOp(kind, view.payload, view.data);
-			m_executing       = false;
+			LaneCp().executing       = false;
 			if (CpPar::Deferred()) {
 				CommandScheduler::SetThreadPriorityCapture(nullptr);
 				g_cp_par_deferred.capture_store = false;
@@ -7705,10 +7705,10 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 				// Astro Bot PC (KYTY_CP_PAR=1b4): only a wait suspends (draws and dispatches never
 				// do); it stays at the ring's head and Thread_Gpu retries it after the merge.
 				EXIT_IF(kind != CpSeq::OpKind::WaitRegMem || snapshot != nullptr);
-				m_retry_op = sequence + 1u;
+				LaneCp().retry_op = sequence + 1u;
 				suspended  = true;
 			} else {
-				m_retry_op = 0;
+				LaneCp().retry_op = 0;
 				ParCensus::NoteOp(kind, view.payload); // Astro Bot PC : KYTY_CP_PAR_CENSUS
 				if (snapshot != nullptr) {
 					ResolveSnapshots().Release();
@@ -7759,11 +7759,11 @@ uint32_t CommandProcessor::RunAheadSubmission(Pm4Execution& execution, uint64_t 
 		if (!suspended) {
 			run.next_op = sequence + 1u;
 		}
-		run.resolver_packets = m_resolver_packets;
-		run.retry_op         = m_retry_op;
+		run.resolver_packets = LaneCp().resolver_packets;
+		run.retry_op         = LaneCp().retry_op;
 		run.submit_id        = LaneCp().submit_id;
-		m_resolver_packets   = saved_packets;
-		m_retry_op           = saved_retry;
+		LaneCp().resolver_packets   = saved_packets;
+		LaneCp().retry_op           = saved_retry;
 		LaneCp().submit_id          = saved_submit_id;
 		if (suspended) {
 			CpParLogStop(Promotion::ForeignWait, kind, submission, view.As<CpSeq::WaitRegMemOp>().addr,
@@ -7808,7 +7808,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 	auto& ops = *OpsOf(context);
 	// Astro Bot PC (KYTY_CP_PAR=1b1): ResolvePrep / ResolveSnapshots follow this context (only
 	// read by the op executions below; the next ResolveSubmission sets it again).
-	m_resolve_lane = CpPar::SeparateWindows() ? context : 0u;
+	// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 1): not read in 2b (ResolveLaneIndex), so not written
+	// either (a shared field written by every lane thread).
+	if (!CpPar::Lanes2b()) {
+		m_resolve_lane = CpPar::SeparateWindows() ? context : 0u;
+	}
 	const CpGaps::Scope gap(CpGaps::Cat::Resolver);
 	EXIT_IF(g_current_execution != nullptr || m_front_mode != FrontMode::Thread);
 	handoff                   = false;
@@ -7854,8 +7858,8 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 	} busy_scope(concurrent);
 	if (concurrent && g_cp_par_run.adopt_pending && g_cp_par_run.target == submission) {
 		g_cp_par_run.adopt_pending = false;
-		m_resolver_packets         = g_cp_par_run.resolver_packets;
-		m_retry_op                 = g_cp_par_run.retry_op;
+		LaneCp().resolver_packets         = g_cp_par_run.resolver_packets;
+		LaneCp().retry_op                 = g_cp_par_run.retry_op;
 	}
 	// Service commands and the interleave point wait while the run-ahead is dirty / may run.
 	auto service_allowed = [concurrent] { return !concurrent || !CpPar::RunAheadDirty(); };
@@ -7962,8 +7966,24 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			const auto& begin = view.As<CpSeq::StreamBeginOp>();
 			EXIT_IF(begin.submission != submission);
 			ParCensus::NoteBegin(submission); // Astro Bot PC : KYTY_CP_PAR_CENSUS
-			m_resolver_packets = 0;
-			m_retry_op         = 0;
+			if (CpPar::Lanes2b()) {
+				// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 1): the verifier stays common (2b never runs
+				// with KYTY_CP_SEQ_VERIFY). Control: a list starts while another lane still has a
+				// suspended op to retry (its list unfinished): 0 in turn (queue 0 is FIFO and a
+				// lane keeps its list to the end); a retry left by this lane's previous list (an
+				// anomaly either way) is counted too. (Diagnostic read of the other lanes' fields:
+				// ordered by the token in turn; to revisit once lanes overlap.)
+				EXIT_IF(begin.verify != 0);
+				uint64_t foreign = 0;
+				for (const auto& other: m_lane_cp) {
+					foreign += other.retry_op != 0 ? 1u : 0u;
+				}
+				if (foreign != 0) {
+					CpPar::NoteLaneStat(context, CpPar::LaneStat::ForeignRetries, foreign);
+				}
+			}
+			LaneCp().resolver_packets = 0;
+			LaneCp().retry_op         = 0;
 			if (begin.state != 0) {
 				auto* state = reinterpret_cast<CommandProcessor*>(begin.state);
 				if (begin.verify != 0) {
@@ -8022,25 +8042,25 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		}
 		// Placement samples (common/cpuPlacement.h), every 256th op: this thread executes the
 		// graphics queue's packets, and ProcessPacket samples only where packets execute.
-		if ((++m_placement_packets & 255u) == 0u) {
+		if ((++LaneCp().placement_packets & 255u) == 0u) {
 			Common::SamplePlacement(Common::ThreadRole::Cp);
 		}
 		// The back's per-packet work of the packets parsed since the previous op.
 		if ((header.flags & CpSeq::FlagAdvanceEpoch) != 0) {
 			SyncEpoch::Advance();
 		}
-		if (packet > m_resolver_packets) {
+		if (packet > LaneCp().resolver_packets) {
 			if (LaneCp().deferred_eop_flushes != 0) {
 				LaneCp().packets_since_eop_request +=
-				    static_cast<uint32_t>(std::min<uint64_t>(packet - m_resolver_packets, 1u << 20u));
+				    static_cast<uint32_t>(std::min<uint64_t>(packet - LaneCp().resolver_packets, 1u << 20u));
 				if (LaneCp().packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
 					// Bound how long a batched end-of-pipe interrupt waits (at an op, not a packet).
 					BufferFlush();
 				}
 			}
-			m_resolver_packets = packet;
+			LaneCp().resolver_packets = packet;
 		}
-		const bool retry     = m_retry_op == sequence + 1u;
+		const bool retry     = LaneCp().retry_op == sequence + 1u;
 		const bool following = m_verifier != nullptr && m_verifier->Follows(submission) &&
 		                       !CpSeq::IsTransport(kind);
 		if (following && !retry) {
@@ -8052,7 +8072,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			previous = GetScheduler().BindRegisters(snapshot->context, snapshot->user_config,
 			                                        snapshot->shaders);
 		}
-		m_executing       = true;
+		LaneCp().executing       = true;
 		uint64_t diagnostic_args[4] {};
 		if (HangWatchdog::Enabled()) {
 			std::memcpy(diagnostic_args, view.payload,
@@ -8104,7 +8124,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		} else {
 			result = ExecuteOp(kind, view.payload, view.data);
 		}
-		m_executing = false;
+		LaneCp().executing = false;
 		if (snapshot != nullptr) {
 			GetScheduler().RestoreRegisters(previous);
 		}
@@ -8112,11 +8132,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			// A wait that has not passed: the op stays at the ring's head and is executed again
 			// in the next slice. Only lockstep ops suspend; they carry no snapshot.
 			EXIT_IF(snapshot != nullptr);
-			m_retry_op            = sequence + 1u;
+			LaneCp().retry_op            = sequence + 1u;
 			execution.m_suspended = true;
 			return Pm4ProcessResult::Blocked;
 		}
-		m_retry_op = 0;
+		LaneCp().retry_op = 0;
 		ParCensus::NoteOp(kind, view.payload); // Astro Bot PC : KYTY_CP_PAR_CENSUS
 		if (concurrent && CpPar::Deferred()) {
 			// Astro Bot PC (KYTY_CP_PAR=1b5, cpParallel.h): the global interrupt order (deferred ones

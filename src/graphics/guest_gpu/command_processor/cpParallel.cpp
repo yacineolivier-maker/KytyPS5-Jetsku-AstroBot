@@ -1444,7 +1444,7 @@ void MaybeReport() {
 				return static_cast<double>(v[static_cast<size_t>(stat)]) / 1e6;
 			};
 			const auto n = [&v](LaneStat stat) { return v[static_cast<size_t>(stat)]; };
-			char item[1024];
+			char item[2048];
 			std::snprintf(item, sizeof(item),
 			              "%s%c: replay %.1f ms busy, turn waits %" PRIu64 " (%.1f ms); submit turn "
 			              "waits %" PRIu64 " (%.1f ms), held operations %" PRIu64
@@ -1454,7 +1454,8 @@ void MaybeReport() {
 			              "under it %" PRIu64 " (delegated takes %" PRIu64 "); occlusion early batches %"
 			              PRIu64 ", dumps outside the lock %" PRIu64 "; seq position below %" PRIu64
 			              "; overlay ops %" PRIu64 ", images %" PRIu64 ", fix-ups %" PRIu64
-			              ", impossible %" PRIu64 ", left %" PRIu64,
+			              ", impossible %" PRIu64 ", left %" PRIu64 "; retries pending at list start %"
+			              PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
 			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs),
 			              n(LaneStat::SubmitTurnWaits), ms(LaneStat::SubmitTurnNs),
@@ -1466,7 +1467,8 @@ void MaybeReport() {
 			              n(LaneStat::OcclusionRebatches), n(LaneStat::OcclusionUnlocked),
 			              n(LaneStat::SeqPositionBelow), n(LaneStat::OverlayOps),
 			              n(LaneStat::OverlayImages), n(LaneStat::OverlayFixups),
-			              n(LaneStat::OverlayImpossible), n(LaneStat::OverlayLeft));
+			              n(LaneStat::OverlayImpossible), n(LaneStat::OverlayLeft),
+			              n(LaneStat::ForeignRetries));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());
