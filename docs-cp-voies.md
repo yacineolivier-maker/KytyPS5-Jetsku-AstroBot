@@ -4,7 +4,7 @@ Branche `cp-voies` (partie de `mt-liaisons`). Conception : `docs\CONCEPTION-MULT
 étapes P1 et P2). Les essais en jeu sont faits par la session principale ; rien de ce qui suit n'a encore été
 essayé en jeu.
 
-## P2 « voies simultanées » (`KYTY_CP_PAR=2b`) — état au 15/11/2026 soir (morceaux (a)–(d) faits, à tour de rôle)
+## P2 « voies simultanées » (`KYTY_CP_PAR=2b`) — état au 15/11/2026 soir (morceaux (a)–(d) et obstacles 1–3 faits, à tour de rôle)
 
 **Ce qui est fait : les étapes 1, 2, 4 et 5. Ce qui n'est pas fait : l'étape 3 (les voies traduisent encore à
 tour de rôle, par le jeton de 2a ; il n'y a pas encore de verrou global des caches).** 2b ne peut donc pas encore
@@ -24,6 +24,9 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `f2e94af8` | (b) | occlusion : état de lot par flux (pool, requêtes, fenêtre, lot) ; émission et emplacements communs | BUILD_OK |
 | `492ed57b` | (a) | `RenderMutex` sans propriétaire en 2b ; position des opérations exécutées du séquenceur par voie | BUILD_OK |
 | `c00a785c` | (d) | surcouche d'état d'image par voie (segments plus jeunes), fusion à la fin du plus ancien | BUILD_OK |
+| `3be1ee4d` | obstacle 1 | champs du `CommandProcessor` modifiés entre les opérations, par voie (`LaneCpState`) ; contrôle « retries pending at list start » | BUILD_OK |
+| `9e7f0ce0` | obstacle 2 | ordre réservé par Thread_Gpu à la remise de la liste ; segment de A fermé à la fin de chaque liste A (`KYTY_CP_PAR_RESERVE=0` coupe) | BUILD_OK |
+| `25a85844` | obstacle 3 | une voie garde son segment jusqu'à la fin de sa liste ; Thread_Gpu enregistre entre-temps dans ce segment (`KYTY_CP_PAR_KEEP=0` coupe) | BUILD_OK |
 | `ba1b4058` | 4–5 | registre des plages liées/écrites par segment ouvert, attente de dépendance, violations d'ordre (`KYTY_CP_PAR_VERIFY=1`), ligne « CpPar 10s: 2b » complète | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
@@ -236,7 +239,89 @@ qui tourne est toujours le plus ancien), « dumps outside the lock » doit tombe
 
 
 
+### Obstacles 1, 2 et 3 de la passation ci-dessous — faits le 15/11 (toujours à tour de rôle, non essayés en jeu)
+
+Trois commits compilés (BUILD_OK chacun), sans 2b rien ne change (tout est derrière `Lanes2b()`).
+
+**Obstacle 1 (`3be1ee4d`) — champs du `CommandProcessor` par voie.** Ajoutés à `LaneCpState` (indice
+`EffectiveLane()`, donc aussi la voie servie quand Thread_Gpu exécute un flip renvoyé) : `resolver_packets`,
+`retry_op`, `executing`, `placement_packets` (écrits entre les opérations, hors verrou) et deux états d'opération
+gardés d'une opération à l'autre au sein d'une liste, relevés en plus : `defer_next_label` (posé par un
+`EventWrite` de vidage de proxy de visibilité, lu par l'étiquette de fin de canal suivante) et
+`flip_wait_suspended` (`WAIT_FLIP_DONE` suspendu puis repris). Hors 2b l'indice reste 0 : 1b3–1b5 (qui
+sauvaient/restauraient `m_resolver_packets`/`m_retry_op` autour des opérations de la course en avant) sont
+inchangés. `m_resolve_lane` n'est plus écrit en 2b (il n'y était déjà plus lu). `m_verifier` reste commun : 2b
+n'existe jamais avec `KYTY_CP_SEQ_VERIFY` (`EXIT_IF` au `StreamBegin` si une liste demandait la vérification).
+**Relevés mais laissés communs** (à revoir avant la simultanéité) : `m_synthetic_occlusion_counter` (compteur
+d'`EventWrite`, sous le verrou des voies : seul l'ordre des valeurs entre voies changerait) ;
+`m_pending_num_instances`/`m_num_instances` (nombre d'instances hérité d'un tirage indirect, touché à la fois par
+le front du séquenceur et par les opérations : partage déjà présent en 2a, à analyser) ; `m_predicate_skip`,
+`m_ce_complete`, `m_flip` (front du séquenceur, pas des voies). Contrôle : « retries pending at list start »
+(nombre de voies ayant une opération suspendue à reprendre quand une voie commence une liste) : **0 attendu**
+(file 0 FIFO, et une voie garde sa liste jusqu'au bout).
+
+**Obstacle 2 (`9e7f0ce0`) — ordre réservé à la remise, A fermé à chaque fin de liste.**
+`CommandScheduler::ReserveLaneOrder(lane)` : dans le crochet `give` de Thread_Gpu qui confie une liste à la voie
+k (cible `HandoffTarget()`), juste **après** la fin du segment de A (pour que A puisse encore rendre une plage
+inutilisée, `TryReleaseRange`), Thread_Gpu réserve l'ordre et la plage de ticks de k (`BeginRange`, sous
+`m_operation_mutex`, `m_lane_order[k]` posé, `m_lane_reserved[k]`) ; `BeginContextSegment` de la voie les
+consomme. Le segment réservé compte comme ouvert pour le tour (les fils sans voie lisent déjà ses ticks). À la
+fin de chaque liste A (`ProcessSequenced`, contexte 0, liste complète, hors listes de passation au mode direct et
+de préparation de flip), `GuestGpu::CpParCloseLaneA` termine le segment de A (la soumission de passation emporte
+le travail de la tranche, à la place du `BufferFlush` : `BufferFlush(false)` fait le reste) et en rouvre un.
+À tour de rôle, mêmes ordres qu'avant (la réservation se fait au même moment que l'ancien début de segment),
+mêmes soumissions (la fermeture remplace la soumission du `BufferFlush` ; le segment de A rouvert, vide, rend sa
+plage au passage suivant). `KYTY_CP_PAR_RESERVE=0` revient au comportement précédent. Compteurs : « orders
+reserved at hand-out » (voies B, C… : ≈ nombre de listes confiées, plus les renvois si `KYTY_CP_PAR_KEEP=0`),
+« unreserved begins » (**0 attendu** pour B, C…), « list-end closures » (voie A : ≈ listes A).
+
+**Obstacle 3 (`25a85844`) — une voie garde son segment jusqu'à la fin de sa liste.** Quand une voie rend le jeton
+pour un renvoi (flip, services : `CpPar::GivingForRequest`, posé dans `Resolver2::RunOnGpuThread`) ou à la fin
+d'une tranche qui n'a pas fini sa liste (suspendue, affamée, cédée : la tâche de tranche appelle
+`CpPar::SetListUnfinished(result != Complete)`), son crochet `give` **ne termine pas** le segment
+(`g_cp_par_kept_lane`). Thread_Gpu, en reprenant le jeton, **enregistre dans ce segment** (flux d'enregistrement,
+voie de ticks, exécuteur, pool, état dynamique, lot d'occlusion de k, segment du livre d'images :
+`CpPar::AdoptSegment`) au lieu d'ouvrir un segment A : le flip renvoyé, le `BufferFlush` de fin de tranche
+(soumission intermédiaire dans la plage de k), les autres files et les services qu'il traite en attendant la
+reprise. Quand il rend le jeton à k (`give`, `t_cp_par_adopted`), rien ne se termine ni ne se réserve
+(`DropSegment`) ; k reprend son segment sans en ouvrir un (`take`). Le segment se termine à la fin de la tranche
+qui achève la liste (ou la passe au mode direct). Ordre GPU identique à l'ancien (k jusque-là, travail de
+Thread_Gpu, suite de k), mais sans segment intermédiaire : **aucune liste confiée plus tard ne peut recevoir un
+ordre plus ancien que la suite d'une liste inachevée**. Pourquoi Thread_Gpu enregistre dans le segment de k au
+lieu d'ouvrir le sien : un segment A plus jeune ouvert pendant que k attend devrait attendre son tour pour
+soumettre ; si k attend un résultat de calcul que Thread_Gpu enregistre (file de calcul, `WAIT_REG_MEM`), ce serait
+un interblocage. `KYTY_CP_PAR_KEEP=0` revient au comportement précédent. Compteurs (voie k) : « segments kept over
+slices », « over bounces », « resumed without closing » (= somme des deux), « not oldest » (**0 attendu** : une
+reprise est toujours le segment le plus ancien), « delegated recordings » (prises du jeton par Thread_Gpu dans le
+segment de k), « open at list end » (**0 attendu**). Contrôles `EXIT_IF` : un seul segment gardé à la fois ;
+Thread_Gpu ne rend le segment gardé qu'à sa voie ; la fermeture de A n'a jamais lieu pendant une adoption.
+
+**Ce que la session principale doit vérifier en jeu** (mêmes variables que plus bas, `KYTY_CP_PAR=2b`) : au
+démarrage, les lignes « segment orders reserved at the hand-out … on » et « lanes keep their segment … on »
+(affichées au premier usage) ; dans la ligne « CpPar 10s: 2b », les nouveaux champs ci-dessus avec les valeurs
+attendues, plus tous les anciens zéros (submit turn waits, held operations, order violations, seq position below,
+overlay…). « submit turn waits » doit rester à 0 : une attente montrerait qu'un segment plus jeune soumet pendant
+qu'un plus ancien est ouvert. i/s : comme avant (aucun gain attendu ; un peu moins de soumissions vides
+possible, puisqu'un renvoi ne coupe plus le segment). En cas de blocage ou d'image fausse, essayer
+`KYTY_CP_PAR_KEEP=0`, puis `KYTY_CP_PAR_RESERVE=0`, pour isoler l'obstacle.
+
+**Risques (3)** : Thread_Gpu utilise maintenant l'exécuteur, le pool et l'état dynamique de la voie k pendant les
+flips renvoyés et entre deux tranches (auparavant les siens) ; un état propre au fil qui supposerait « Thread_Gpu =
+flux 0 » (état gardé dans l'exécuteur de A, `thread_local` d'un module de rendu) serait faux → image fausse ou
+erreur de validation, à surveiller. Le `BufferFlush` qui suit une tranche est compté dans `LaneCp()` de A (comme
+avant) alors qu'il soumet le tampon de k : sans danger (k vide un peu plus tôt ensuite). (2) : une soumission
+vide de plus est possible quand une liste A se termine sans rien avoir enregistré après la dernière soumission.
+
 ### Passation (15/11 soir, après `b758f3d3`) : `KYTY_CP_PAR_CONCURRENT=1` non commencé
+
+**Mise à jour (après `25a85844`) : les obstacles 1, 2 et 3 sont levés (section précédente). Restent 4 à 7.**
+Pour 4 (boucle des files sans attente de la tranche), noter ce que 2 et 3 imposent : en simultané, la voie A ne
+pourra pas « adopter » le segment d'une autre voie en attente sans s'arrêter (règle de 3, faite pour le tour de
+rôle) ; il faudra soit que Thread_Gpu ne confie pas de liste au-delà d'une tête suspendue (et n'enregistre rien en
+attendant hors du segment gardé), soit des segments A intercalés à ordre réservé d'avance. La réservation
+(`ReserveLaneOrder`) se fait déjà au moment de confier : avec `RunSliceAsync`, l'appeler au moment de la remise
+(elle exige que la voie n'ait ni segment ouvert ni réservé). Les champs de `LaneCpState` sont lus par
+`EffectiveLane()` : un fil de voie ne touche que les siens.
 
 Demandé : lever le jeton (désactivé par défaut, sur 2b). **Pas écrit**, faute de place, et parce que l'examen du
 code a montré des obstacles qu'il faut traiter avant, sous peine d'un mode qui bloque ou perd le GPU dès le premier
