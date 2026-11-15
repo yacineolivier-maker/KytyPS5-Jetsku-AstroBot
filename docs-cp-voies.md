@@ -33,6 +33,7 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `68d86418` | compteurs | ligne « CpPar 10s: 2b concurrent », contrôles d'ordre | BUILD_OK |
 | `9e05e27b` | blocage 15/11 | délai de sécurité de la barrière de trame rétabli ; tranche inachevée soumise | BUILD_OK |
 | `1ff2bee9` | chien de garde | état de chaque voie après 20 s sans image | BUILD_OK |
+| `63f97b56` | blocage 19 h 23 | liste reprise placée avant les listes plus jeunes dehors | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
 
@@ -243,6 +244,47 @@ qui tourne est toujours le plus ancien), « dumps outside the lock » doit tombe
 
 
 
+
+### Deuxième blocage (essai du 15/11, 19 h 23, après 4 images) : tour jamais rendu
+
+**Rapport du chien de garde** (`console-20261115-192354.txt`, « STALL ») : Thread_Gpu « waiting for a
+lane », listes dehors `[list 32 lane C] [list 30 lane B ended]` ; B inactive ; C en attente du tour
+(opération d'étiquette, son ordre 0x1a = 26, tour 0x19 = 25) ; segment gardé B ; ordres B 25 (le plus
+ancien), C 26 ; verrou libre.
+
+**Cause (prouvée par l'ordre affiché des listes dehors).** La liste 30 (B) était revenue inachevée
+(attente de flip) : recueillie, remise en tête de file 0, segment gardé. Pendant ce temps la 32 (C) était
+déjà dehors. `CpParTryDispatch` a reconfié la 30 et l'a **ajoutée à la fin** des listes dehors
+(`push_back`), donc derrière la 32. Les fins ne sont recueillies que par l'avant (`CpParConcurrentStep`) :
+la 30, revenue de nouveau inachevée, n'a jamais été recueillie, n'a jamais été remise en file ni
+reconfiée, son segment (ordre 25) n'a jamais été repris ni terminé, et C (ordre 26) attendait son tour
+pour toujours. Thread_Gpu restait en « wait » (`CpParCanGoHome` faux : la voie du segment gardé est
+encore parmi les listes dehors). Corrigé (`63f97b56`) : les listes dehors sont **insérées dans l'ordre
+des listes** ; seule la liste reprise (la plus ancienne) peut passer devant des listes dehors (sinon
+`EXIT`). Compteurs « resumed before younger » (> 0 attendu dans le mode : c'est le cas qui bloquait) et
+contrôle « out-of-order ends » (une liste finie inachevée derrière une liste encore dehors ; **0
+attendu**, journal « ended unfinished behind list … » la première fois).
+
+**« Lane D » avec 3 voies** : le chien de garde affichait les 5 emplacements ; celui de D n'est jamais
+écrit avec `KYTY_CP_PAR_LANES=3` (« running (no wait noted) » = emplacement vide). Il n'y a pas de 4e
+voie ; les emplacements des voies absentes ne sont plus affichés.
+
+**Autres cas « fin de liste / tour non rendu » cherchés par la même logique** :
+- une liste qui finit complète termine son segment dans son crochet `give`, seulement à son tour : toutes
+  les listes plus anciennes ont donc fini, et (dans l'ordre maintenant garanti) sont recueillies avant
+  elle ;
+- une liste qui finit inachevée garde son segment seulement à son tour (la plus ancienne) : elle est
+  alors en tête des listes dehors, recueillie, remise en tête de file 0 (devant toute liste non confiée)
+  et reprise avant toute autre (`CpParTryDispatch` refuse toute autre voie tant qu'un segment est gardé) ;
+- le segment A de Thread_Gpu ne s'ouvre qu'en l'absence de liste dehors et se ferme à la remise suivante ;
+  le segment gardé adopté par Thread_Gpu lui est rendu à la reprise (crochet `give`, « drop ») ;
+- retraits tenus (`DeferRetire`) et opérations retenues : libérés quand le tour atteint leur segment,
+  donc dès que les segments plus anciens se terminent (cas ci-dessus) ;
+- reste possible : « open at list end » (une liste finie dont le segment resterait ouvert) — déjà compté,
+  0 attendu ; le chien de garde le montrerait (ordre d'une voie sans liste dehors).
+
+**À vérifier en jeu** : même essai. Attendu : plus de blocage ; « resumed before younger » > 0 ;
+« out-of-order ends » 0 ; contrôles d'ordre à 0. En cas de blocage : les lignes « STALL ».
 
 ### Blocage à l'écran-titre (essai du 15/11, 19 h 01) et chien de garde
 
