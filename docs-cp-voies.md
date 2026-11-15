@@ -16,6 +16,7 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 |---|---|---|---|
 | `87d2964e` | 1 | rejeu par voie, remise à la file dans l'ordre des listes | BUILD_OK |
 | `d4e6056d` | 2 | plages de ticks par segment de voie (au lieu d'un tick provisoire), ordre de remise par segment, soumissions et opérations différées d'un segment plus jeune retenues jusqu'à son tour | BUILD_OK |
+| `48d04f8c` | 3a | 2b accepté avec `KYTY_EOP_TIMESTAMPS=gpu` (préréglage U59) ; tas de descripteurs : un pool se retire au plus grand tick de ses utilisateurs | BUILD_OK |
 | `ba1b4058` | 4–5 | registre des plages liées/écrites par segment ouvert, attente de dépendance, violations d'ordre (`KYTY_CP_PAR_VERIFY=1`), ligne « CpPar 10s: 2b » complète | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
@@ -80,8 +81,14 @@ registre), `renderer/renderContext.cpp` (exécuteurs par voie aussi en 2b).
 ### Variables pour l'essai en jeu
 
 Base (comme P1) : `KYTY_CP_SEQ=1`, `KYTY_CP_RECORDER=1` (sans `KYTY_CP_RECORDER_VERIFY`),
-`KYTY_DRAW_PREP=parallel`, **`KYTY_CP_PAR=2b`**. Ne pas activer `KYTY_GPU_TIMING`, `KYTY_GPU_OP_PROFILE` ni
-`KYTY_EOP_TIMESTAMPS=gpu` (2b retomberait en 2a).
+`KYTY_DRAW_PREP=parallel`, **`KYTY_CP_PAR=2b`**. Ne pas activer `KYTY_GPU_TIMING` ni `KYTY_GPU_OP_PROFILE`
+(2b retomberait en 2a). Depuis `48d04f8c`, `KYTY_EOP_TIMESTAMPS=gpu` est accepté (avant : repli en 2a ; avec
+`gpu` le début des tampons de voie n'est plus paresseux, donc une soumission par passage de jeton).
+
+Mesuré le 15/11 15 h 30 (session principale, Aerial Garden, `KYTY_EOP_TIMESTAMPS=record`, commits jusqu'à
+`ba1b4058`) : 2b N=2 22,3 i/s, N=3 22,2, 2a 23,1 ; aucune perte du GPU ; avec `KYTY_CP_PAR_VERIFY=1` des millions
+de dépendances vérifiées, 0 attente, 0 violation, 0 attente de tour de soumission ; rejeu A ~1,1–1,4 s, B ~0,9–1,4 s
+par 10 s.
 
 1. **N = 2** (défaut, ou `KYTY_CP_PAR_LANES=2`).
 2. **N = 3** : `KYTY_CP_PAR_LANES=3` (option `KYTY_CP_PAR_B_WORKERS=2` comme en P1).
@@ -119,7 +126,13 @@ Comparer image, i/s (3 tours), stabilité (5 min) à 2a.
 
 ### Suite
 
-**Étape 3 (non faite) — exécution simultanée sous un verrou global.** Ce qu'il faut, dans l'ordre :
+**Étape 3b (non faite) — exécution simultanée sous un verrou global.** Seule la préparation 3a est faite
+(`48d04f8c`). La simultanéité réelle n'a pas été écrite : elle change la boucle des files de Thread_Gpu, le
+partage du `CommandProcessor` (un seul objet, champs gardés d'une opération à l'autre : `SetSubmitId`,
+`BufferInit/BufferFlush`, compteur d'opérations exécutées du séquenceur qui ne suit que Thread_Gpu), la propriété
+du `RenderMutex` (propriétaire unique donné avec le jeton) et l'identité « fil GPU » empruntée (`g_gpu_thread`,
+59 contrôles), et ne pouvait pas être faite sans risque d'interblocage ou de perte du GPU impossible à vérifier
+sans essai. Ce qu'il faut, dans l'ordre :
 1. Remplacer le jeton par une exécution simultanée : aujourd'hui Thread_Gpu attend dans `RunSlice` la fin de la
    tranche d'une voie. Il faut que la boucle des files (`ProcessSequenced`) confie une soumission de file 0 à sa
    voie **sans attendre** et passe à la suivante (file 0 regardée au-delà de sa tête), la fin étant constatée plus
@@ -129,10 +142,12 @@ Comparer image, i/s (3 tours), stabilité (5 min) à 2a.
    disposition à la fin du segment, enregistrés en fin de segment de la voie plus ancienne), StreamBuffer, tas de
    descripteurs, occlusion, `RenderMutex` (aujourd'hui « propriétaire » unique, donné avec le jeton) ; les 59
    contrôles « fil GPU » à requalifier ; commencer par une opération entière sous le verrou (sûr, sans gain), puis
-   sortir du verrou la préparation, l'émission, les descripteurs et les constantes poussées. Point à reprendre
-   au passage : le tas de descripteurs retire un pool au `CurrentTick()` du fil qui le retire ; en simultané,
-   un pool utilisé par un segment plus jeune puis retiré par un plus ancien serait remis à zéro trop tôt
-   (**perte du GPU possible**) : retirer au plus grand tick des segments qui l'ont utilisé.
+   sortir du verrou la préparation, l'émission, les descripteurs et les constantes poussées. (Le retrait des
+   pools de descripteurs au tick du fil appelant est corrigé en 3a : plus grand tick des utilisateurs.)
+   Autres retraits « au tick du fil appelant » à revoir de la même façon avant la simultanéité (perte du GPU
+   possible sinon) : pages du flux (`StreamBuffer`, `streamBuffer.cpp:410`), copies de mise en place et DMA
+   (`uploadDma.cpp`), emplacements d'occlusion et de statistiques LOD (`occlusion.cpp`, `lodStats.cpp`), tout
+   objet partagé entre voies qui serait libéré par une voie plus ancienne alors qu'une plus jeune l'a utilisé.
 3. Ce que le segment plus jeune ne peut pas faire avant son tour (classement 1b4/1b5 à reprendre) : écritures du
    CP visibles par le jeu (étiquettes, `WRITE_DATA` hors étiquettes internes apprises), attentes `WAIT_REG_MEM`
    sur une valeur d'une autre liste, interruptions de fin de canal (à capturer et livrer dans l'ordre comme 1b5),
