@@ -1,5 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR=2b)
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/hangWatchdog.h"
@@ -274,6 +277,12 @@ std::optional<uint64_t> UploadDma::Stage(vk::Buffer source, uint64_t source_offs
 	m_available.notify_one();
 	m_stage_tick  = m_scheduler.CurrentTick();
 	m_stage_value = m_enqueued;
+	if (m_scheduler.GetMasterSemaphore().Ranges()) {
+		// Astro Bot PC (KYTY_CP_PAR=2b): the staging lane's own record.
+		const auto lane           = std::min<uint32_t>(MasterSemaphore::ThreadTickLane(), 3u);
+		m_lane_stage_tick[lane]   = m_stage_tick;
+		m_lane_stage_value[lane]  = m_stage_value;
+	}
 	return offset;
 }
 
@@ -384,6 +393,29 @@ bool UploadDma::DrainHostCopies(uint64_t address, uint64_t size, bool all) {
 
 uint64_t UploadDma::PendingValue() {
 	// Called when the guest scheduler submits its current recording.
+	if (m_scheduler.GetMasterSemaphore().Ranges()) {
+		// Astro Bot PC (KYTY_CP_PAR=2b, tick ranges): the submitting lane's own staging. Counted
+		// when the single record would have missed it (another lane staged since: its submit would
+		// not have waited for the transfer its copies read).
+		const auto lane        = std::min<uint32_t>(MasterSemaphore::ThreadTickLane(), 3u);
+		const auto tick        = m_scheduler.CurrentTick();
+		const auto stage_value = m_lane_stage_tick[lane] == tick ? m_lane_stage_value[lane] : 0;
+		if (stage_value > m_known_value && m_stage_tick != tick) {
+			CpPar::NoteLaneStat(lane, CpPar::LaneStat::EarlyRetires, 1);
+		}
+		if (stage_value <= m_known_value) {
+			return 0;
+		}
+		uint64_t value = 0;
+		if (m_graphics.device.getSemaphoreCounterValue(m_semaphore, &value) == vk::Result::eSuccess) {
+			m_known_value = std::max(m_known_value, value);
+		}
+		if (m_known_value >= stage_value) {
+			return 0;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaSubmitWaits);
+		return stage_value;
+	}
 	if (m_stage_tick != m_scheduler.CurrentTick() || m_known_value >= m_stage_value) {
 		return 0;
 	}

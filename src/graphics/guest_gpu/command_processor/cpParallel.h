@@ -516,6 +516,7 @@ enum class LaneStat : uint32_t {
 	DependencyWaits,  // a binding waited for an older open segment that wrote the range to end
 	DependencyWaitNs,
 	OrderViolations,  // a write to a range a younger open segment already bound
+	EarlyRetires,     // 3b-1: a retire / submit dependency at the caller's tick would have been too early
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

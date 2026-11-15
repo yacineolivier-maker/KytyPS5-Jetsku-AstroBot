@@ -1335,13 +1335,13 @@ void MaybeReport() {
 			              "%s%c: replay %.1f ms busy, turn waits %" PRIu64 " (%.1f ms); submit turn "
 			              "waits %" PRIu64 " (%.1f ms), held operations %" PRIu64
 			              "; dependencies checked %" PRIu64 ", waits %" PRIu64 " (%.1f ms), order "
-			              "violations %" PRIu64,
+			              "violations %" PRIu64 ", early retires avoided %" PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
 			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs),
 			              n(LaneStat::SubmitTurnWaits), ms(LaneStat::SubmitTurnNs),
 			              n(LaneStat::HeldOperations), n(LaneStat::DependencyChecks),
 			              n(LaneStat::DependencyWaits), ms(LaneStat::DependencyWaitNs),
-			              n(LaneStat::OrderViolations));
+			              n(LaneStat::OrderViolations), n(LaneStat::EarlyRetires));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());

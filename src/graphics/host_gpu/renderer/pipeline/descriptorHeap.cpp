@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR=2b)
+
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -68,6 +70,11 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		return batch.sets[--batch.size];
 	}
 
+	if (m_master_semaphore.Ranges() && m_master_semaphore.CurrentTick() < m_current_pool_tick) {
+		// Astro Bot PC (KYTY_CP_PAR=2b): retiring at the caller's tick would have been too early.
+		CpPar::NoteLaneStat(std::min<uint32_t>(MasterSemaphore::ThreadTickLane(), 3u),
+		                    CpPar::LaneStat::EarlyRetires, 1);
+	}
 	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.Ranges()
 	                                                 ? m_current_pool_tick
 	                                                 : m_master_semaphore.CurrentTick());

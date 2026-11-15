@@ -222,6 +222,11 @@ private:
 	// only it waits; later submissions order after those copies through their own barriers.
 	uint64_t                m_stage_tick  = 0;
 	uint64_t                m_stage_value = 0;
+	// Astro Bot PC (KYTY_CP_PAR=2b, tick ranges): the same per lane (MasterSemaphore::
+	// ThreadTickLane), so that a lane's submit waits for its own staging even if another lane staged
+	// since. Without tick ranges: unused (m_stage_tick / m_stage_value as before).
+	std::array<uint64_t, 4> m_lane_stage_tick {};
+	std::array<uint64_t, 4> m_lane_stage_value {};
 	// KYTY_UPLOAD_DMA_WRITE_DRAIN: tickets of queued host copies in staging order; copied ones
 	// are pruned from the front.
 	std::deque<std::shared_ptr<HostCopyTicket>> m_tickets;
