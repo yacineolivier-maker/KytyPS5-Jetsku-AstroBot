@@ -574,6 +574,9 @@ enum class LaneStat : uint32_t {
 	DependencyHazards,  //       KYTY_CP_PAR_VERIFY: a dependency wait refused (lock held), counted only
 	YoungerServices,    //       services not run by a younger segment (left to the oldest)
 	RetiresHeld,        //       a shared object's retirement held for a younger open segment (DeferRetire)
+	FenceHolds,         //       the head list (for this lane) held by the frame fence at a hand-out try
+	FenceTimeouts,      //       ... handed out after the fence's 2 s safety timeout
+	UnfinishedFlushes,  //       an unfinished slice's recording submitted at its end
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

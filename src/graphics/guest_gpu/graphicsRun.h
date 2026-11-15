@@ -167,6 +167,7 @@ private:
 	struct CpParFlight {
 		Submission        submission;
 		CommandProcessor* cp      = nullptr;
+		GuestGpu*         gpu     = nullptr;
 		uint32_t          lane    = 0;
 		bool              done    = false;
 		bool              handoff = false;

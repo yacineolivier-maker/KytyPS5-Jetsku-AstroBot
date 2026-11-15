@@ -7183,6 +7183,22 @@ void GuestGpu::CpParFlightTask(void* argument) {
 	                                                flight.handoff, flight.lane);
 	CpPar::NoteResolveTime(flight.lane, CpPar::NowNs() - start);
 	CpPar::SetLaneActive(false);
+	if (flight.result != Pm4ProcessResult::Complete &&
+	    flight.submission.command_execution.MadeProgress()) {
+		// The list stops unfinished (a wait not passed, starved, yielded): what it recorded so far
+		// is submitted now, as Thread_Gpu's flush after an unfinished slice does in turn
+		// (ProcessSequenced, BufferFlush in the kept segment). Otherwise the labels, interrupts or
+		// flip requests recorded before the wait stay in the open buffer, and the wait (or a
+		// compute queue, or the guest) may be waiting for exactly that work. As the oldest (an
+		// unfinished list is kept only as the oldest anyway), outside then under the lanes' lock.
+		{
+			const CpPar::TurnReasonScope why(CpPar::TurnReason::Slice);
+			flight.gpu->m_renderer.GetCommandScheduler().WaitSegmentTurn();
+		}
+		const CpPar::LaneLockScope lock;
+		flight.cp->BufferFlush(true);
+		CpPar::NoteLaneStat(flight.lane, CpPar::LaneStat::UnfinishedFlushes, 1);
+	}
 	// Obstacle 3: the give hook that follows keeps the lane's segment open while its list is
 	// unfinished (after waiting for its turn: concurrent mode).
 	CpPar::SetListUnfinished(flight.result != Pm4ProcessResult::Complete);
@@ -7257,13 +7273,33 @@ bool GuestGpu::CpParTryDispatch() {
 			return false;
 		}
 		if (!FrameFencePassed(front)) {
+			// The frame fence's safety timeout (FrameFencePassed) counts from the first time the
+			// front was held: noted here as the main loop's queue selection does, since queue 0 is
+			// not looked at there in this mode. Without it a front held by a fence nothing else can
+			// release (e.g. a compute submission admitted before the Done, suspended on a label of a
+			// later list) would stay held for good: in turn it runs after 2 s (blocking, 15/11).
+			if (front.fence_hold_ns == 0) {
+				front.fence_hold_ns = CpNowNs();
+			}
+			HangWatchdog::NoteQueue(0, front.sequence, "frame-fence-held", front.frame_fence);
+			CpPar::NoteLaneStat(lane, CpPar::LaneStat::FenceHolds, 1);
 			return false;
+		}
+		if (front.fence_hold_ns != 0 && CpNowNs() - front.fence_hold_ns > FrameFenceTimeoutNs) {
+			CpPar::NoteLaneStat(lane, CpPar::LaneStat::FenceTimeouts, 1);
+			static std::atomic_bool logged {false};
+			if (!logged.exchange(true)) {
+				std::printf("Kyty CpPar 2b concurrent: frame fence: list %" PRIu64 " waited over 2 s for "
+				            "the previous frame; handed out anyway (as in turn)\n",
+				            front.sequence);
+			}
 		}
 		flight             = std::make_unique<CpParFlight>();
 		flight->submission = std::move(front);
 		queue.pop_front();
 		flight->lane = lane;
 		flight->cp   = m_gfx_cp.get();
+		flight->gpu  = this;
 		// m_submission_count still counts it until it is collected (WaitForIdle, shutdown).
 	}
 	auto&      submission = flight->submission;
