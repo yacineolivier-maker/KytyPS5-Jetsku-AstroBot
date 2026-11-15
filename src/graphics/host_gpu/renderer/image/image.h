@@ -525,6 +525,9 @@ public:
 		return LaneBinding();
 	}
 	[[nodiscard]] ImageBinding& LaneBinding();
+	[[nodiscard]] const ImageBinding& Binding() const {
+		return const_cast<Image*>(this)->Binding();
+	}
 	// Every lane's flags (slot 0: binding; 1..3: lanes B..D; only slot 0 without the switch).
 	[[nodiscard]] uint32_t BindingSlots() const noexcept { return g_lane_bindings ? 4u : 1u; }
 	[[nodiscard]] ImageBinding& SlotBinding(uint32_t slot) {
