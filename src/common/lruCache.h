@@ -83,6 +83,10 @@ public:
 	// TextureCache's LRU mirror checks (KYTY_IMAGE_LRU_SKIP_VERIFY).
 	[[nodiscard]] Tick TickOf(size_t id) const { return m_items[id].tick; }
 	[[nodiscard]] bool Linked(size_t id) const { return id < m_items.size() && m_items[id].linked; }
+	// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS, deferred touches): the item's insertion generation
+	// (a freed and reused slot has a new one) and its object.
+	[[nodiscard]] uint64_t      GenerationOf(size_t id) const { return m_items[id].generation; }
+	[[nodiscard]] const Object& ObjectOf(size_t id) const { return m_items[id].object; }
 
 	void Free(size_t id) {
 		auto& item = m_items[id];

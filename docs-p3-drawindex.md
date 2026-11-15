@@ -215,3 +215,32 @@ Limites : les conditions qui portent sur l'état partagé lui-même (verrous lec
 des marques : ce sont des prérequis structurels, vrais pour tous les dessins une fois faits. Une marque posée
 pendant une opération par un travail qui n'est pas le dessin (un `DrainPreparedDraws`, un service) compte pour
 ce dessin. Aucune condition n'a dû être classée « non évaluable » : toutes sont lues à une décision existante.
+
+## 5. Prérequis de P3 (étapes 1 à 3), chacun derrière son interrupteur (défaut 0)
+
+Mesure de départ (session principale, `console-20261115-204841.txt`, Aerial Garden, 20,5 i/s,
+`KYTY_CP_PAR_FASTCHECK=1`) : B ~327 000 DrawIndex / 10 s, fast 35–40 % ; C ~485 000, fast 30–32 % ;
+causes seules : `buffer-stream` (B ~86 000, C ~140 000), `buffer-written` (C ~111 000), puis
+`targets-acquired`, `head-waited`, `texture-dcc`, `submit`, `slice-yield` (quelques milliers) ;
+DrawAuto : 0 fast. L'anneau par voie ferait passer B à ~66 %, C à ~61 % ; les tampons écrits ensuite
+C à ~85 %.
+
+Module commun `drawPrep\laneShare.{h,cpp}` : lecture des interrupteurs une fois au démarrage (après
+l'activation de 2b ; refusés hors 2b), compteurs par voie, ligne toutes les 10 s
+« CpPar 10s: 2b lane share (…): A: …; B: …; ». Avec `KYTY_CP_PAR_VERIFY=1` chaque étape se contrôle.
+
+| Interrupteur | Étape | Ce qui change | Auto-contrôle (`KYTY_CP_PAR_VERIFY=1`, 0 attendu) |
+|---|---|---|---|
+| `KYTY_CP_PAR_LANE_STREAM=1` | C1 | `StreamBuffer::Lane()` : un anneau de flux de 64 Mio par voie B.. (même mémoire que l'anneau commun, créé au premier usage). Passent par lui : `UploadShaderData`/`NativeUpload` (via `GetUtilityBuffer(Stream)`), petites lectures sales CPU (`ObtainBufferNow`), index 8 bits, paramètres du tiler. Le mémo de liaison « flux » n'est repris que si sa copie est dans l'anneau de la voie. FASTCHECK ne compte plus `buffer-stream` | `stream overlaps` : une plage remise chevauche l'arc des plages encore en vol (tick non libre) ; `stream foreign` : un anneau servi à un fil d'une autre voie |
+| `KYTY_CP_PAR_LANE_DESCRIPTORS=1` | C2 | `DescriptorHeap::Commit` va au tas de la voie du fil (pools, lots, retrait au plus grand tick de ses jeux, donc au tick de la voie) | `descriptor double` : un jeu remis alors que le tick de sa remise précédente n'est pas libre (table commune à tous les tas) ; `descriptor early` : un pool retiré sous le plus grand tick de ses jeux |
+| `KYTY_CP_PAR_LANE_PREREQS=1` | C3, W1/W2, W5, W12, W13 | C3 : drapeaux de liaison d'image par voie (`Image::Binding()`), les décisions du cache (image liée ou cible quelque part, `needs_rebind`) regardent toutes les voies ; W5 : profondeur d'`UploadBatch` par voie ; W13 : `CommandScheduler::Active()` lit l'enveloppe du fil ; W1/W2 : contacts LRU d'images et de tampons d'un fil de voie sous le verrou mis de côté et appliqués à la fin de l'opération (encore sous le verrou) et avant toute collecte (entrée périmée : abandonnée, comptée) ; W12 : demande de vidage anticipé par voie | `touches stale` est informatif (entrées libérées entre-temps) |
+| aucun | W8, R8 | `g_dynamic_state_emitted` par fil (la différence est toujours prise dans un même dessin, sur son fil) ; `m_unregister_epoch` atomique (relaxé) : mêmes valeurs | — |
+
+Rien de cela ne sort une opération du verrou des voies : ce sont des prérequis du chemin rapide (§3 (a)).
+Restent à faire avant lui : C4 (états d'image), C5 (`RenderMutex` partagé), C6 (identité de voie rapide),
+le reste de §2.2–2.3, puis le chemin rapide lui-même.
+
+Limites connues : la copie de flux différée (`KYTY_STREAM_COPY_DEFER`, préréglage U59) est déjà coupée
+dès que le recorder a plusieurs flux (2a/2b) ; le mémo de plages (`RecordRangeFact`) et le mémo de
+liaison restent communs (W3) ; `KYTY_CP_OWNED_COUNTERS=1` (préréglage U59) garde ses compteurs non
+atomiques (W10) : sans effet tant que tout est sous le verrou.

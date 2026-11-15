@@ -866,6 +866,9 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 									if (LaneShare::g_descriptors) {
 										m_renderer.GetDescriptorHeap().EnableLaneHeaps(); // C2
 									}
+									if (LaneShare::g_prereqs) {
+										g_lane_bindings = true; // C3 (image/image.h)
+									}
 									std::printf("Kyty CpPar: 2b: each lane has its own replay thread; "
 									            "native buffers are handed to the queue in list "
 									            "order\n");
@@ -8972,6 +8975,13 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			if (overlay) {
 				CpPar::t_overlay = false;
 				Image::CpParEndOp(context);
+			}
+			if (LaneShare::g_prereqs) {
+				// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W1/W2): the op's deferred LRU touches,
+				// still under the lanes' lock.
+				const auto touch_lane = CommandScheduler::ThreadContext();
+				m_renderer.GetTextureCache().FlushDeferredTouches(touch_lane);
+				m_renderer.GetBufferCache().FlushDeferredTouches(touch_lane);
 			}
 			CpPar::LaneLockRelease();
 		} else {

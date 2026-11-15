@@ -1343,4 +1343,10 @@ Image::~Image() {
 	}
 }
 
+// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, C3, image.h): the recording thread's lane's flags.
+ImageBinding& Image::LaneBinding() {
+	const auto lane = CommandScheduler::ThreadContext();
+	return lane != 0 && lane <= lane_bindings.size() ? lane_bindings[lane - 1] : binding;
+}
+
 } // namespace Libs::Graphics

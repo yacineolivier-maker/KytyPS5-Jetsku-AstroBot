@@ -1507,28 +1507,28 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (image.info.data.Empty()) {
 		return;
 	}
-	if (image.binding.is_bound) {
-		image.binding.force_general |= image.binding.shader_write != storage;
+	if (image.Binding().is_bound) {
+		image.Binding().force_general |= image.Binding().shader_write != storage;
 	}
-	if (!Common::RendererBatchEnabled() || (!image.binding.is_bound && !image.binding.is_target)) {
+	if (!Common::RendererBatchEnabled() || (!image.Binding().is_bound && !image.Binding().is_target)) {
 		m_bound_images.push_back(id);
 	}
-	image.binding.is_bound = true;
-	image.binding.shader_write |= storage;
+	image.Binding().is_bound = true;
+	image.Binding().shader_write |= storage;
 }
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
 	auto& image             = m_context.GetTextureCache().GetImage(id);
-	if (!Common::RendererBatchEnabled() || (!image.binding.is_bound && !image.binding.is_target)) {
+	if (!Common::RendererBatchEnabled() || (!image.Binding().is_bound && !image.Binding().is_target)) {
 		m_bound_images.push_back(id);
 	}
-	image.binding.is_target = true;
+	image.Binding().is_target = true;
 }
 
 void RenderExecutor::ResetBindings() {
 	for (const auto id: m_bound_images) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
-			image->binding = {};
+			image->Binding() = {}; // Astro Bot PC (C3): this lane's flags
 		}
 	}
 	m_bound_images.clear();
@@ -2325,12 +2325,12 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto needs_rebind = [&](uint32_t i) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		return old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		       old_image->binding.needs_rebind;
+		       old_image->Binding().needs_rebind;
 	};
 	const auto rebind = [&](uint32_t i) {
 		if (const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		    old_image != nullptr) {
-			old_image->binding = {};
+			old_image->Binding() = {}; // Astro Bot PC (C3): this lane's flags
 		}
 		ResolveTexture(program.info.images[i], snapshot.images[i], images[i]);
 		BindImage(images[i].image_id, images[i].desc.type == TextureCache::BindingType::Storage);
@@ -2517,9 +2517,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		EXIT_IF(!target.image_id);
 		const auto old_image = cache.m_slot_images.try_get(target.image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
+		    old_image->Binding().needs_rebind) {
 			if (old_image != nullptr) {
-				old_image->binding = {};
+				old_image->Binding() = {}; // Astro Bot PC (C3): this lane's flags
 			}
 			target.desc.view_info.base_level = target.guest_mip_level;
 			target.desc.view_info.base_layer = target.guest_array_layer;
@@ -2851,8 +2851,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                            vk::AccessFlagBits2::eShaderWrite
 				                      : vk::AccessFlagBits2::eShaderRead,
 				              range, vk_buffer, true);
-			} else if (image.binding.is_target) {
-				const auto layout = image.binding.attachment_layout;
+			} else if (image.Binding().is_target) {
+				const auto layout = image.Binding().attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);
 				Profiler::CountFrameEvent(image.info.IsDepth()
 				                              ? Profiler::FrameEvent::SampledDepthAttachmentBindings
@@ -2867,12 +2867,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 				}
 				image.Transit(layout,
-				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
-				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
+				              image.Binding().attachment_access | vk::AccessFlagBits2::eShaderRead |
+				                  (image.Binding().shader_write ? vk::AccessFlagBits2::eShaderWrite
 				                                              : vk::AccessFlags2 {}),
 				              {}, vk_buffer, true);
-			} else if (image.binding.force_general && !image.info.IsDepth()) {
-				const vk::AccessFlags2 storage_access = image.binding.shader_write
+			} else if (image.Binding().force_general && !image.info.IsDepth()) {
+				const vk::AccessFlags2 storage_access = image.Binding().shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
 				image.Transit(vk::ImageLayout::eGeneral,

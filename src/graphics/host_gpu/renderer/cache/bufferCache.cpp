@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/drawPrep/laneShare.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (W1/W2)
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1144,7 +1145,7 @@ void BufferCache::Register(BufferId id) {
 }
 
 void BufferCache::Unregister(BufferId id) {
-	m_unregister_epoch++;
+	m_unregister_epoch.fetch_add(1, std::memory_order_relaxed);
 	ChangeRegister<false>(id);
 }
 
@@ -1237,7 +1238,44 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 		}
 		buffer.lru_tick = m_gc_tick;
 	}
+	if (LaneShare::g_prereqs) [[unlikely]] {
+		// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W2): a lane thread's touch under the lanes'
+		// lock waits for the op's end.
+		const auto lane = CommandScheduler::ThreadContext();
+		if (lane != 0 && lane < m_deferred_touches.size() && CpPar::LaneLockHeld()) {
+			m_deferred_touches[lane].push_back({buffer.lru_id, m_lru_cache.GenerationOf(buffer.lru_id)});
+			LaneShare::Note(lane, LaneShare::Stat::TouchDeferred);
+			return;
+		}
+	}
 	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+}
+
+void BufferCache::FlushDeferredTouches(uint32_t lane) {
+	const auto first = lane == UINT32_MAX ? size_t {1} : static_cast<size_t>(lane);
+	const auto last  = lane == UINT32_MAX ? m_deferred_touches.size() : static_cast<size_t>(lane) + 1u;
+	for (size_t index = first; index < last && index < m_deferred_touches.size(); index++) {
+		auto& touches = m_deferred_touches[index];
+		if (touches.empty()) {
+			continue;
+		}
+		uint64_t flushed = 0;
+		uint64_t stale   = 0;
+		for (const auto& touch: touches) {
+			if (!m_lru_cache.Linked(touch.lru_id) ||
+			    m_lru_cache.GenerationOf(touch.lru_id) != touch.generation) {
+				stale++;
+				continue;
+			}
+			m_lru_cache.Touch(touch.lru_id, m_gc_tick);
+			flushed++;
+		}
+		LaneShare::Note(static_cast<uint32_t>(index), LaneShare::Stat::TouchFlushed, flushed);
+		if (stale != 0) {
+			LaneShare::Note(static_cast<uint32_t>(index), LaneShare::Stat::TouchStale, stale);
+		}
+		touches.clear();
+	}
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
@@ -1627,12 +1665,29 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fau
 	    [this](uint64_t address, uint64_t bytes) noexcept { ForgetKnownFills(address, bytes); });
 }
 
+// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W12): the eager readback flush a lane's recorded
+// writer asks for is that lane's (its idle flush takes it; another lane's submit does not clear it).
+bool& BufferCache::EagerFlushFlag() noexcept {
+	if (!LaneShare::g_prereqs) [[likely]] {
+		return m_eager_flush;
+	}
+	return m_eager_flush_lane[CommandScheduler::ThreadContext() & 3u];
+}
+
+// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W5): each recording lane's scopes nest on their own.
+uint32_t& BufferCache::UploadBatchDepth() noexcept {
+	if (!LaneShare::g_prereqs) [[likely]] {
+		return m_upload_batch_depth;
+	}
+	return m_upload_batch_depth_lane[CommandScheduler::ThreadContext() & 3u];
+}
+
 BufferCache::UploadBatch::UploadBatch(BufferCache& cache): m_cache(cache) {
-	m_cache.m_upload_batch_depth++;
+	m_cache.UploadBatchDepth()++;
 }
 
 BufferCache::UploadBatch::~UploadBatch() {
-	if (--m_cache.m_upload_batch_depth == 0 && m_cache.m_scheduler.Active()) {
+	if (--m_cache.UploadBatchDepth() == 0 && m_cache.m_scheduler.Active()) {
 		auto& command = m_cache.m_scheduler.Current();
 		if (command.IsInvalid()) {
 			return;
@@ -2283,7 +2338,7 @@ bool BufferCache::TryFalseSharingWrite(uint64_t vaddr, uint64_t size, ReadMemory
 	// Submit the recording that copies them soon (within the eager-flush budget): the sooner it
 	// completes, the shorter the time guest reads of those bytes see their old contents.
 	if (m_eager_flush_budget != 0) {
-		m_eager_flush = true;
+		EagerFlushFlag() = true;
 	}
 	m_false_sharing_totals.writes++;
 	m_false_sharing_totals.bytes += bytes;
@@ -2780,7 +2835,7 @@ void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
 	    m_eager_flush_budget != 0) {
 		// A page the command processor reads back: submit this recording once the writer is
 		// recorded, so the read after it finds a submitted (ideally finished) producer.
-		m_eager_flush = true;
+		EagerFlushFlag() = true;
 	}
 }
 
@@ -2820,7 +2875,7 @@ void BufferCache::IssueEagerReadbacks() {
 		return;
 	}
 	// This submission is the early flush a recorded writer may have asked for.
-	m_eager_flush = false;
+	EagerFlushFlag() = false;
 	if (m_eager.Empty()) {
 		return;
 	}
@@ -2964,10 +3019,10 @@ EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page
 }
 
 bool BufferCache::TakeEagerFlushRequest(bool in_rendering) {
-	if (!m_eager_flush || in_rendering) {
+	if (!EagerFlushFlag() || in_rendering) {
 		return false;
 	}
-	m_eager_flush    = false;
+	EagerFlushFlag()    = false;
 	const auto frame = m_memory_tracker.Frame();
 	if (frame != m_eager_flush_frame) {
 		m_eager_flush_frame = frame;
@@ -3358,7 +3413,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			source = StageUploadDma(source, copies, &host_copies, force_dma);
 			command.RequestUploadCopy(source, buffer.Handle(), copies);
 			buffer.MarkContentWritten();
-			if (m_upload_batch_depth == 0) {
+			if (UploadBatchDepth() == 0) {
 				command.FlushBarriers();
 			}
 			if (is_texel_buffer && !is_written) {
@@ -3781,7 +3836,7 @@ BufferCache::NativeWindow* BufferCache::NativeTierLookup(uint64_t vaddr, uint64_
 		w.buffer = nullptr;
 		return nullptr;
 	}
-	if (w.unregister != m_unregister_epoch) {
+	if (w.unregister != UnregisterEpoch()) {
 		m_n3_draw.inv_unregister++;
 		w.buffer = nullptr;
 		return nullptr;
@@ -3838,7 +3893,7 @@ void BufferCache::NativeTierLearn(uint64_t vaddr, uint64_t size, const std::pair
 		w.generation = m_n3_generation;
 		w.epoch      = SyncEpoch::Current();
 		w.structure  = structure;
-		w.unregister = m_unregister_epoch;
+		w.unregister = UnregisterEpoch();
 		w.signature  = before;
 		w.touched    = m_gc_tick; // the normal path touched the buffer
 		m_n3_draw.learned++;
@@ -5183,6 +5238,9 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RetireUnusedBuffers(uint64_t frame, uint64_t min_age) {
+	if (LaneShare::g_prereqs) [[unlikely]] {
+		FlushDeferredTouches(UINT32_MAX); // Astro Bot PC (W1/W2): every lane's touches first
+	}
 	if (frame <= min_age) {
 		return;
 	}
@@ -5227,6 +5285,9 @@ void BufferCache::RetireUnusedBuffers(uint64_t frame, uint64_t min_age) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	if (LaneShare::g_prereqs) [[unlikely]] {
+		FlushDeferredTouches(UINT32_MAX); // Astro Bot PC (W1/W2): every lane's touches first
+	}
 	MaintainHotPages();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {

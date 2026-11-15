@@ -158,6 +158,14 @@ public:
 	// (and its eager copy can complete) before that read, instead of the read draining the GPU.
 	// Budgeted per frame (KYTY_READBACK_EAGER_FLUSHES, default 8; 0 disables).
 	[[nodiscard]] bool TakeEagerFlushRequest(bool in_rendering);
+	// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W1/W2): the LRU touches the calling lane thread
+	// deferred during its op (under the lanes' lock), applied now; all lanes: lane = UINT32_MAX.
+	void FlushDeferredTouches(uint32_t lane);
+	struct DeferredTouch {
+		size_t   lru_id     = 0;
+		uint64_t generation = 0;
+	};
+	std::array<std::vector<DeferredTouch>, 4> m_deferred_touches; // index = lane
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	// Astro Bot PC (KYTY_NATIVE_S1_SAFE): the cache buffer of an id, null when the slot is free (an
 	// unregistered buffer still in its slot has is_deleted set). Read-only, GPU thread.
@@ -272,7 +280,10 @@ public:
 	// Buffers unregistered so far (a join retires the buffers it absorbs, an unmap or the
 	// collector deletes them): a draw or dispatch whose resolved bindings were made before the
 	// count moved may hold a retired buffer (KYTY_REBIND_AFTER_JOIN, RenderExecutor).
-	[[nodiscard]] uint64_t UnregisterEpoch() const noexcept { return m_unregister_epoch; }
+	// Astro Bot PC (P3 prerequisites, R8): atomic (relaxed; same values), read by every lane.
+	[[nodiscard]] uint64_t UnregisterEpoch() const noexcept {
+		return m_unregister_epoch.load(std::memory_order_relaxed);
+	}
 	// Publications can outlive cache ownership. Registration is on the GPU thread; completion
 	// is on the priority worker, and these queries never wait for GPU work or backing writes.
 	[[nodiscard]] uint64_t BeginBackingPublication(std::span<const GuestRange> ranges,
@@ -777,7 +788,7 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
-	uint64_t                                          m_unregister_epoch = 0;
+	std::atomic<uint64_t>                             m_unregister_epoch {0};
 	struct KnownFillRange {
 		uint64_t address = 0;
 		uint64_t size    = 0;
@@ -891,6 +902,9 @@ private:
 	};
 	FalseSharingTotals m_false_sharing_totals;
 	uint32_t                                          m_upload_batch_depth = 0;
+	// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W5): the depth per recording lane (index = lane).
+	std::array<uint32_t, 4>                           m_upload_batch_depth_lane {};
+	[[nodiscard]] uint32_t& UploadBatchDepth() noexcept;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
 	// GPU-thread-only snapshots taken BEFORE the last full scan, never after it.
@@ -1016,6 +1030,9 @@ private:
 	bool               m_eager_enabled       = false;
 	EagerReadbackPages m_eager;
 	bool               m_eager_flush         = false;
+	// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W12): the request per recording lane (index = lane).
+	std::array<bool, 4> m_eager_flush_lane {};
+	[[nodiscard]] bool& EagerFlushFlag() noexcept;
 	uint32_t           m_eager_flush_budget  = 0;
 	uint32_t           m_eager_flush_frame   = 0;
 	uint32_t           m_eager_flushes       = 0;

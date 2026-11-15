@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/image/keptRanges.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <compare>
 #include <limits>
@@ -64,6 +65,13 @@ struct ImageBinding {
 	bool             force_general = false;
 	bool             shader_write  = false;
 };
+
+// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, drawPrep/laneShare.h, C3): the binding flags are the
+// state of one command buffer's draw: with the switch, each lane B.. keeps its own (Image::Binding,
+// the recording thread's lane), lane A and the threads without a lane keep Image::binding. The
+// cache's own decisions (an image bound or a target anywhere, a rebind) look at every lane's.
+// Start-up only (graphicsRun.cpp).
+inline bool g_lane_bindings = false;
 
 class Image final {
 public:
@@ -507,6 +515,48 @@ public:
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
+	// Astro Bot PC (C3, g_lane_bindings): lanes B, C, D's flags (unused without the switch).
+	std::array<ImageBinding, 3> lane_bindings {};
+	// The recording thread's lane's flags (binding without the switch).
+	[[nodiscard]] ImageBinding& Binding() {
+		if (!g_lane_bindings) [[likely]] {
+			return binding;
+		}
+		return LaneBinding();
+	}
+	[[nodiscard]] ImageBinding& LaneBinding();
+	// Every lane's flags (slot 0: binding; 1..3: lanes B..D; only slot 0 without the switch).
+	[[nodiscard]] uint32_t BindingSlots() const noexcept { return g_lane_bindings ? 4u : 1u; }
+	[[nodiscard]] ImageBinding& SlotBinding(uint32_t slot) {
+		return slot == 0 ? binding : lane_bindings[slot - 1];
+	}
+	[[nodiscard]] const ImageBinding& SlotBinding(uint32_t slot) const {
+		return slot == 0 ? binding : lane_bindings[slot - 1];
+	}
+	// Bound or a target in some lane; a target in some lane.
+	[[nodiscard]] bool BoundAnywhere() const noexcept {
+		for (uint32_t slot = 0; slot < BindingSlots(); slot++) {
+			if (SlotBinding(slot).is_bound || SlotBinding(slot).is_target) {
+				return true;
+			}
+		}
+		return false;
+	}
+	[[nodiscard]] bool TargetAnywhere() const noexcept {
+		for (uint32_t slot = 0; slot < BindingSlots(); slot++) {
+			if (SlotBinding(slot).is_target) {
+				return true;
+			}
+		}
+		return false;
+	}
+	// needs_rebind in every lane where the image is bound or a target.
+	void MarkRebindWhereBound() noexcept {
+		for (uint32_t slot = 0; slot < BindingSlots(); slot++) {
+			auto& flags = SlotBinding(slot);
+			flags.needs_rebind |= flags.is_bound || flags.is_target;
+		}
+	}
 	bool             registered     = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;

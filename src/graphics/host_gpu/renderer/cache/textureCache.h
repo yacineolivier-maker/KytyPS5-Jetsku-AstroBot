@@ -319,6 +319,19 @@ private:
 	void                      FreeImage(ImageId id, HangTrace::ImageFreeReason reason =
 	                                                    HangTrace::ImageFreeReason::Other);
 	void                      TouchImage(Image& image);
+	// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W1): the LRU touches a lane thread (B..) makes
+	// while it holds the lanes' lock are kept per lane (slot and generation) and applied at the
+	// op's end (FlushDeferredTouches(lane), still under the lock) or before any collection (all
+	// lanes: UINT32_MAX). A slot freed or reused since is dropped.
+public:
+	void                      FlushDeferredTouches(uint32_t lane);
+
+private:
+	struct DeferredTouch {
+		size_t   lru_id     = 0;
+		uint64_t generation = 0;
+	};
+	std::array<std::vector<DeferredTouch>, 4> m_deferred_touches;
 	void                      SyncAliasFromOwner(ImageId id);
 	void                      TrackImage(ImageId id);
 	// Chunk-granular tracking (Image::ChunkState). Caller holds m_lock.

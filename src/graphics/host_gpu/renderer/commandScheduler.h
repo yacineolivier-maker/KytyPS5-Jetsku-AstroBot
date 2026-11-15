@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/drawPrep/laneShare.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -133,7 +134,12 @@ public:
 	// an op (an indirect multi-draw's per-record draw index).
 	[[nodiscard]] HW::Shader* BoundShaders() const noexcept { return Cmd().m_shaders; }
 
-	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W13): the calling thread's wrapper (every wrapper is
+	// bound together, CommandScheduler::Begin): a lane no longer reads lane A's register pointer,
+	// which lane A rewrites at every committed draw (same value: never null once begun).
+	[[nodiscard]] bool Active() const noexcept {
+		return (LaneShare::g_prereqs ? Cmd() : m_command).m_registers != nullptr;
+	}
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	// Astro Bot PC (KYTY_CP_PAR=1b3): the calling thread's wrapper names a native buffer.

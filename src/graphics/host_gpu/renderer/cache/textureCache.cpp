@@ -21,6 +21,8 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+#include "graphics/host_gpu/renderer/drawPrep/laneShare.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (W1/W2)
 #include "graphics/host_gpu/renderer/image/dccClear.h"
 #include "graphics/host_gpu/renderer/image/imageClearRange.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -943,7 +945,7 @@ void TextureCache::RetireIdlePartialImages() {
 		const bool idle =
 		    frame - std::min(frame, image->frame_accessed_last) > m_resident_idle_frames &&
 		    tick - std::min(tick, image->tick_accessed_last) > NumFramesBeforeRemoval &&
-		    !image->binding.is_bound && !image->binding.is_target && !image->IsGpuModified();
+		    !image->BoundAnywhere() && !image->IsGpuModified();
 		if (idle) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureResidentIdleFrees);
 			FreeImage(id, HangTrace::ImageFreeReason::ResidentIdle);
@@ -1249,9 +1251,51 @@ void TextureCache::TouchImage(Image& image) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruTouchSkips);
 		return;
 	}
+	if (LaneShare::g_prereqs) [[unlikely]] {
+		// Astro Bot PC (KYTY_CP_PAR_LANE_PREREQS=1, W1): a lane thread's touch under the lanes'
+		// lock waits for the op's end.
+		const auto lane = CommandScheduler::ThreadContext();
+		if (lane != 0 && lane < m_deferred_touches.size() && CpPar::LaneLockHeld()) {
+			m_deferred_touches[lane].push_back({image.lru_id, m_lru_cache.GenerationOf(image.lru_id)});
+			LaneShare::Note(lane, LaneShare::Stat::TouchDeferred);
+			return;
+		}
+	}
 	bump(m_lru_touch_totals.touches);
 	m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	image.lru_tick = m_lru_cache.TickOf(image.lru_id);
+}
+
+void TextureCache::FlushDeferredTouches(uint32_t lane) {
+	const auto first = lane == UINT32_MAX ? size_t {1} : static_cast<size_t>(lane);
+	const auto last  = lane == UINT32_MAX ? m_deferred_touches.size() : static_cast<size_t>(lane) + 1u;
+	for (size_t index = first; index < last && index < m_deferred_touches.size(); index++) {
+		auto& touches = m_deferred_touches[index];
+		if (touches.empty()) {
+			continue;
+		}
+		uint64_t flushed = 0;
+		uint64_t stale   = 0;
+		for (const auto& touch: touches) {
+			if (!m_lru_cache.Linked(touch.lru_id) ||
+			    m_lru_cache.GenerationOf(touch.lru_id) != touch.generation) {
+				stale++;
+				continue;
+			}
+			m_lru_cache.Touch(touch.lru_id, m_gc_tick);
+			if (auto* image = m_slot_images.try_get(m_lru_cache.ObjectOf(touch.lru_id)); image != nullptr) {
+				image->lru_tick = m_lru_cache.TickOf(touch.lru_id);
+			}
+			flushed++;
+		}
+		m_lru_touch_totals.touches.store(m_lru_touch_totals.touches.load(std::memory_order_relaxed) + flushed,
+		                                 std::memory_order_relaxed);
+		LaneShare::Note(static_cast<uint32_t>(index), LaneShare::Stat::TouchFlushed, flushed);
+		if (stale != 0) {
+			LaneShare::Note(static_cast<uint32_t>(index), LaneShare::Stat::TouchStale, stale);
+		}
+		touches.clear();
+	}
 }
 
 bool TextureCache::LruMirrorHolds(Image& image, bool skip) {
@@ -2245,8 +2289,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			    !SameBacking(other->info, info, true)) {
 				continue;
 			}
-			if (cached.binding.is_bound || cached.binding.is_target) {
-				cached.binding.needs_rebind = true;
+			if (cached.BoundAnywhere()) {
+				cached.MarkRebindWhereBound(); // Astro Bot PC (C3): every lane where bound
 				NoteImageStateChange();
 			}
 			return other_id;
@@ -2257,8 +2301,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
-	if (cached.binding.is_bound || cached.binding.is_target) {
-		cached.binding.needs_rebind = true;
+	if (cached.BoundAnywhere()) {
+		cached.MarkRebindWhereBound(); // Astro Bot PC (C3): every lane where bound
 		NoteImageStateChange();
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
@@ -2420,8 +2464,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (!merged_id) {
 			return {ExpandImage(requested, cached_id)};
 		}
-		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
-		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
+		cached.MarkRebindWhereBound(); // Astro Bot PC (C3): every lane where bound
+		for (uint32_t slot = 0; slot < cached.BindingSlots(); slot++) { // Astro Bot PC (C3)
+			m_slot_images[merged_id].SlotBinding(slot).is_target |= cached.SlotBinding(slot).is_target;
+		}
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
 		FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapMipMerge);
@@ -2446,7 +2492,7 @@ bool TextureCache::KeepOverlappedImage(const Image& cached, uint64_t current_fra
 	return m_overlap_keep_frames != 0 && !m_overlap_crowded && cached.ChunkTracked() &&
 	       !cached.IsGpuModified() && !cached.IsBufferModified() && !cached.depth_id &&
 	       !cached.usage.render_target && !cached.usage.depth_target && !cached.usage.storage &&
-	       !cached.usage.video_out && !cached.binding.is_target &&
+	       !cached.usage.video_out && !cached.TargetAnywhere() &&
 	       current_frame - std::min(current_frame, cached.frame_accessed_last) <=
 	           m_overlap_keep_frames;
 }
@@ -2462,8 +2508,8 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	if (!info.IsBlock() || source.info.IsBlock()) {
 		expanded.usage = source.usage;
 	}
-	if (source.binding.is_bound || source.binding.is_target) {
-		source.binding.needs_rebind = true;
+	if (source.BoundAnywhere()) {
+		source.MarkRebindWhereBound(); // Astro Bot PC (C3): every lane where bound
 		NoteImageStateChange();
 	}
 	// The copy below supplies the source's bytes (and their ownership): the refresh must not move
@@ -4587,7 +4633,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
-		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+		if (!image.registered || image.depth_id || image.Binding().needs_rebind) {
 			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 		}
 		// The view's levels must be resident (a storage binding: the whole chain). FindImage
@@ -4635,7 +4681,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc,
 	}
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
-	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+	if (!image.registered || image.depth_id || image.Binding().needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	RequireFullResidency(id);
@@ -4678,7 +4724,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
-	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+	if (!image.registered || image.depth_id || image.Binding().needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	RequireFullResidency(id);
@@ -6579,7 +6625,7 @@ bool TextureCache::IdleRetirable(const Image& image, uint64_t frame, uint64_t mi
 	// a probe or impostor rendered once and sampled minutes later would come back as stale guest
 	// bytes. Freeing them needs a download into guest memory first, not an age.
 	return image.registered && !image.depth_id && !image.IsGpuModified() &&
-	       !image.binding.is_bound && !image.binding.is_target && !image.usage.video_out &&
+	       !image.BoundAnywhere() && !image.usage.video_out &&
 	       frame - std::min(frame, image.frame_accessed_last) > min_age;
 }
 
@@ -6635,6 +6681,9 @@ bool TextureCache::KeptIdlePool(const Image& image) const {
 
 uint64_t TextureCache::RetireUnusedImages(uint64_t frame, uint64_t min_age, size_t max_count,
                                           uint64_t enough, bool idle_pass) {
+	if (LaneShare::g_prereqs) [[unlikely]] {
+		FlushDeferredTouches(UINT32_MAX); // Astro Bot PC (W1/W2): every lane's touches first
+	}
 	if (frame <= min_age) {
 		return 0;
 	}
@@ -6690,6 +6739,9 @@ uint64_t TextureCache::RetireUnusedImages(uint64_t frame, uint64_t min_age, size
 
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
+	if (LaneShare::g_prereqs) [[unlikely]] {
+		FlushDeferredTouches(UINT32_MAX); // Astro Bot PC (W1/W2): every lane's touches first
+	}
 	RetireIdlePartialImages();
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -6807,6 +6859,9 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::RunPressureGarbageCollector(uint64_t tick) {
+	if (LaneShare::g_prereqs) [[unlikely]] {
+		FlushDeferredTouches(UINT32_MAX); // Astro Bot PC (W1/W2): every lane's touches first
+	}
 	// Driver heap usage includes images awaiting deferred destruction. Do not evict
 	// a second cache's worth of resources while those bytes are already retiring.
 	const auto pending_bytes = m_graphics.CanReportMemoryUsage() ? m_pressure_retirement_bytes : 0;

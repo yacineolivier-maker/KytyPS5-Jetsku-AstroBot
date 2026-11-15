@@ -246,7 +246,7 @@ bool TextureBindingMemo::FindHint(const Key& key, uint64_t hash, uint64_t& tag) 
 Image* TextureBindingMemo::HitImage(TextureCache& cache, const Entry& entry) {
 	auto* image = cache.m_slot_images.try_get(entry.image);
 	if (image == nullptr || !image->registered || image->depth_id ||
-	    image->binding.needs_rebind || entry.requested_first < image->resident_first ||
+	    image->Binding().needs_rebind || entry.requested_first < image->resident_first ||
 	    cache.PageVersion(entry.page) != entry.page_version ||
 	    (entry.has_partner && !image->alias_owner && !image->info.HasStencil())) {
 		return nullptr;
@@ -354,7 +354,7 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		// owner and a residency extension (resident levels changed, or fewer than the view
 		// samples) are FindImage/RebindImages work: all take the full resolution.
 		if (image == nullptr || !image->registered || image->depth_id ||
-		    image->binding.needs_rebind || entry.requested_first < image->resident_first) {
+		    image->Binding().needs_rebind || entry.requested_first < image->resident_first) {
 			return stale();
 		}
 		// A structural change on the description's first page may alter what FindImage returns:
@@ -496,7 +496,7 @@ bool TextureBindingMemo::ViewImageReady(const Entry& entry, const Image& image) 
 	// FindTexture's rediscovery checks, a no-op EnsureResidency (the view's levels are resident),
 	// a no-op RefreshImage, and no stencil plane refresh.
 	return image.info.data.Empty() ||
-	       (image.registered && !image.depth_id && !image.binding.needs_rebind &&
+	       (image.registered && !image.depth_id && !image.Binding().needs_rebind &&
 	        entry.requested_first >= image.resident_first && !image.info.HasStencil() &&
 	        RefreshIsNoOp(image));
 }
@@ -573,7 +573,7 @@ bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<Texture
 		// TryResolve's conditions for a hit that needs no revalidation.
 		const auto* image = cache.m_slot_images.try_get(entry.image);
 		if (image == nullptr || !image->registered || image->depth_id ||
-		    image->binding.needs_rebind || entry.requested_first < image->resident_first ||
+		    image->Binding().needs_rebind || entry.requested_first < image->resident_first ||
 		    cache.PageVersion(entry.page) != entry.page_version ||
 		    (entry.has_partner && !image->alias_owner && !image->info.HasStencil()) ||
 		    (entry.dcc && !cache.MetadataPagesHold(entry.dcc_noop))) {
@@ -624,7 +624,7 @@ uint32_t TextureBindingMemo::RepeatResolveFailure(TextureCache&                 
 			continue;
 		}
 		const auto* image = cache.m_slot_images.try_get(entry.image);
-		if (image == nullptr || !image->registered || image->depth_id || image->binding.needs_rebind) {
+		if (image == nullptr || !image->registered || image->depth_id || image->Binding().needs_rebind) {
 			return 3;
 		}
 		if (entry.requested_first < image->resident_first) {
@@ -659,7 +659,7 @@ bool TextureBindingMemo::TryRepeatViews(TextureCache& cache, std::span<TextureBi
 		const auto* image = cache.m_slot_images.try_get(binding.image_id);
 		// RebindImages resolves a binding again when its image is gone, unregistered (null images
 		// never are) or awaits a rebind; then TryAcquireView's conditions.
-		if (image == nullptr || image->binding.needs_rebind) {
+		if (image == nullptr || image->Binding().needs_rebind) {
 			return false;
 		}
 		if (!image->info.data.Empty() &&

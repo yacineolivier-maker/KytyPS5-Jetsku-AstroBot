@@ -417,8 +417,9 @@ static bool DynamicStateShadowEnabled() {
 }
 
 // Dynamic-state commands recorded by draws (GPU thread; KYTY_DRAW_RUN=verify reads the difference
-// around a continuation's dynamic state).
-static uint64_t g_dynamic_state_emitted = 0;
+// around a continuation's dynamic state). Astro Bot PC (P3 prerequisites, W8): per thread; the
+// difference is always taken inside one draw, on its thread, so the values compared are the same.
+static thread_local uint64_t g_dynamic_state_emitted = 0;
 
 // Records one dynamic-state group unless the shadow proves the command buffer already holds
 // exactly these values (see GraphicsDynamicStateShadow for when that holds).
@@ -916,7 +917,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		EXIT_IF(!target.image_id);
 		const auto owner = cache.m_slot_images.try_get(target.image_id);
 		if (owner == nullptr || (!owner->registered && !owner->info.data.Empty()) ||
-		    owner->binding.needs_rebind) {
+		    owner->Binding().needs_rebind) {
 			EXIT("color target changed after render-state discovery\n");
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc,
@@ -925,12 +926,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
-		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
+		const auto  layout = image.Binding().is_bound ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
-		image.binding.attachment_layout = layout;
-		image.binding.attachment_access =
+		image.Binding().attachment_layout = layout;
+		image.Binding().attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
-		image.Transit(layout, image.binding.attachment_access,
+		image.Transit(layout, image.Binding().attachment_access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Identity(), true);
@@ -947,7 +948,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	CommitStats::SubScope depth_scope(CommitStats::Sub::AcquireDepth);
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
-		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
+		if (owner == nullptr || !owner->registered || owner->Binding().needs_rebind) {
 			EXIT("depth target changed after render-state discovery\n");
 		}
 		// FindDepthTarget treats the binding as a write. Restored below for draws that write
@@ -1083,8 +1084,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			access = sampled;
 		}
 		m_depth_feedback = {depth.image_id, static_cast<bool>(draw_writes), true};
-		image.binding.attachment_layout = layout;
-		image.binding.attachment_access = access;
+		image.Binding().attachment_layout = layout;
+		image.Binding().attachment_access = access;
 		image.Transit(layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
@@ -2634,7 +2635,7 @@ uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachme
 			field = 2;
 		} else if (image->registered != mark.registered) {
 			field = 3;
-		} else if (image->binding.needs_rebind) {
+		} else if (image->Binding().needs_rebind) {
 			field = 4;
 		} else if (image->resident_first != mark.resident_first) {
 			field = 5;
@@ -2739,21 +2740,21 @@ void RenderExecutor::DrawRunMarkBindings() {
 			if (image->info.data.Empty()) {
 				continue;
 			}
-			if (image->binding.is_bound) {
-				image->binding.force_general |= image->binding.shader_write;
+			if (image->Binding().is_bound) {
+				image->Binding().force_general |= image->Binding().shader_write;
 			}
 			if (!Common::RendererBatchEnabled() ||
-			    (!image->binding.is_bound && !image->binding.is_target)) {
+			    (!image->Binding().is_bound && !image->Binding().is_target)) {
 				m_bound_images.push_back(mark.id);
 			}
-			image->binding.is_bound = true;
+			image->Binding().is_bound = true;
 		} else {
 			// BindRenderTarget.
 			if (!Common::RendererBatchEnabled() ||
-			    (!image->binding.is_bound && !image->binding.is_target)) {
+			    (!image->Binding().is_bound && !image->Binding().is_target)) {
 				m_bound_images.push_back(mark.id);
 			}
-			image->binding.is_target = true;
+			image->Binding().is_target = true;
 		}
 	}
 }
@@ -3330,7 +3331,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 		bool clean = true;
 		for (const auto& mark: run.images) {
 			const auto* image = m_context.GetTextureCache().m_slot_images.try_get(mark.id);
-			clean = clean && image != nullptr && !image->binding.needs_rebind &&
+			clean = clean && image != nullptr && !image->Binding().needs_rebind &&
 			        (image->info.data.Empty() ||
 			         (image->registered && !image->IsCpuDirty() && !image->IsBufferModified())) &&
 			        (!mark.texture || DrawRunTextureReady(*image));
