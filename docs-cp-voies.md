@@ -19,6 +19,7 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `48d04f8c` | 3a | 2b accepté avec `KYTY_EOP_TIMESTAMPS=gpu` (préréglage U59) ; tas de descripteurs : un pool se retire au plus grand tick de ses utilisateurs | BUILD_OK |
 | `ae518a8e` | 3b-1 | retraits « au tick du fil appelant » relevés ; dépendance de soumission UploadDma par voie ; compteur « early retires avoided » | BUILD_OK |
 | `36a6a7ee` | 3b-2 (partielle) | verrou global FIFO des voies autour de chaque opération (`KYTY_CP_PAR_LOCK=0` le coupe), `IsGpuThread` vrai pour son détenteur ; compteurs prises/attente/temps tenu | BUILD_OK |
+| `8aae2d32` | 3b-2 (suite) | état du `CommandProcessor` gardé d'une opération à l'autre, par voie (`LaneCpState`, indice = voie effective) ; `m_resolve_lane` remplacé en 2b | BUILD_OK |
 | `ba1b4058` | 4–5 | registre des plages liées/écrites par segment ouvert, attente de dépendance, violations d'ordre (`KYTY_CP_PAR_VERIFY=1`), ligne « CpPar 10s: 2b » complète | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
@@ -89,6 +90,19 @@ tick plus grand en tête ne fait que retarder) : correct aussi en simultané. Re
 utilisateur : les pools de descripteurs (corrigé en 3a : plus grand tick des utilisateurs). Corrigé en 3b-1 :
 la dépendance de soumission d'`UploadDma` (un seul `m_stage_tick`) devient propre à chaque voie. « early
 retires avoided » (ligne 2b) compte les cas où l'ancien calcul aurait été trop tôt : 0 attendu à tour de rôle.
+
+Mesuré le 15/11 16 h 14 (Aerial Garden, préréglage U59, EOP `gpu`) : 2b N=2 22,1 i/s, N=3 24,2, vérification
+16,7, verrou coupé 20,8 ; aucune perte du GPU, 0 violation, 0 retrait trop tôt ; verrou ~0,7 M prises/10 s, ~40 ms
+d'attente, ~4 s tenu.
+
+**3b-2, suite (`8aae2d32`).** `submit_id`, `deferred_eop_flushes`, `packets_since_eop_request`,
+`idle_flush_tick/draws`, `slice_draws` : un jeu par voie en 2b (`CommandProcessor::LaneCpState`, indice
+`CpPar::EffectiveLane()` = voie du fil, ou voie dont Thread_Gpu sert la requête). `m_resolve_lane` n'est plus lu
+en 2b. `g_current_execution` / `g_current_processor` étaient déjà propres à chaque fil. Effet à tour de rôle : les
+compteurs de vidange différée et de vidange « GPU au repos » ne se cumulent plus entre voies (chaque voie vide
+selon ses propres seuils). **Restent** : `RenderMutex` (propriétaire unique donné avec le jeton : en 3b-3, tout
+accès « propriétaire » doit devenir « tient le verrou des voies ») et le compteur d'opérations exécutées du
+séquenceur (ne suit que Thread_Gpu ; par voie, comme les fenêtres DrawPrep).
 
 **3b-2 (partielle).** Verrou global FIFO des voies (`CpPar::LaneLockAcquire`), pris autour de chaque opération
 d'une voie dans `ResolveSubmission` (pas autour des flips renvoyés à Thread_Gpu) ; `IsGpuThread()` répond aussi
