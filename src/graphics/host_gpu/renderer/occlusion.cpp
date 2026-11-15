@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR=2b)
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -134,6 +135,14 @@ void OcclusionCounter::ReferenceBatch(uint64_t counter, const std::vector<uint64
 }
 
 OcclusionCounter::OcclusionCounter(RenderContext& context): m_context(context) {}
+
+// Astro Bot PC (KYTY_CP_PAR=2b, morceau (b), occlusion.h).
+uint32_t OcclusionCounter::LaneOf() noexcept {
+	if (!CpPar::Lanes2b()) {
+		return 0;
+	}
+	return std::min<uint32_t>(CommandScheduler::ThreadContext(), MaxBatchLanes - 1);
+}
 OcclusionCounter::~OcclusionCounter() {
 	// RenderContext drains its scheduler before member destruction (the scheduler is declared
 	// before this counter, so it is still alive here).
@@ -141,7 +150,9 @@ OcclusionCounter::~OcclusionCounter() {
 		m_context.GetCommandScheduler().SetPreSubmitHook(nullptr, nullptr);
 	}
 	auto device = m_context.GetGraphics().device;
-	if (m_pool) device.destroyQueryPool(m_pool);
+	for (auto& lane: m_lane_batches) {
+		if (lane.pool) device.destroyQueryPool(lane.pool);
+	}
 	if (m_pipeline) device.destroyPipeline(m_pipeline);
 	if (m_layout) device.destroyPipelineLayout(m_layout);
 	if (m_descriptors) device.destroyDescriptorSetLayout(m_descriptors);
@@ -151,14 +162,20 @@ OcclusionCounter::~OcclusionCounter() {
 }
 
 void OcclusionCounter::Initialize() {
-	if (m_pool) return;
+	auto& lane = B();
+	if (lane.pool) return;
 	auto& graphics = m_context.GetGraphics();
 	auto& scheduler = m_context.GetCommandScheduler();
 	EXIT_IF(!graphics.precise_occlusion_enabled || graphics.max_push_descriptors < 3);
 	vk::QueryPoolCreateInfo query {};
 	query.queryType = vk::QueryType::eOcclusion;
 	query.queryCount = QueryCapacity;
-	RequireVulkanSuccess(graphics.device.createQueryPool(&query, nullptr, &m_pool), "create occlusion pool");
+	RequireVulkanSuccess(graphics.device.createQueryPool(&query, nullptr, &lane.pool), "create occlusion pool");
+	if (m_counter) {
+		// Astro Bot PC (KYTY_CP_PAR=2b, morceau (b)): another lane's pool (its reset window starts
+		// with no index reset); the common objects exist already.
+		return;
+	}
 	const std::array<vk::DescriptorSetLayoutBinding, 3> bindings {{
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
 	    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
@@ -288,13 +305,13 @@ void OcclusionCounter::VerifyReduce() {
 	// Adds the queries ended since the last verify reduction to the verify counter (outside
 	// rendering), exactly as FlushPending adds the pending ones without the batch.
 	KYTY_GPU_OP_SITE("occlusion.verify");
-	const uint32_t fresh = m_queries.Pending() - m_verified;
+	const uint32_t fresh = B().queries.Pending() - B().verified;
 	if (fresh == 0) return;
 	m_context.GetCommandScheduler().Current().Sink().copyQueryPoolResults(
-	    m_pool, m_verified, fresh, m_verify_result->Handle(), 0, 8,
+	    B().pool, B().verified, fresh, m_verify_result->Handle(), 0, 8,
 	    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 	VerifyDispatch(0, m_verify_counter->Handle(), 0, m_verify_counter->Size(), fresh);
-	m_verified = m_queries.Pending();
+	B().verified = B().queries.Pending();
 }
 
 void OcclusionCounter::PreSubmit(void* context) {
@@ -305,13 +322,13 @@ void OcclusionCounter::FlushBatch() {
 	KYTY_GPU_OP_SITE("occlusion.batch");
 	if (!m_batch_pipeline) return;
 	auto& scheduler = m_context.GetCommandScheduler();
-	if (m_queries.Active()) {
+	if (B().queries.Active()) {
 		// A counted instance is open (the scheduler is submitting mid-instance): end it so its
 		// query joins this batch. Ending rendering may itself flush (pool full, Accumulate).
 		scheduler.EndRendering();
 	}
-	if (m_batch_count == 0 && m_queries.Pending() == 0) return;
-	EXIT_IF(m_queries.Active() || m_prepared);
+	if (B().batch_count == 0 && B().queries.Pending() == 0) return;
+	EXIT_IF(B().queries.Active() || B().prepared);
 	// The batch's dumps took this tick as their completion tick: the reduction must be recorded
 	// into this very command buffer (nothing below may submit it).
 	const auto tick    = scheduler.CurrentTick();
@@ -320,8 +337,8 @@ void OcclusionCounter::FlushBatch() {
 	}
 	auto&      command = scheduler.Current();
 	const auto sink    = command.Sink();
-	if (m_queries.Pending() != 0) {
-		sink.copyQueryPoolResults(m_pool, 0, m_queries.Pending(), m_result->Handle(), 0, 8,
+	if (B().queries.Pending() != 0) {
+		sink.copyQueryPoolResults(B().pool, 0, B().queries.Pending(), m_result->Handle(), 0, 8,
 		                          vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 	}
 	const vk::DescriptorBufferInfo infos[] {{m_result->Handle(), 0, m_result->Size()},
@@ -343,7 +360,7 @@ void OcclusionCounter::FlushBatch() {
 	command.BindPipeline(vk::PipelineBindPoint::eCompute, m_batch_pipeline);
 	command.PushDescriptors(vk::PipelineBindPoint::eCompute, m_batch_layout, 0,
 	                        static_cast<uint32_t>(writes.size()), writes.data());
-	const uint32_t push[] {m_batch_first_slot, m_batch_count, m_queries.Pending(), m_slot_count};
+	const uint32_t push[] {B().batch_first_slot, B().batch_count, B().queries.Pending(), m_slot_count};
 	command.PushConstants(m_batch_layout, vk::ShaderStageFlagBits::eCompute, sizeof(push), push);
 	sink.dispatch(1, 1, 1);
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
@@ -351,10 +368,10 @@ void OcclusionCounter::FlushBatch() {
 	sink.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eAllCommands, {},
 	                     1, &barrier, 0, nullptr, 0, nullptr);
 	EXIT_IF(scheduler.CurrentTick() != tick);
-	m_queries.Reduced();
-	m_reset_window.Reduced();
-	m_verified    = 0;
-	m_batch_count = 0;
+	B().queries.Reduced();
+	B().reset_window.Reduced();
+	B().verified    = 0;
+	B().batch_count = 0;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionReductions);
 }
 
@@ -414,9 +431,9 @@ void OcclusionCounter::RecoverBeforePrepare() {
 	// the rendering instance under it); a left-over query or a full pool is repaired instead of
 	// closing the emulator. KYTY_OCCLUSION_STRICT=1 keeps the old exit for development.
 	EXIT_IF(StrictState());
-	const auto recovery = m_queries.BeforePrepare();
+	const auto recovery = B().queries.BeforePrepare();
 	if (recovery.stale_query != OcclusionQueryState::NoQuery) {
-		m_context.GetCommandScheduler().Current().StateSink().endQuery(m_pool, recovery.stale_query);
+		m_context.GetCommandScheduler().Current().StateSink().endQuery(B().pool, recovery.stale_query);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionUnendedScopes);
 		static std::once_flag once;
 		std::call_once(once, [&] {
@@ -426,7 +443,7 @@ void OcclusionCounter::RecoverBeforePrepare() {
 			std::fflush(stdout);
 		});
 	}
-	if (recovery.reduce && m_pool) {
+	if (recovery.reduce && B().pool) {
 		static std::once_flag once;
 		std::call_once(once, [] {
 			std::printf("Occlusion counter: the query pool was full when a scope began; reduced it first\n");
@@ -441,8 +458,8 @@ void OcclusionCounter::RecoverBeforePrepare() {
 }
 
 void OcclusionCounter::Prepare(uint32_t control) {
-	m_prepared = false;
-	if (m_queries.Active() || m_queries.Full()) {
+	B().prepared = false;
+	if (B().queries.Active() || B().queries.Full()) {
 		RecoverBeforePrepare();
 	}
 	if (!Enabled() || !ControlCounts(control)) return;
@@ -457,17 +474,17 @@ void OcclusionCounter::Prepare(uint32_t control) {
 		return;
 	}
 	Initialize();
-	if (!m_queries.CanBegin()) {
+	if (!B().queries.CanBegin()) {
 		// The pool could not be reduced (never expected): this scope is not counted.
 		Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionCapacityDropped);
 		return;
 	}
 	const auto reset =
-	    m_reset_window.Prepare(m_queries.Pending(), QueryCapacity, g_reset_batch.On() ? 64u : 1u);
+	    B().reset_window.Prepare(B().queries.Pending(), QueryCapacity, g_reset_batch.On() ? 64u : 1u);
 	if (reset.count != 0) {
-		m_context.GetCommandScheduler().Current().Sink().resetQueryPool(m_pool, reset.first, reset.count);
+		m_context.GetCommandScheduler().Current().Sink().resetQueryPool(B().pool, reset.first, reset.count);
 	}
-	m_prepared = true;
+	B().prepared = true;
 }
 
 // Query begins and ends are recorded through StateSink(): they access no memory a draw accesses,
@@ -477,27 +494,27 @@ void OcclusionCounter::Prepare(uint32_t control) {
 // never begun index was ended, the pool count skipped past its reduction point, and the next
 // Prepare exited (m_pending >= QueryCapacity; rocket_hourglass).
 void OcclusionCounter::Begin() {
-	if (!m_prepared) return;
-	m_prepared = false;
-	if (!m_queries.CanBegin()) return;
-	const auto query = m_queries.Begin();
-	m_context.GetCommandScheduler().Current().StateSink().beginQuery(m_pool, query,
+	if (!B().prepared) return;
+	B().prepared = false;
+	if (!B().queries.CanBegin()) return;
+	const auto query = B().queries.Begin();
+	m_context.GetCommandScheduler().Current().StateSink().beginQuery(B().pool, query,
 	                                                                 vk::QueryControlFlagBits::ePrecise);
-	++m_scopes_since_dump;
+	++B().scopes_since_dump;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionScopes);
 }
 
 void OcclusionCounter::End() {
 	// The state changes first: an end reached again while this one is recorded finds none open.
-	const auto query = m_queries.End();
+	const auto query = B().queries.End();
 	if (query == OcclusionQueryState::NoQuery) return;
-	m_context.GetCommandScheduler().Current().StateSink().endQuery(m_pool, query);
+	m_context.GetCommandScheduler().Current().StateSink().endQuery(B().pool, query);
 }
 
 void OcclusionCounter::Accumulate() {
 	// Keep ended queries in distinct slots across native rendering boundaries and
 	// submissions. Only a guest snapshot or bounded pool exhaustion needs a sum.
-	if (m_queries.Full() && !m_queries.Active()) {
+	if (B().queries.Full() && !B().queries.Active()) {
 		if (m_batch_pipeline) {
 			FlushBatch();
 		} else {
@@ -508,14 +525,14 @@ void OcclusionCounter::Accumulate() {
 
 void OcclusionCounter::FlushPending() {
 	KYTY_GPU_OP_SITE("occlusion.flush");
-	EXIT_IF(m_queries.Active() || m_prepared);
-	if (m_queries.Pending() == 0) return;
+	EXIT_IF(B().queries.Active() || B().prepared);
+	if (B().queries.Pending() == 0) return;
 	auto native = m_context.GetCommandScheduler().Current().Handle();
-	native.copyQueryPoolResults(m_pool, 0, m_queries.Pending(), m_result->Handle(), 0, 8,
+	native.copyQueryPoolResults(B().pool, 0, B().queries.Pending(), m_result->Handle(), 0, 8,
 	                            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 	Dispatch(0, m_counter->Handle(), 0, m_counter->Size());
-	m_queries.Reduced();
-	m_reset_window.Reduced();
+	B().queries.Reduced();
+	B().reset_window.Reduced();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionReductions);
 }
 
@@ -543,7 +560,7 @@ void OcclusionCounter::Dispatch(uint32_t mode, vk::Buffer output, uint64_t offse
 	command.BindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 	command.PushDescriptors(vk::PipelineBindPoint::eCompute, m_layout, 0,
 	                        static_cast<uint32_t>(writes.size()), writes.data());
-	const uint32_t push[] {mode, static_cast<uint32_t>(offset - aligned), m_queries.Pending()};
+	const uint32_t push[] {mode, static_cast<uint32_t>(offset - aligned), B().queries.Pending()};
 	native.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
 	native.dispatch(1, 1, 1);
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
@@ -600,7 +617,12 @@ bool OcclusionCounter::SplitEnabled() {
 
 bool OcclusionCounter::Dump(uint64_t address) {
 	auto& scheduler = m_context.GetCommandScheduler();
-	if (!m_pool) {
+	if (CpPar::Lanes2b() && CpPar::LaneLockEnabled() && !CpPar::LaneLockHeld()) {
+		// Astro Bot PC (KYTY_CP_PAR=2b, morceau (b)): the common state below is touched outside the
+		// lanes' global lock (harmless in turn; a race once lanes overlap).
+		CpPar::NoteLaneStat(LaneOf(), CpPar::LaneStat::OcclusionUnlocked, 1);
+	}
+	if (!m_counter) {
 		scheduler.EndRendering(); // Initialize records outside rendering
 	}
 	Initialize();
@@ -613,11 +635,11 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	const auto              slot_index = static_cast<uint32_t>(m_issued % m_slot_count);
 	// Not with the batch verify (its per-dump reductions record outside rendering), nor when the
 	// slot must be waited for (the wait may submit this command buffer).
-	bool split = batch && SplitEnabled() && instance != 0 && !m_prepared && !m_verify_counter &&
+	bool split = batch && SplitEnabled() && instance != 0 && !B().prepared && !m_verify_counter &&
 	             (m_issued < m_slot_count || scheduler.IsFree(m_slot_ticks[slot_index]));
 	if (split) {
 		End();
-		if (m_queries.Full()) {
+		if (B().queries.Full()) {
 			split = false; // the pool must be reduced outside rendering (Accumulate)
 		}
 	}
@@ -643,19 +665,31 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	}
 	const uint64_t slot_offset = uint64_t {slot} * PublishSlotSize;
 	const auto     tag         = static_cast<uint32_t>(m_issued);
+	if (batch && B().batch_count != 0 && !B().prepared &&
+	    slot != (B().batch_first_slot + B().batch_count) % m_slot_count) {
+		// Astro Bot PC (KYTY_CP_PAR=2b, morceau (b)): another lane's dumps took the slots after this
+		// lane's batch (the batch shader reduces consecutive slots): this lane's batch is reduced
+		// first, outside rendering. Never in turn (a hand-off reduces the batch of the lane it ends).
+		CpPar::NoteLaneStat(LaneOf(), CpPar::LaneStat::OcclusionRebatches, 1);
+		if (split) {
+			scheduler.EndRendering();
+			split = false;
+		}
+		FlushBatch();
+	}
 	if (batch) {
 		// KYTY_OCCLUSION_BATCH: the queries ended so far in this batch precede the dump; FlushBatch
 		// reduces them and writes the slot (and this tag) before this command buffer is submitted.
 		auto* entries = reinterpret_cast<uint32_t*>(m_prefix->Mapped().data()) + uint64_t {slot} * 2u;
-		entries[0]    = m_queries.Pending();
+		entries[0]    = B().queries.Pending();
 		entries[1]    = tag;
 		if (!m_prefix->IsCoherent()) {
 			m_prefix->Flush(uint64_t {slot} * TableEntrySize, TableEntrySize);
 		}
-		if (m_batch_count == 0) {
-			m_batch_first_slot = slot;
+		if (B().batch_count == 0) {
+			B().batch_first_slot = slot;
 		}
-		++m_batch_count;
+		++B().batch_count;
 		if (m_verify_counter) {
 			// The per-dump path's value for this dump, into the verify slot.
 			VerifyReduce();
@@ -674,8 +708,8 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	const bool debug_log = DebugLogActive(true);
 	if (debug_log) {
 		DebugLog("D %u 0x%" PRIx64 " scopes=%u colors=%u depth=%u %ux%u zaddr=0x%" PRIx64 " zfmt=%u\n", tag, address,
-		         m_scopes_since_dump, m_last_scope.colors, m_last_scope.has_depth ? 1u : 0u, m_last_scope.width,
-		         m_last_scope.height, m_last_scope.depth_address, m_last_scope.depth_format);
+		         B().scopes_since_dump, B().last_scope.colors, B().last_scope.has_depth ? 1u : 0u, B().last_scope.width,
+		         B().last_scope.height, B().last_scope.depth_address, B().last_scope.depth_format);
 	}
 	auto publish = [this, address, slot_offset, batch, tag, debug_log] {
 		m_publish->Invalidate(slot_offset, batch ? PublishSlotSize : 248);
@@ -761,40 +795,40 @@ bool OcclusionCounter::Dump(uint64_t address) {
 		event.event         = "dump";
 		event.address       = address;
 		event.value         = m_issued;
-		event.scopes        = m_scopes_since_dump;
-		event.width         = m_last_scope.width;
-		event.height        = m_last_scope.height;
-		event.colors        = m_last_scope.colors;
-		event.has_depth     = m_last_scope.has_depth;
-		event.depth_format  = m_last_scope.depth_format;
-		event.depth_address = m_last_scope.depth_address;
+		event.scopes        = B().scopes_since_dump;
+		event.width         = B().last_scope.width;
+		event.height        = B().last_scope.height;
+		event.colors        = B().last_scope.colors;
+		event.has_depth     = B().last_scope.has_depth;
+		event.depth_format  = B().last_scope.depth_format;
+		event.depth_address = B().last_scope.depth_address;
 		HangTrace::RecordOcclusion(event);
 	}
 	// An end dump sits 8 bytes after its begin dump (interleaved begin/end pairs, at any 8-byte
 	// alignment). A pair whose latest counted scope rendered only depth is a visibility proxy
 	// (e.g. a bounding box).
-	const bool sync = SyncProxyDumps() && kind == OcclusionDumpPairs::Kind::End && m_scopes_since_dump != 0 &&
-	                  m_last_scope.colors == 0 && m_last_scope.has_depth;
-	m_scopes_since_dump = 0;
-	m_last_scope        = {};
+	const bool sync = SyncProxyDumps() && kind == OcclusionDumpPairs::Kind::End && B().scopes_since_dump != 0 &&
+	                  B().last_scope.colors == 0 && B().last_scope.has_depth;
+	B().scopes_since_dump = 0;
+	B().last_scope        = {};
 	// A slot wait above may have submitted the command buffer (ending the instance).
 	split = split && scheduler.Active() && scheduler.Current().Identity() == command &&
 	        scheduler.CurrentTick() == tick && scheduler.Current().ActiveRenderingSerial() == instance;
 	if (split && WouldCount(scheduler.Current().OcclusionControl())) {
 		// The instance is counted from here on: its next query begins inside it, or, without a
 		// reset index, the next draw begins a new instance (Prepare resets outside rendering).
-		if (m_queries.CanBegin() && m_reset_window.IsReset(m_queries.Pending())) {
-			const auto query = m_queries.Begin();
-			scheduler.Current().StateSink().beginQuery(m_pool, query, vk::QueryControlFlagBits::ePrecise);
-			++m_scopes_since_dump;
-			m_last_scope = m_instance_scope;
+		if (B().queries.CanBegin() && B().reset_window.IsReset(B().queries.Pending())) {
+			const auto query = B().queries.Begin();
+			scheduler.Current().StateSink().beginQuery(B().pool, query, vk::QueryControlFlagBits::ePrecise);
+			++B().scopes_since_dump;
+			B().last_scope = B().instance_scope;
 			Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionScopes);
 		} else {
 			scheduler.EndRendering();
 			split = false;
 		}
 	}
-	m_last_dump_kept = split;
+	B().last_dump_kept = split;
 	return sync;
 }
 }

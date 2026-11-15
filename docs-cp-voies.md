@@ -155,6 +155,24 @@ propre voie A, à la frontière d'opérations, sont aussi pris sous le verrou. L
 services que Thread_Gpu exécute dans sa boucle principale, hors `ResolveSubmission` (à prendre sous le verrou en
 3b-3).
 
+**(b) Occlusion : état de lot par voie.** `OcclusionCounter::LaneBatch` : pool de requêtes, requêtes terminées en
+attente de réduction (`OcclusionQueryState`), fenêtre de remise à zéro, lot de vidages (`batch_first_slot`,
+`batch_count`), `prepared`, `verified`, diagnostics de portée ; un par flux d'enregistrement en 2b, le seul utilisé
+(indice 0) hors 2b. **Indice : `CommandScheduler::ThreadContext()` (le flux dont le tampon natif reçoit les
+requêtes), pas `EffectiveLane()`** : quand Thread_Gpu sert un flip de la voie k, il enregistre dans le flux 0 ;
+l'état de lot doit suivre le tampon où sont les requêtes, et le crochet de pré-soumission (appelé par le fil qui
+soumet, y compris à la passation) vide le lot de ce flux. Le pool de la voie k (k > 0) est créé à son premier
+usage. Restent communs (touchés par `Dump`, dans une opération, donc sous le verrou des voies en 2b) : compteur
+d'émission `m_issued`, emplacements de publication et leurs ticks, table des préfixes, paires de vidages, porte,
+compteur cumulatif sur le GPU (accumulé dans l'ordre de soumission, donc dans l'ordre des listes), tampon de
+résultats (temporaire GPU, ordonné par les barrières). Le lot d'une voie doit occuper des emplacements
+consécutifs (le nuanceur de lot le suppose) : si une autre voie a pris les emplacements suivants, le lot est
+réduit d'abord (« occlusion early batches », 0 attendu à tour de rôle). « dumps outside the lock » compte les
+vidages faits hors verrou en 2b (à surveiller : une course une fois les voies simultanées). À tour de rôle :
+mêmes requêtes, mêmes lots qu'avant (la passation vide déjà le lot de la voie qui finit), mais chaque voie
+utilise son propre pool.
+
+
 ### Variables pour l'essai en jeu
 
 Base (comme P1) : `KYTY_CP_SEQ=1`, `KYTY_CP_RECORDER=1` (sans `KYTY_CP_RECORDER_VERIFY`),

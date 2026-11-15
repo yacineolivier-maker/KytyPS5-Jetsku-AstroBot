@@ -85,12 +85,12 @@ public:
 	// KYTY_OCCLUSION_SPLIT=0 restores the end of rendering at every dump.
 	[[nodiscard]] static bool SplitEnabled();
 	// The last Dump() left the rendering instance active (KYTY_OCCLUSION_SPLIT).
-	[[nodiscard]] bool LastDumpKeptInstance() const noexcept { return m_last_dump_kept; }
+	[[nodiscard]] bool LastDumpKeptInstance() const noexcept { return B().last_dump_kept; }
 	// The attachments of the rendering instance just begun (counted or not): the scope a query
 	// begun inside it by a split dump reports to the proxy detection.
 	void NoteInstance(uint64_t depth_address, uint32_t width, uint32_t height, uint32_t colors,
 	                  bool has_depth, uint32_t depth_format) {
-		m_instance_scope = {depth_address, width, height, colors, has_depth, depth_format};
+		B().instance_scope = {depth_address, width, height, colors, has_depth, depth_format};
 	}
 	// Proxy detection enabled (any mode but Off).
 	[[nodiscard]] static bool SyncProxyDumps();
@@ -102,7 +102,7 @@ public:
 	[[nodiscard]] bool HasUnpublishedDumps() const noexcept {
 		return m_published.load(std::memory_order_acquire) != m_issued;
 	}
-	[[nodiscard]] bool Active() const noexcept { return m_queries.Active(); }
+	[[nodiscard]] bool Active() const noexcept { return B().queries.Active(); }
 	// KYTY_OCCLUSION_LOG=<file> (diagnostics): while <file>.on exists, every dump ("D"), its
 	// publication ("P", the cumulative value) and every draw recorded while a dump pair is open
 	// ("d") are written to <file>. Pair results are P(end) - P(begin).
@@ -121,7 +121,7 @@ public:
 	// next dump.
 	void NoteScope(uint64_t depth_address, uint32_t width, uint32_t height, uint32_t colors,
 	               bool has_depth, uint32_t depth_format) {
-		m_last_scope = {depth_address, width, height, colors, has_depth, depth_format};
+		B().last_scope = {depth_address, width, height, colors, has_depth, depth_format};
 	}
 private:
 	static constexpr uint32_t DefaultPublishSlots = 1024;
@@ -153,7 +153,6 @@ private:
 	void RecoverBeforePrepare();
 	[[nodiscard]] static bool StrictState();
 	RenderContext& m_context;
-	vk::QueryPool m_pool;
 	vk::DescriptorSetLayout m_descriptors;
 	vk::PipelineLayout m_layout;
 	vk::Pipeline m_pipeline;
@@ -161,32 +160,25 @@ private:
 	std::unique_ptr<Buffer> m_result;
 	std::unique_ptr<Buffer> m_publish;
 	uint32_t m_slot_count = DefaultPublishSlots;
-	OcclusionResetWindow m_reset_window;
 	std::vector<uint64_t> m_slot_ticks;
 	// KYTY_OCCLUSION_BATCH: the batch reduction pipeline, the per-slot prefix table and the dumps
-	// recorded since the last batch (consecutive slots from m_batch_first_slot).
+	// recorded since the last batch (LaneBatch).
 	vk::DescriptorSetLayout m_batch_descriptors;
 	vk::PipelineLayout m_batch_layout;
 	vk::Pipeline m_batch_pipeline;
 	std::unique_ptr<Buffer> m_prefix;
-	uint32_t m_batch_first_slot = 0;
-	uint32_t m_batch_count = 0;
 	std::atomic<uint64_t> m_batch_mismatches {0}; // publications whose slot tag did not match
 	// KYTY_OCCLUSION_BATCH=verify: the per-dump reduction's buffers, the queries it has reduced
 	// so far in this batch, and the publications checked / found different.
 	std::unique_ptr<Buffer> m_verify_counter;
 	std::unique_ptr<Buffer> m_verify_result;
 	std::unique_ptr<Buffer> m_verify_publish;
-	uint32_t m_verified = 0;
 	std::atomic<uint64_t> m_verify_checks {0};
 	std::atomic<uint64_t> m_verify_mismatches {0};
 	void VerifyReduce();
 	void VerifyDispatch(uint32_t mode, vk::Buffer output, uint64_t offset, uint64_t range, uint32_t count);
 	uint64_t m_issued = 0;
 	std::atomic<uint64_t> m_published {0};
-	bool m_prepared = false;
-	OcclusionQueryState m_queries {QueryCapacity}; // the open query, the ended ones awaiting reduction
-	uint32_t m_scopes_since_dump = 0; // hang-trace diagnostics only
 	struct ScopeInfo {
 		uint64_t depth_address = 0;
 		uint32_t width         = 0;
@@ -195,9 +187,31 @@ private:
 		bool     has_depth     = false;
 		uint32_t depth_format  = 0;
 	};
-	ScopeInfo m_last_scope {}; // hang-trace diagnostics only
-	ScopeInfo m_instance_scope {};
-	bool      m_last_dump_kept = false;
+	// Astro Bot PC (KYTY_CP_PAR=2b, morceau (b)): the batch state of one recording stream (lane):
+	// its query pool and the queries ended in it awaiting reduction, the reset window, the batch of
+	// dumps recorded into its command buffer since its last reduction (consecutive slots from
+	// batch_first_slot), the scope diagnostics. Outside 2b only lane 0's is used (unchanged). The
+	// issue counter, the publish slots and their ticks, the prefix table, the dump pairs and the
+	// gate stay common (touched by Dump, inside an op: under the lanes' global lock in 2b).
+	struct LaneBatch {
+		vk::QueryPool        pool;
+		OcclusionResetWindow reset_window;
+		OcclusionQueryState  queries {QueryCapacity}; // the open query, the ended ones awaiting reduction
+		uint32_t             batch_first_slot  = 0;
+		uint32_t             batch_count       = 0;
+		uint32_t             verified          = 0;
+		bool                 prepared          = false;
+		uint32_t             scopes_since_dump = 0; // hang-trace diagnostics only
+		ScopeInfo            last_scope {};         // hang-trace diagnostics only
+		ScopeInfo            instance_scope {};
+		bool                 last_dump_kept = false;
+	};
+	static constexpr uint32_t MaxBatchLanes = 4; // CpPar::MaxLanes
+	// The calling thread's recording stream in 2b (CommandScheduler::ThreadContext), else 0.
+	[[nodiscard]] static uint32_t LaneOf() noexcept;
+	[[nodiscard]] LaneBatch&       B() noexcept { return m_lane_batches[LaneOf()]; }
+	[[nodiscard]] const LaneBatch& B() const noexcept { return m_lane_batches[LaneOf()]; }
+	std::array<LaneBatch, MaxBatchLanes> m_lane_batches {};
 };
 }
 #endif

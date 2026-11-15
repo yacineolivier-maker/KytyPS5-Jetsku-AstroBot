@@ -531,6 +531,8 @@ enum class LaneStat : uint32_t {
 	LockHoldNs,       //       time holding it
 	LockedBounces,    // morceau (c): a service / flip bounced to Thread_Gpu with the lane lock held
 	LockDelegated,    //       Thread_Gpu re-took the lock as the delegated holder while serving it
+	OcclusionRebatches, // morceau (b): a lane's occlusion batch reduced early (another lane's slots in between)
+	OcclusionUnlocked,  //       an occlusion dump outside the lanes' global lock
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
