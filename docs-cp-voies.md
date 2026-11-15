@@ -1,9 +1,156 @@
-# Étape P1 « voies découplées, à tour de rôle » (`KYTY_CP_PAR=2a`)
+# Voies de traduction : P1 (`KYTY_CP_PAR=2a`) et P2 (`KYTY_CP_PAR=2b`)
+
+Branche `cp-voies` (partie de `mt-liaisons`). Conception : `docs\CONCEPTION-MULTICOEUR.md` (découpage (a),
+étapes P1 et P2). Les essais en jeu sont faits par la session principale ; rien de ce qui suit n'a encore été
+essayé en jeu.
+
+## P2 « voies simultanées » (`KYTY_CP_PAR=2b`) — état au 15/11/2026 soir
+
+**Ce qui est fait : les étapes 1, 2, 4 et 5. Ce qui n'est pas fait : l'étape 3 (les voies traduisent encore à
+tour de rôle, par le jeton de 2a ; il n'y a pas encore de verrou global des caches).** 2b ne peut donc pas encore
+apporter de gain de traduction ; il met en place et fait tourner, à tour de rôle, tout ce dont la simultanéité aura
+besoin pour ne pas perdre le GPU. `KYTY_CP_PAR=2a` et le mode par défaut sont inchangés (tout le code 2b est
+derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
+
+| Commit | Étape | Contenu | Build |
+|---|---|---|---|
+| `87d2964e` | 1 | rejeu par voie, remise à la file dans l'ordre des listes | BUILD_OK |
+| `d4e6056d` | 2 | plages de ticks par segment de voie (au lieu d'un tick provisoire), ordre de remise par segment, soumissions et opérations différées d'un segment plus jeune retenues jusqu'à son tour | BUILD_OK |
+| `ba1b4058` | 4–5 | registre des plages liées/écrites par segment ouvert, attente de dépendance, violations d'ordre (`KYTY_CP_PAR_VERIFY=1`), ligne « CpPar 10s: 2b » complète | BUILD_OK |
+
+### Ce que fait 2b (en plus de 2a)
+
+**Étape 1 — rejeu par voie** (`CommandRecorder::EnableLaneReplay`). Chaque flux de voie (B, C, D) a son propre fil
+de rejeu (« CP recorder B/C/D ») avec son exécuteur natif et son état de rejeu ; le fil « CP recorder » ne rejoue
+plus que le flux A. Les paquets `Switch` ne chaînent plus les anneaux. Chaque voie enregistre déjà dans les tampons
+de son propre pool (2a) : deux fils de rejeu n'écrivent jamais dans le même pool. Une vidange (`Drain`, début de
+toute fenêtre directe) n'attend que l'anneau du fil appelant. 2b est refusé (2a continue, message au démarrage)
+avec `KYTY_GPU_TIMING`, le profileur d'opérations GPU ou `KYTY_EOP_TIMESTAMPS=gpu` (anneaux à producteur unique).
+
+**Étape 2 — plages de ticks** (`MasterSemaphore::EnableRanges/BeginRange/NextLaneTick/TryReleaseRange`). La
+demande était un « tick provisoire résolu à la soumission ». Plutôt que de traduire après coup les ~100 endroits
+qui lisent `CurrentTick()` (opérations différées, durées de vie du flux, ticks du pool, mémos indexés par tick,
+étiquettes…), chaque segment de voie **réserve dans l'ordre des listes une plage de 2^20 ticks** (son « ordre »
+0, 1, 2…) au début du segment. Ses soumissions intermédiaires prennent les ticks de la plage dans l'ordre ; sa
+soumission de passation prend **le dernier tick de la plage**. Le sémaphore chronologique saute donc des valeurs
+(autorisé par Vulkan : attendre une valeur sautée se termine au signal supérieur suivant). Conséquence : le tick
+d'un enregistrement est **connu et définitif dès l'enregistrement**, même si une voie plus ancienne soumet
+encore ; tout ce qui est rattaché à `CurrentTick()` se termine avec le tampon qui contient l'enregistrement (ou un
+suivant), donc rien n'est à « rattacher » à la soumission. Détails :
+- `CurrentTick()` (dans `MasterSemaphore`, donc aussi pour les appels directs) rend le prochain tick de la voie
+  du fil appelant (`SetThreadTickLane`, posé par Thread_Gpu au démarrage et par chaque fil au début de son
+  segment) ; un fil sans voie (ouvriers DrawPrep, exécuteur des opérations prioritaires, fil principal) lit celui
+  de la voie du segment le plus ancien ouvert.
+- Un segment qui n'a rien encodé rend sa plage (`TryReleaseRange`) si aucune plage plus récente n'a été réservée
+  (toujours vrai à tour de rôle : le segment suivant réutilise ses ticks, comme 2a réutilisait le tick) ; sinon il
+  soumet un tampon vide avec le dernier tick de sa plage. Ainsi **toute valeur vue sous le tick courant d'une voie
+  finit signalée sans l'aide de cette voie** (sinon une attente de ce tick par la voie elle-même bloquerait).
+- Rejeu : le `Switch` porte l'ordre du segment, le `Submit` porte `lane_order` ; un fil de rejeu ne remet un
+  tampon à la file (ou au courtier) qu'une fois tous les ordres plus anciens terminés (leur `Switch` rejoué).
+  Remplace la porte « tick précédent » de l'étape 1 (les ticks ont des trous).
+- Producteur (`CommandScheduler`, sous `m_operation_mutex`) : le « tour » est l'ordre du plus ancien segment non
+  terminé. Une soumission intermédiaire d'un segment plus jeune **attend son tour** (`WaitLaneTurn`) ; une
+  opération différée (`DeferOperation`, `DeferPriorityOperation`) par le fil d'un segment plus jeune est
+  **retenue** avec ce segment et mise en file quand il devient le plus ancien : les deux files restent en ordre de
+  ticks (sinon `PriorityDoneLocked` pourrait conclure trop tôt, et les interruptions sortiraient dans le désordre).
+- `Finish` et `Shutdown` attendent le dernier tick soumis au lieu de `CurrentTick() - 1`.
+
+**Étapes 4–5 — dépendances entre voies** (`CommandScheduler::NoteLaneBuffer`, appelé au point de liaison des
+tampons de stockage `NativeStorageBuffer`, sur le fil de la voie). Avec `KYTY_CP_PAR_VERIFY=1`, un registre garde
+par segment ouvert les plages qu'il a liées et celles qu'il a écrites (effacées à la fin du segment). Une liaison
+d'une plage écrite par un segment **plus ancien encore ouvert** attend la fin de ce segment (étape 4, compté avec
+le temps). Une écriture d'une plage qu'un segment **plus jeune ouvert** a déjà liée est une **violation d'ordre**
+(étape 5 : comptée, les 16 premières journalisées « Kyty CpPar 2b: order violation … ») — seule une reprise (P4)
+la réparerait. À tour de rôle aucun autre segment n'est jamais ouvert : les deux compteurs doivent rester à 0
+(auto-contrôle de la tenue des ordres). Sans `KYTY_CP_PAR_VERIFY` le registre ne coûte rien. Les images et
+cibles de rendu ne sont pas encore enregistrées.
+
+**Ligne console** toutes les 10 s, en plus de « CpPar 10s: 2a lanes (N): … » (listes et temps de traduction par
+voie) : « CpPar 10s: 2b (N): A: replay x ms busy, turn waits n (y ms); submit turn waits n (y ms), held operations
+n; dependencies checked n, waits n (y ms), order violations n; B: … ». Pas encore de « temps sous verrou » : il n'y
+a pas de verrou (étape 3).
+
+**Fichiers touchés (P2)** : `command_processor/cpParallel.{h,cpp}` (mode, `LaneStat`, ligne 2b, message de
+vérification), `guest_gpu/graphicsRun.cpp` (mise en route, voie du fil pour les ticks), `renderer/commandRecorder.{h,cpp}`
+(fils de rejeu par voie, portes d'ordre, `Switch` portant l'ordre), `renderer/commandStream.h` (`lane_order` du
+paquet `Submit`), `renderer/masterSemaphore.{h,cpp}` (plages de ticks), `renderer/commandScheduler.{h,cpp}` (ordres,
+tour, opérations retenues, registre des dépendances), `renderer/pipeline/descriptors.cpp` (point d'appel du
+registre), `renderer/renderContext.cpp` (exécuteurs par voie aussi en 2b).
+
+### Variables pour l'essai en jeu
+
+Base (comme P1) : `KYTY_CP_SEQ=1`, `KYTY_CP_RECORDER=1` (sans `KYTY_CP_RECORDER_VERIFY`),
+`KYTY_DRAW_PREP=parallel`, **`KYTY_CP_PAR=2b`**. Ne pas activer `KYTY_GPU_TIMING`, `KYTY_GPU_OP_PROFILE` ni
+`KYTY_EOP_TIMESTAMPS=gpu` (2b retomberait en 2a).
+
+1. **N = 2** (défaut, ou `KYTY_CP_PAR_LANES=2`).
+2. **N = 3** : `KYTY_CP_PAR_LANES=3` (option `KYTY_CP_PAR_B_WORKERS=2` comme en P1).
+3. Une fois chacun : ajouter `KYTY_CP_PAR_VERIFY=1` (auto-contrôle, un peu plus lent).
+
+Au démarrage : « Kyty CpPar: KYTY_CP_PAR=2b … », « 2a lanes (N): … », « 2b: each lane has its own replay
+thread … ». Attendus toutes les 10 s : « not no-ops A 0 B 0 » ; dans la ligne 2b : **submit turn waits 0, held
+operations 0, dependency waits 0, order violations 0** (à tour de rôle) ; « turn waits » du rejeu > 0 est normal
+(le rejeu d'une voie attend le `Switch` de la précédente). i/s attendus : comme 2a (aucun gain prévu tant que
+l'étape 3 manque) ; un léger gain est possible si le rejeu de A était chargé, une légère perte si les fils de
+rejeu supplémentaires (attente active de 30 µs, `KYTY_CP_RECORDER_SPIN_US`) gênent un processeur déjà chargé.
+Comparer image, i/s (3 tours), stabilité (5 min) à 2a.
+
+### Risques (où une perte du GPU serait possible)
+
+1. **Remise hors ordre** (étapes 1–2) : si la porte d'ordre du rejeu laissait passer le tampon d'un segment plus
+   récent avant un plus ancien, des ressources libérées au tick plus ancien seraient encore lues → perte du GPU
+   possible. Contrôles : `EXIT_IF` si un `Switch` termine un ordre hors tour (`CommandRecorder::EndOrder`) ou si
+   le tour producteur recule (`EndOrderLocked`, `BeginContextSegment`). Interblocage possible au lieu d'une perte
+   si un segment ne finissait jamais (le chien de garde nomme « recorder-lane-order »).
+2. **Ticks à trous** (étape 2) : code qui supposerait des ticks consécutifs. Relevé : la fusion de soumissions du
+   courtier (`CanCoalesceAfter`, tick + 1) fusionne moins (sans danger) ; l'heuristique de vidange « GPU au repos »
+   (`KnownGpuTick() + 1 < current`) déclenche moins ; `Finish`/`Shutdown` corrigés ; `FramePool`
+   (`CurrentTick() - 1`) est sur l'ordonnanceur du présentateur (sans plages). Si un appel `Wait(t)` sur une valeur
+   jamais signalée subsistait, on aurait un **blocage** (pas une perte) — empêché par la règle de restitution des
+   plages (ci-dessus). Plages épuisées (> 2^20 soumissions dans un segment) : arrêt `EXIT` explicite.
+3. **Rejeu concurrent** (étape 1) : deux fils enregistrent en même temps dans deux tampons de pools distincts
+   (permis par Vulkan). Objets partagés touchés au rejeu : `vkUpdateDescriptorSets` (chaque set est écrit par une
+   seule voie), pools de requêtes d'occlusion (réinitialisations/requêtes dans des tampons différents, ordonnées
+   par l'ordre de soumission), copies hôte (`StreamCopyDefer` déjà suspendu en double flux). Une course ici
+   donnerait au pire une perte du GPU au rejeu ; non observée (non essayé).
+4. **Fils sans voie** : leur `CurrentTick()` est celui du segment le plus ancien (ou la base de plage suivante
+   entre deux segments) : un mémo daté par eux est au pire manqué (repli lent, correct).
+5. Hérités de P1 : fil hors jeton qui enregistrerait (`EXIT_IF`), début paresseux (voir plus bas).
+
+### Suite
+
+**Étape 3 (non faite) — exécution simultanée sous un verrou global.** Ce qu'il faut, dans l'ordre :
+1. Remplacer le jeton par une exécution simultanée : aujourd'hui Thread_Gpu attend dans `RunSlice` la fin de la
+   tranche d'une voie. Il faut que la boucle des files (`ProcessSequenced`) confie une soumission de file 0 à sa
+   voie **sans attendre** et passe à la suivante (file 0 regardée au-delà de sa tête), la fin étant constatée plus
+   tard ; les tranches cédées (`Yielded`) et les soumissions de calcul restent à gérer.
+2. Un verrou global (comme `OpLockAcquire` de 1b3, mais pour N voies) autour de tout ce qui touche BufferCache,
+   TextureCache, état d'image (reprendre la surcouche `Image::CpParTouch` de 1b3 : état d'entrée et correctifs de
+   disposition à la fin du segment, enregistrés en fin de segment de la voie plus ancienne), StreamBuffer, tas de
+   descripteurs, occlusion, `RenderMutex` (aujourd'hui « propriétaire » unique, donné avec le jeton) ; les 59
+   contrôles « fil GPU » à requalifier ; commencer par une opération entière sous le verrou (sûr, sans gain), puis
+   sortir du verrou la préparation, l'émission, les descripteurs et les constantes poussées. Point à reprendre
+   au passage : le tas de descripteurs retire un pool au `CurrentTick()` du fil qui le retire ; en simultané,
+   un pool utilisé par un segment plus jeune puis retiré par un plus ancien serait remis à zéro trop tôt
+   (**perte du GPU possible**) : retirer au plus grand tick des segments qui l'ont utilisé.
+3. Ce que le segment plus jeune ne peut pas faire avant son tour (classement 1b4/1b5 à reprendre) : écritures du
+   CP visibles par le jeu (étiquettes, `WRITE_DATA` hors étiquettes internes apprises), attentes `WAIT_REG_MEM`
+   sur une valeur d'une autre liste, interruptions de fin de canal (à capturer et livrer dans l'ordre comme 1b5),
+   flips, lectures du GPU par le CPU, commandes de service (aujourd'hui renvoyées à Thread_Gpu) : la voie attend
+   alors son tour (le mécanisme `WaitLaneTurn` existe déjà pour les soumissions).
+4. Puis activer le registre des étapes 4–5 en permanence (pas seulement en vérification) et y ajouter images et
+   cibles de rendu ; mesurer attentes de dépendance et violations ; les violations demanderont la reprise (P4) ou
+   une déclaration préalable des plages écrites (le recensement P0 a mesuré 83–106 plages/image, surtout listes
+   1 → 5 et 1 → 6).
+5. **P3 (`2c`), lectures sans verrou** : mémos par voie, libération différée, sous-anneaux de flux par voie,
+   pour sortir les lectures de cache du verrou (gain visé dans la conception : ~28–32 ms/image à 3 voies).
+
+## P1 « voies découplées, à tour de rôle » (`KYTY_CP_PAR=2a`)
 
 Branche `cp-voies` (partie de `mt-liaisons`). Conception : `docs\CONCEPTION-MULTICOEUR.md` (étape P1 du
 découpage (a)). Les essais en jeu sont faits par la session principale.
 
-## État au 15/11/2026 (P1 terminée, à essayer en jeu)
+### État au 15/11/2026 (P1 terminée, à essayer en jeu)
 
 | Commit | Contenu | Build |
 |---|---|---|
@@ -16,7 +163,7 @@ Mesure du 15/11 avec `7e1f5472` (Aerial Garden) : aucune erreur, image correcte 
 2a contre 18,1 sans** ; « hand-off submits A 1641 (empty 133), B 1641 (empty 6) » par 10 s ; Thread_Gpu 5,5 s et
 CP resolver #2 4,1 s de traduction par 10 s, à tour de rôle. Les commits suivants n'ont **pas encore été essayés**.
 
-## Ce que fait 2a
+### Ce que fait 2a
 
 `KYTY_CP_PAR=2a` = 1b2 (jeton, exécution strictement à tour de rôle) **plus**, pour chaque voie :
 
@@ -54,7 +201,7 @@ Sans `KYTY_CP_PAR=2a` rien ne change : `DeferBegin` n'est appelé que par `Begin
 par voie ne servent qu'aux indices 0/1 hors 2a, le `Switch` sans cible garde la bascule de 1b2/1b3, la répartition
 reste `(r − 1) mod 2`.
 
-## Fichiers touchés
+### Fichiers touchés
 
 - `command_processor/cpParallel.h/.cpp` : `MaxLanes`, `RequestedLanes()` (`KYTY_CP_PAR_LANES`), `ContextCount()`,
   `ThreadLane()`, `HandoffTarget()`, un `Resolver2` par voie (`RunSlice(lane, …)`), statistiques par voie,
@@ -69,7 +216,7 @@ reste `(r − 1) mod 2`.
   fin de segment paresseuse.
 - `renderer/renderContext.h/.cpp` : un `RenderExecutor` par voie après A ; `drawPrep.h/.cpp` : `Engine(…, lane)`.
 
-## Variables pour l'essai en jeu
+### Variables pour l'essai en jeu
 
 Base (comme le 15/11) : `KYTY_CP_SEQ=1`, `KYTY_CP_RECORDER=1` (sans `KYTY_CP_RECORDER_VERIFY`),
 `KYTY_DRAW_PREP=parallel`, `KYTY_CP_PAR=2a`.
@@ -86,7 +233,7 @@ back n; B: … ; C: … ». Attendus : « skipped » ≈ l'ancien « empty » (�
 le temps de traduction se répartit sur trois fils mais **le total ne baisse pas** (toujours à tour de rôle : P1 ne
 fait que préparer P2). Comparer image, i/s (3 tours), stabilité (5 min) entre N = 2, N = 3 et sans `KYTY_CP_PAR`.
 
-## Risques connus
+### Risques connus
 
 1. **Fil hors jeton qui enregistre dans le planificateur invité** : son flux est 0 → enveloppe A, sans tampon
    pendant le segment d'une autre voie → arrêt `EXIT_IF`. Non observé en 1b2 ni en 2a (15/11), non prouvé absent.
@@ -103,7 +250,7 @@ fait que préparer P2). Comparer image, i/s (3 tours), stabilité (5 min) entre 
    A et des étiquettes du mémo de la voie : repli sur le chemin lent (correct).
 5. 1b3/1b4/1b5 restent à deux contextes (`KYTY_CP_PAR_LANES` n'est lu qu'en 2a).
 
-## Suite : P2 (`=2b`, voies simultanées)
+### Suite prévue en P1 pour P2 (historique ; état réel : section P2 ci-dessus)
 
 Ce qui manque pour faire tourner les voies en même temps (sous un verrou global des caches au début) :
 
