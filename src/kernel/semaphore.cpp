@@ -10,8 +10,21 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#pragma comment(lib, "Synchronization.lib") // WaitOnAddress (KYTY_GUEST_SEMA_LIGHT)
+#endif
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -26,13 +39,88 @@ LIB_NAME("libkernel", "libkernel");
 
 constexpr uint32_t SIGNAL_APC_POLL_MICROS = 10000;
 
+// Astro Bot PC (KYTY_GUEST_SEMA_LIGHT, default 0, Windows only): the guest kernel semaphores'
+// lock and wake-ups on lighter primitives. 1: an SRW lock instead of the critical section (the
+// 15/11 profile showed Thread_Main ~5.5 % in RtlLeaveCriticalSection -> NtSetInformationThread
+// under KernelSignalSema) and each waiter parked on its own word (WaitOnAddress, woken by
+// WakeByAddressSingle under the lock) instead of a condition variable. Same rules otherwise:
+// waiter order, need counts, timeouts, cancel, delete, the 10 ms pending-signal poll.
+// "verify": the same, plus checks under the lock (0 <= count <= max after each change, no
+// waiter both served and still counted) and late wake-ups (a served waiter that resumed more than
+// 15 ms after it was served: a lost wake-up, saved by the 10 ms poll); counters every 10 s:
+// "Kyty semaphores invites 10 s : ...".
+enum class SemaMode { Classic, Light, Verify };
+
+static SemaMode GuestSemaMode() {
+	static const SemaMode mode = [] {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const char* value = std::getenv("KYTY_GUEST_SEMA_LIGHT");
+		SemaMode    m     = SemaMode::Classic;
+		if (value != nullptr && std::strcmp(value, "1") == 0) {
+			m = SemaMode::Light;
+		} else if (value != nullptr && std::strcmp(value, "verify") == 0) {
+			m = SemaMode::Verify;
+		}
+		if (m != SemaMode::Classic) {
+			std::printf("Kyty semaphores invites : verrou SRW et attente par adresse%s "
+			            "(KYTY_GUEST_SEMA_LIGHT)\n",
+			            m == SemaMode::Verify ? ", avec verification" : "");
+			std::fflush(stdout);
+		}
+		return m;
+#else
+		return SemaMode::Classic;
+#endif
+	}();
+	return mode;
+}
+
+namespace {
+std::atomic<uint64_t> g_sema_signals {0};
+std::atomic<uint64_t> g_sema_waits {0};
+std::atomic<uint64_t> g_sema_blocking {0};
+std::atomic<uint64_t> g_sema_late_wakes {0};
+std::atomic<uint64_t> g_sema_max_wake_us {0};
+std::atomic<uint64_t> g_sema_violations {0};
+std::atomic<uint64_t> g_sema_report_ns {0};
+
+uint64_t SemaNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void SemaVerifyReport() {
+	const auto now  = SemaNowNs();
+	auto       last = g_sema_report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_sema_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ull ||
+	    !g_sema_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	std::printf("Kyty semaphores invites 10 s : %" PRIu64 " signaux, %" PRIu64 " attentes dont %" PRIu64
+	            " bloquantes, reveils tardifs (>15 ms) %" PRIu64 " (pire %" PRIu64
+	            " us), controles en defaut %" PRIu64 "\n",
+	            g_sema_signals.exchange(0, std::memory_order_relaxed),
+	            g_sema_waits.exchange(0, std::memory_order_relaxed),
+	            g_sema_blocking.exchange(0, std::memory_order_relaxed),
+	            g_sema_late_wakes.exchange(0, std::memory_order_relaxed),
+	            g_sema_max_wake_us.exchange(0, std::memory_order_relaxed),
+	            g_sema_violations.load(std::memory_order_relaxed));
+	std::fflush(stdout);
+}
+} // namespace
+
 class KernelSemaPrivate {
 public:
 	enum class Result { Ok, TimedOut, Canceled, Deleted, InvalCount };
 
 	KernelSemaPrivate(const std::string& name, bool fifo, int init_count, int max_count)
 	    : m_name(name), m_fifo_order(fifo), m_count(init_count), m_init_count(init_count),
-	      m_max_count(max_count) {};
+	      m_max_count(max_count), m_mode(GuestSemaMode()) {};
 	virtual ~KernelSemaPrivate();
 
 	KYTY_CLASS_NO_COPY(KernelSemaPrivate);
@@ -60,7 +148,90 @@ private:
 		// Astro Bot PC (13/11) : chaque fil en attente a sa variable de condition ; un signal ne reveille que les
 		// fils servis (avant : SignalAll a chaque Signal, tous les fils reveilles se disputaient le verrou).
 		Common::CondVar cond;
+		// KYTY_GUEST_SEMA_LIGHT: the word this waiter parks on (1 once served), and when it was
+		// served (verify).
+		std::atomic<uint32_t> word {0};
+		uint64_t              served_ns = 0;
 	};
+
+	// The semaphore's lock (KYTY_GUEST_SEMA_LIGHT: SRW; otherwise the critical section).
+	void Lock() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_mode != SemaMode::Classic) {
+			AcquireSRWLockExclusive(&m_srw);
+			return;
+		}
+#endif
+		m_mutex.Lock();
+	}
+	void Unlock() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_mode != SemaMode::Classic) {
+			ReleaseSRWLockExclusive(&m_srw);
+			return;
+		}
+#endif
+		m_mutex.Unlock();
+	}
+	class Guard {
+	public:
+		explicit Guard(KernelSemaPrivate& sema): m_sema(sema) { m_sema.Lock(); }
+		~Guard() { m_sema.Unlock(); }
+		Guard(const Guard&)            = delete;
+		Guard& operator=(const Guard&) = delete;
+
+	private:
+		KernelSemaPrivate& m_sema;
+	};
+
+	// Lock held: the waiter was marked ready; wakes it.
+	void Wake(WaitingThread* waiter) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_mode != SemaMode::Classic) {
+			if (m_mode == SemaMode::Verify) {
+				waiter->served_ns = SemaNowNs();
+			}
+			waiter->word.store(1, std::memory_order_release);
+			WakeByAddressSingle(static_cast<void*>(&waiter->word));
+			return;
+		}
+#endif
+		waiter->cond.Signal();
+	}
+	// Lock held: parks until woken, `micros` at most (ms granularity, as the condition variable);
+	// returns with the lock held.
+	void Park(WaitingThread* waiter, uint32_t micros) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_mode != SemaMode::Classic) {
+			Unlock();
+			uint32_t   expected = 0;
+			const auto ms       = static_cast<DWORD>(micros < 1000 ? 1 : micros / 1000);
+			(void)WaitOnAddress(static_cast<volatile void*>(&waiter->word), &expected, sizeof(expected), ms);
+			Lock();
+			return;
+		}
+#endif
+		waiter->cond.WaitFor(&m_mutex, micros);
+	}
+	// KYTY_GUEST_SEMA_LIGHT=verify, lock held.
+	void Check() {
+		if (m_mode != SemaMode::Verify) {
+			return;
+		}
+		bool bad = m_count < 0 || m_count > m_max_count;
+		for (const auto* waiter: m_waiting_threads) {
+			if (waiter->ready != (waiter->word.load(std::memory_order_relaxed) != 0) &&
+			    m_status == Status::Set && waiter->result != Result::Canceled) {
+				bad = true;
+			}
+		}
+		if (bad && g_sema_violations.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Kyty semaphores invites : controle en defaut sur '%s' (compte %d, max %d, "
+			            "%zu en attente)\n",
+			            m_name.c_str(), m_count, m_max_count, m_waiting_threads.size());
+			std::fflush(stdout);
+		}
+	}
 
 	void AddWaiter(WaitingThread* waiter);
 	void RemoveWaiter(WaitingThread* waiter);
@@ -75,15 +246,19 @@ private:
 	int                         m_count;
 	int                         m_init_count;
 	int                         m_max_count;
+	SemaMode                    m_mode;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SRWLOCK m_srw = SRWLOCK_INIT;
+#endif
 };
 
 KernelSemaPrivate::~KernelSemaPrivate() {
-	Common::LockGuard lock(m_mutex);
+	Guard lock(*this);
 
 	while (m_status != Status::Set) {
-		m_mutex.Unlock();
+		Unlock();
 		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
+		Lock();
 	}
 
 	m_status = Status::Deleted;
@@ -92,19 +267,19 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 		if (!waiter->ready) {
 			waiter->result = Result::Deleted;
 			waiter->ready  = true;
-			waiter->cond.Signal();
+			Wake(waiter);
 		}
 	}
 
 	while (!m_waiting_threads.empty()) {
-		m_mutex.Unlock();
+		Unlock();
 		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
+		Lock();
 	}
 }
 
 KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_waiting_threads) {
-	Common::LockGuard lock(m_mutex);
+	Guard lock(*this);
 
 	if (set_count > m_max_count) {
 		return Result::InvalCount;
@@ -126,15 +301,20 @@ KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_wait
 		if (!waiter->ready) {
 			waiter->result = Result::Canceled;
 			waiter->ready  = true;
-			waiter->cond.Signal();
+			Wake(waiter);
 		}
 	}
+	Check();
 
 	return Result::Ok;
 }
 
 KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
-	Common::LockGuard lock(m_mutex);
+	if (m_mode == SemaMode::Verify) {
+		g_sema_signals.fetch_add(1, std::memory_order_relaxed);
+		SemaVerifyReport();
+	}
+	Guard lock(*this);
 
 	if (m_status == Status::Deleted) {
 		return Result::Deleted;
@@ -147,6 +327,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 	m_count += signal_count;
 
 	WakeWaiters(); // reveille seulement les fils servis
+	Check();
 
 	return Result::Ok;
 }
@@ -177,13 +358,16 @@ void KernelSemaPrivate::WakeWaiters() {
 			m_count -= waiter->need_count;
 			waiter->result = Result::Ok;
 			waiter->ready  = true;
-			waiter->cond.Signal();
+			Wake(waiter);
 		}
 	}
 }
 
 KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_micros) {
-	Common::LockGuard lock(m_mutex);
+	if (m_mode == SemaMode::Verify) {
+		g_sema_waits.fetch_add(1, std::memory_order_relaxed);
+	}
+	Guard lock(*this);
 
 	if (need_count < 1 || need_count > m_max_count) {
 		return Result::InvalCount;
@@ -202,6 +386,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 
 	if (m_count >= need_count) {
 		m_count -= need_count;
+		Check();
 		if (ptr_micros != nullptr) {
 			*ptr_micros = micros;
 		}
@@ -210,6 +395,10 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 
 	if (!infinitely && micros == 0) {
 		return Result::TimedOut;
+	}
+
+	if (m_mode == SemaMode::Verify) {
+		g_sema_blocking.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	uint32_t      elapsed = 0;
@@ -233,17 +422,24 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 			return Result::TimedOut;
 		}
 
-		if (infinitely) {
-			waiter.cond.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
-		} else {
-			waiter.cond.WaitFor(&m_mutex, micros - elapsed);
-		}
+		Park(&waiter, infinitely ? SIGNAL_APC_POLL_MICROS : micros - elapsed);
 
-		m_mutex.Unlock();
+		Unlock();
 		LibKernel::KernelDispatchPendingSignalForCurrentThread();
-		m_mutex.Lock();
+		Lock();
 
 		elapsed = static_cast<uint32_t>(t.GetTimeS() * 1000000.0);
+	}
+
+	if (m_mode == SemaMode::Verify && waiter.served_ns != 0) {
+		const auto delay_us = (SemaNowNs() - waiter.served_ns) / 1000u;
+		if (delay_us > 15'000) {
+			g_sema_late_wakes.fetch_add(1, std::memory_order_relaxed);
+		}
+		auto worst = g_sema_max_wake_us.load(std::memory_order_relaxed);
+		while (delay_us > worst &&
+		       !g_sema_max_wake_us.compare_exchange_weak(worst, delay_us, std::memory_order_relaxed)) {
+		}
 	}
 
 	RemoveWaiter(&waiter);
