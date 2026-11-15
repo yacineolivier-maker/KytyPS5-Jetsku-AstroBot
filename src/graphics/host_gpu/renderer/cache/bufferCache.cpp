@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -3059,6 +3060,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::CreateBuffer);
+	FastCheck::Fail(FastCheck::Cause::BufferCreate); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -3132,6 +3134,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			RunRangeMemoVerifyHook(vaddr, size);
 		}
 	}
+	// Astro Bot PC (KYTY_CP_PAR_FASTCHECK): past every early return, a synchronization.
+	FastCheck::Fail(FastCheck::Cause::BufferSync);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -4485,6 +4489,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 			stream = decide();
 		}
 		if (stream) {
+			FastCheck::Fail(FastCheck::Cause::BufferStream); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 			const auto alignment = std::max<uint64_t>(
 			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 			auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -4522,6 +4527,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		FastCheck::Fail(FastCheck::Cause::BufferWritten); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		PreserveImagesForGpuWrite(id, vaddr, size);
 		// Writable descriptors reserve a new version before recording their shader commands.
 		buffer.MarkContentWritten();
@@ -4562,6 +4568,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 	// Bytes the shader cannot write only need the upload a read binding gets. Each written range
 	// then uploads anything dirtied meanwhile and becomes GPU-owned under the same tracker locks,
 	// exactly as a whole writable binding does.
+	FastCheck::Fail(FastCheck::Cause::BufferWritten); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false, nullptr, "written-binding");
 	// Writable descriptors reserve a new version before recording their shader commands.
 	buffer.MarkContentWritten();

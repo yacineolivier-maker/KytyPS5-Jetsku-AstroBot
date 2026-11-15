@@ -38,6 +38,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/xframeReuse.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/lodStats.h"
@@ -1160,6 +1161,7 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
                                         const ShaderTextureResource&               descriptor,
                                         const TextureBindingMemo::Key& memo_key, uint64_t hash,
                                         bool memo, TextureBinding& binding) {
+	FastCheck::Fail(FastCheck::Cause::TextureMiss); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	auto&      texture_cache     = m_context.GetTextureCache();
 	const bool storage           = resource.written;
 	const bool description_cache =
@@ -1334,6 +1336,7 @@ vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledSh
 	auto       descriptor     = NativeSamplerDescriptor(program, index, value);
 	const bool integer_border = program.info.samplers[index].integer_border;
 	if (!SamplerMemoEnabled()) {
+		FastCheck::Fail(FastCheck::Cause::SamplerMiss); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		return m_context.GetSamplerCache().GetSampler(descriptor, integer_border);
 	}
 	// Keyed on exactly the SamplerCache key (the four final dwords and the border class).
@@ -1360,6 +1363,7 @@ vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledSh
 		}
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::SamplerMemoMisses);
+	FastCheck::Fail(FastCheck::Cause::SamplerMiss); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	const auto sampler = m_context.GetSamplerCache().GetSampler(descriptor, integer_border);
 	// The least recently used way makes room at the front.
 	std::rotate(set, set + SamplerMemoWays - 1, set + SamplerMemoWays);
@@ -2345,10 +2349,12 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				desc.view_info.level_count = 1;
 				// The shader selects the mip after applying the guest minimum LOD.
 				desc.view_info.min_lod = 0;
+				FastCheck::Fail(FastCheck::Cause::TextureViewMiss); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
 			binding.image_view = binding.mip_views.front();
 		} else if (!m_texture_memo.TryAcquireView(texture_cache, binding)) {
+			FastCheck::Fail(FastCheck::Cause::TextureViewMiss); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 			m_texture_memo.RecordView(binding, binding.image_view);
 		}

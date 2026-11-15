@@ -10,6 +10,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
@@ -922,6 +923,7 @@ void CommandRecorder::Submit(const CommandStream::SubmitPacket& submit) {
 }
 
 void CommandRecorder::Drain(const void* site_key, bool is_site) {
+	FastCheck::Fail(FastCheck::Cause::RecorderDrain); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	if (m_stream_count > 1 && CpPar::Concurrent()) {
 		// Astro Bot PC (KYTY_CP_PAR=1b3): a drain of the run-ahead cannot reach its unmerged
 		// position (cpParallel.h): an insertion merges it first.

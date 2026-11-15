@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include <atomic>
@@ -194,6 +195,7 @@ bool TextureBindingMemo::DccStateHolds(TextureCache& cache, const Entry& entry) 
 }
 
 void TextureBindingMemo::ApplyDcc(TextureCache& cache, const Entry& entry, Image& image) {
+	FastCheck::Fail(FastCheck::Cause::TextureDcc); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	// MaterializeDccClear's bookkeeping before its decision: the image takes the description's
 	// metadata, and no other interpretation of those bytes remains (TryRepeatLookup does the same).
 	image.info.metadata = entry.desc.info.metadata;

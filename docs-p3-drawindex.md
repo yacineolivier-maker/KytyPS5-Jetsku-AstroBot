@@ -172,3 +172,46 @@ part qui passe (a) : à mesurer avec le compteur « aurait été rapide » (`KYT
 
 Non vérifié : durée de vie des programmes de `state.programs` face à une éviction ; atteignabilité en 2b des
 chemins qui ne posent que `SetThreadStream` ; contenu exact des rappels différés ; mode dense de `SlotVector`.
+
+## 4. Recensement « aurait été rapide » (`KYTY_CP_PAR_FASTCHECK=1`, défaut 0)
+
+Mesure de (b) sans rien changer au comportement (`drawPrep\fastCheck.{h,cpp}`). Chaque opération DrawIndex ou
+DrawAuto exécutée sous le verrou des voies (`ResolveSubmission`) est encadrée par `FastCheck::Begin`/`End`. Le
+code du commit marque, **aux décisions qu'il prend de toute façon**, les événements que la condition (a)
+interdit : ce sont des bits `thread_local` du fil de l'opération. Aucune recherche supplémentaire, aucune
+écriture de LRU, de mémo ni de drapeau : le recensement ne lit rien de plus que le commit et n'écrit que ses
+propres compteurs (atomiques, par voie). Désactivé : une lecture d'une constante par point de marquage.
+
+Points de marquage (cause → condition) :
+
+| Condition | Causes | Où |
+|---|---|---|
+| 1 | `not-published`, `inherit-pending`, `snapshot` | `ExecDrawIndex`/`ExecDrawAuto`, `OpSnapshot` (`graphicsRun.cpp`) |
+| 2 | `head-unclaimed` (le commit prépare lui-même), `head-waited` (attente sous le verrou) | `Engine::ReadyHead` |
+| 3 | `prep-missing`, `prep-refused` (repli `GetGraphicsPrograms`), `plan-not-quiet` (contrôles matériels exécutés), `pipeline-not-planned` | `RefreshShaders`, `RunDrawChecks`, `ExecutePreparedDraw` |
+| 4 | `target-op` (métadonnées, copie profondeur, résolution, copie profondeur→couleur), `index8`, `restart-scan`, `mrt-split` | `DrawIndex`/`DrawAuto`, `ResolvePrimitiveRestart`, `ExecutePreparedDraw` |
+| 5 | `run-late-fallback` (continuation perdue en route), `targets-acquired` (`AcquireRenderTargets` appelé : ni continuation ni réutilisation) | `ExecutePreparedDraw` |
+| 6 | `texture-miss` (`ResolveTextureFull`), `texture-view-miss` (`FindTexture`), `texture-dcc` (`ApplyDcc`), `transition` (barrière d'image réellement enregistrée) | `descriptors.cpp`, `textureBindingMemo.cpp`, `image.cpp` |
+| 7 | `buffer-written` (liaison écrite), `buffer-create`, `buffer-sync` (synchronisation au-delà des sorties précoces), `buffer-stream` (petite lecture sale CPU copiée dans le flux), `buffer-rejoin` | `bufferCache.cpp`, `ExecutePreparedDraw` |
+| 8 | `sampler-miss`, `occlusion-flush`, `recorder-drain` | `NativeSampler`, `occlusion.cpp`, `CommandRecorder::Drain` |
+| 9 | `pending-ops` (une opération différée exécutée), `submit` (`CommandScheduler::Submit`), `services` (garde-fou 2 ms), `slice-yield` | `commandScheduler.cpp`, `drawPrep.cpp`, `MaybeYieldSlice` |
+
+Classement à la fin de l'opération : **fast** (aucune marque et le dessin a atteint la sélection de pipeline,
+ou une opération de cible), **empty** (rien d'enregistré : compte nul, programme absent, rien à dessiner,
+pipeline sauté), sinon **failed** : compté à sa **première** cause (la plus petite dans l'ordre ci-dessus, donc
+la première condition qui échoue) et, s'il n'a qu'une marque, à sa **cause seule** (les dessins qu'une seule
+correction rendrait rapides).
+
+Ligne toutes les 10 s (une voie la publie) :
+
+```
+CpPar 10s: 2b fast-draw candidates (10s; condition (a) 1-9, docs-p3-drawindex.md):
+  lane B: DrawIndex n (fast n), DrawAuto n (fast n); fast x%, empty n, failed n
+    first failure: 2: head-waited n | 5: targets-acquired n | 7: buffer-written n ...
+    sole cause: 5: targets-acquired n | 6: transition n ...
+```
+
+Limites : les conditions qui portent sur l'état partagé lui-même (verrous lecteurs, §2.1 C1-C6) ne sont pas
+des marques : ce sont des prérequis structurels, vrais pour tous les dessins une fois faits. Une marque posée
+pendant une opération par un travail qui n'est pas le dessin (un `DrainPreparedDraws`, un service) compte pour
+ce dessin. Aucune condition n'a dû être classée « non évaluable » : toutes sont lues à une décision existante.

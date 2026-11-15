@@ -30,6 +30,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -803,6 +804,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandS
 // preparation: it is a function of the registers and of log state that only moves one way).
 static void RunDrawChecks(const CommandBuffer& buffer, const HW::UserConfig& ucfg,
                           const DrawPrep::BindingPlan* plan) {
+	if (plan == nullptr || !plan->hw_checks_quiet || DrawPrep::BindingsVerifyMode() != 0) {
+		FastCheck::Fail(FastCheck::Cause::PlanNotQuiet); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
+	}
 	if (plan != nullptr && plan->hw_checks_quiet) {
 		if (DrawPrep::BindingsVerifyMode() == 0) {
 			OwnedCounters::Add(DrawPrep::GetBindingTotals().hw_checks_skipped, 1);
@@ -1789,6 +1793,7 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 		case DrawPrep::RestartDecision::Enabled: return true;
 		case DrawPrep::RestartDecision::Scan: break;
 	}
+	FastCheck::Fail(FastCheck::Cause::RestartScan); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	const auto restart_index = DrawPrep::PrimitiveRestartIndex(buffer.GetRegisters(), element_size);
 
 	// A game can set a custom reset value without using it in the index buffer.
@@ -2029,6 +2034,10 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	const bool prepared_valid =
 	    prepared != nullptr && DrawPrep::Validate(*prepared, state.ps_active, target_export_mapping);
 	CommitStats::StepMark(CommitStats::Step::Validate);
+	if (!prepared_valid) {
+		// Astro Bot PC (KYTY_CP_PAR_FASTCHECK): the serial program preparation below.
+		FastCheck::Fail(prepared == nullptr ? FastCheck::Cause::PrepMissing : FastCheck::Cause::PrepRefused);
+	}
 	if (prepared_valid) {
 		ApplyPreparedDraw(*prepared, state);
 		// The binding plan was computed from this preparation (KYTY_DRAW_PREP_BINDINGS).
@@ -5135,6 +5144,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		return;
 	}
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
+		FastCheck::Fail(FastCheck::Cause::TargetOp); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
+		FastCheck::Recorded();
 		m_run_active = false; // the copy is not a draw of the run
 		return;
 	}
@@ -5347,6 +5358,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (targets_late || (m_run_active && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true) ||
 	                                      run_indirect_barrier))) {
 		const CommitStats::SubScope late_scope(CommitStats::Sub::LateFallback);
+		FastCheck::Fail(FastCheck::Cause::RunLateFallback); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		if (!targets_late) {
 			DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
 			DrawRun::CountMiss(DrawRun::Miss::Images);
@@ -5387,6 +5399,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		auto& cache = m_context.GetBufferCache();
 		for (uint32_t pass = 0; pass < 4 && cache.UnregisterEpoch() != m_rebind_epoch; pass++) {
 			NoteRebindAfterJoin("draw", draw.Name());
+			FastCheck::Fail(FastCheck::Cause::BufferRejoin); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 			m_rebind_epoch = cache.UnregisterEpoch();
 			{
 				const BufferCache::UploadBatch upload_batch(cache);
@@ -5472,6 +5485,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (planned_pipeline != nullptr && !plan_verify) {
 		pipeline_cache.NotePlannedPipeline(state.depth_info, ps_input);
 	} else {
+		FastCheck::Fail(FastCheck::Cause::PipelineNotPlanned); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		const bool skippable = planned_pipeline == nullptr && pipeline_cache.PipelineSkipEnabled() &&
 		                       DrawOnlyChangesPicture(m_context, state, vertex_stages, mesh_active);
 		pipeline_object = pipeline_cache.TryGetGraphicsPipeline(
@@ -5499,6 +5513,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	const auto& pipeline = *pipeline_object;
+	FastCheck::Recorded(); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK): the draw is recorded below
 	CommitStats::StepMark(CommitStats::Step::PipelineSel);
 	CommitStats::Mark(CommitStats::Phase::Pipeline);
 	// Astro Bot PC (KYTY_NATIVE_MODE=s0, nativeLearn.h): the learning hook of a native op's draw.
@@ -5568,6 +5583,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			const auto acquire_transitions =
 			    acquire_reuse ? Image::RecordedTransitions() : uint64_t {0};
+			FastCheck::Fail(FastCheck::Cause::TargetsAcquired); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 			rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 			                                 state.depth_info, feedback_aspects, stages,
 			                                 bounded ? &written : nullptr);
@@ -6245,6 +6261,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		if (m_native_lean_sample) {
 			NativeLeanMismatch("target operation ran", 0);
 		}
+		FastCheck::Fail(FastCheck::Cause::TargetOp); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
+		FastCheck::Recorded();                       // a target operation records work
 		ResetBindings();
 		return;
 	}
@@ -6333,6 +6351,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	std::vector<uint16_t> expanded_indices;
 	if (index_source.guest_element_size == 1) {
+		FastCheck::Fail(FastCheck::Cause::Index8); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
 		const auto* src = static_cast<const uint8_t*>(args.index_addr);
 		expanded_indices.resize(args.index_count);
@@ -6362,6 +6381,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	CommitStats::StepMark(CommitStats::Step::ResetBindings);
 	if (const auto split = std::exchange(m_mrt_split_slots, 0u); split != 0u) {
 		// KYTY_MRT_SPLIT: the second pass, with only the slots the first left out.
+		FastCheck::Fail(FastCheck::Cause::MrtSplit); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		native_s1_segment.valid = false; // S1: not a single draw of the segment's state
 		NoteMrtSplit(split);
 		m_run.valid = false;
@@ -6425,6 +6445,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		if (m_native_lean_sample) {
 			NativeLeanMismatch("target operation ran", 0);
 		}
+		FastCheck::Fail(FastCheck::Cause::TargetOp); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
+		FastCheck::Recorded();                       // a target operation records work
 		ResetBindings();
 		return;
 	}
@@ -6520,6 +6542,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	CommitStats::StepMark(CommitStats::Step::ResetBindings);
 	if (const auto split = std::exchange(m_mrt_split_slots, 0u); split != 0u) {
 		// KYTY_MRT_SPLIT: the second pass, with only the slots the first left out.
+		FastCheck::Fail(FastCheck::Cause::MrtSplit); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		NoteMrtSplit(split);
 		m_run.valid = false;
 		BeginDrawRun();

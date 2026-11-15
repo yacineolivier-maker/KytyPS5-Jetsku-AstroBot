@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -400,6 +401,7 @@ void CommandScheduler::PopOperations(bool wait_for_priority) {
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
+		FastCheck::Fail(FastCheck::Cause::PendingOps); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		if (wait_for_priority) {
 			WaitPriorityOperations(operation.tick);
 		}
@@ -1255,6 +1257,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	GpuOpProfiler::NoteSubmitStack(); // Astro Bot PC (KYTY_RENDER_END_STATS)
+	FastCheck::Fail(FastCheck::Cause::Submit); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	const CpGaps::Scope gap(CpGaps::Cat::Flush);
 	HangWatchdog::NoteSubmission();
 	if (m_dual && CpPar::Concurrent()) {

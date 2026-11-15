@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -521,6 +522,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		return;
 	}
 	g_recorded_transitions.fetch_add(1, std::memory_order_relaxed);
+	FastCheck::Fail(FastCheck::Cause::Transition); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	// Barrier batcher (render.h): merged with pending requests, recorded now or (deferrable) at
 	// the next flush point, ending an active rendering instance only when recorded.
 	if (m_scheduler.Active() && m_scheduler.Current().BatchImageBarriers(barriers, command_buffer,

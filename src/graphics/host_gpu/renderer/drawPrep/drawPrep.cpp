@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
@@ -1544,6 +1545,7 @@ Engine::Slot& Engine::ReadyHead() {
 	const auto stats_start = CommitStats::Now();
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
+		FastCheck::Fail(FastCheck::Cause::HeadUnclaimed); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		const CpGaps::Scope gap(CpGaps::Cat::HeadSelf);
 		PrepareSlot(m_renderer.GetPipelineCache(), slot, true);
 		HashForRepeatTrace(slot);
@@ -1555,6 +1557,7 @@ Engine::Slot& Engine::ReadyHead() {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
 	} else {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
+		FastCheck::Fail(FastCheck::Cause::HeadWaited); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		const CpGaps::Scope gap(CpGaps::Cat::HeadWait);
 		// Diagnostics: what the wait began with (the window's depth, a waiting unclaimed slot).
 		const auto occupancy = window.Occupancy();
@@ -1587,6 +1590,7 @@ Engine::Slot& Engine::ReadyHead() {
 			    // just before these draws were parsed.
 			    if ((spins & 1023u) == 1023u && m_service_commands &&
 			        NowNs() - spin_start > 2'000'000u) {
+				    FastCheck::Fail(FastCheck::Cause::ServicesRun); // Astro Bot PC (fastCheck.h)
 				    m_service_commands();
 			    }
 		    },

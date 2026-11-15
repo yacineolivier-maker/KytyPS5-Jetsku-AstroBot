@@ -49,6 +49,7 @@ static bool ClockLocal() {
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
@@ -1896,6 +1897,7 @@ void CommandProcessor::MaybeYieldSlice() {
 		return; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the oldest lane yields for the compute work
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GfxSliceYields);
+	FastCheck::Fail(FastCheck::Cause::SliceYield); // Astro Bot PC (fastCheck.h)
 	g_current_execution->m_yield = true;
 }
 
@@ -3795,10 +3797,14 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
+			FastCheck::Fail(FastCheck::Cause::InheritPending); // Astro Bot PC (fastCheck.h)
 			// The inherited count may be GPU data an earlier (pending) draw writes.
 			DrainPreparedDraws();
 		}
 		args.instance_count = NumInstances();
+	}
+	if ((op.flags & CpSeq::DrawFlagPublished) == 0) {
+		FastCheck::Fail(FastCheck::Cause::NotPublished); // Astro Bot PC (fastCheck.h)
 	}
 	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
 		// Thread mode: the sequencer published the draw; commit its prepared slot now, in order.
@@ -4473,9 +4479,13 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
+			FastCheck::Fail(FastCheck::Cause::InheritPending); // Astro Bot PC (fastCheck.h)
 			DrainPreparedDraws();
 		}
 		args.instance_count = NumInstances();
+	}
+	if ((op.flags & CpSeq::DrawFlagPublished) == 0) {
+		FastCheck::Fail(FastCheck::Cause::NotPublished); // Astro Bot PC (fastCheck.h)
 	}
 	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
 		const NativeLeanScope native_lean(m_renderer.GetRenderExecutor(), op.flags, m_native_lean_op);
@@ -8865,6 +8875,12 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				CpPar::NoteVisibleOp(context, sequence, GetScheduler().LaneSegmentOldest(context));
 			}
 		}
+		// Astro Bot PC (KYTY_CP_PAR_FASTCHECK=1, drawPrep/fastCheck.h): the census of this draw op.
+		const bool fast_check = FastCheck::Enabled() &&
+		                        (kind == CpSeq::OpKind::DrawIndex || kind == CpSeq::OpKind::DrawAuto);
+		if (fast_check) {
+			FastCheck::Begin();
+		}
 		// Placement samples (common/cpuPlacement.h), every 256th op: this thread executes the
 		// graphics queue's packets, and ProcessPacket samples only where packets execute.
 		if ((++LaneCp().placement_packets & 255u) == 0u) {
@@ -8895,6 +8911,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		auto*                             snapshot = OpSnapshot(kind, view.payload);
 		CommandScheduler::RegisterBinding previous {};
 		if (snapshot != nullptr) {
+			FastCheck::Fail(FastCheck::Cause::Snapshot);
 			previous = GetScheduler().BindRegisters(snapshot->context, snapshot->user_config,
 			                                        snapshot->shaders);
 		}
@@ -8953,6 +8970,9 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		LaneCp().executing = false;
 		if (snapshot != nullptr) {
 			GetScheduler().RestoreRegisters(previous);
+		}
+		if (fast_check) {
+			FastCheck::End(context, kind == CpSeq::OpKind::DrawAuto);
 		}
 		concurrent_op.Release(); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1)
 		if (result.suspended) {

@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR=2b)
@@ -328,6 +329,7 @@ void OcclusionCounter::FlushBatch() {
 		scheduler.EndRendering();
 	}
 	if (B().batch_count == 0 && B().queries.Pending() == 0) return;
+	FastCheck::Fail(FastCheck::Cause::OcclusionFlush); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	EXIT_IF(B().queries.Active() || B().prepared);
 	// The batch's dumps took this tick as their completion tick: the reduction must be recorded
 	// into this very command buffer (nothing below may submit it).
@@ -527,6 +529,7 @@ void OcclusionCounter::FlushPending() {
 	KYTY_GPU_OP_SITE("occlusion.flush");
 	EXIT_IF(B().queries.Active() || B().prepared);
 	if (B().queries.Pending() == 0) return;
+	FastCheck::Fail(FastCheck::Cause::OcclusionFlush); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	auto native = m_context.GetCommandScheduler().Current().Handle();
 	native.copyQueryPoolResults(B().pool, 0, B().queries.Pending(), m_result->Handle(), 0, 8,
 	                            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
