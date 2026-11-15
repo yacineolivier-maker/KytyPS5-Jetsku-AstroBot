@@ -62,6 +62,16 @@ void NoteDeferredLabel(uint64_t completed_ns, uint64_t visible_ns) noexcept;
 // sceAgcSuspendPoint (any guest thread): one call, wait_ns blocked.
 void NoteAgcDone(uint64_t wait_ns) noexcept;
 
+// A submission held by the frame fence (KYTY_FRAME_FENCE) for ns while the CP could have run it.
+void NoteFenceHold(uint64_t ns) noexcept;
+
+// Astro Bot's GPU-label poll (eboot 0x114b2f0: a yield and a short sleep in a loop, return
+// addresses 0x114b305 / 0x114b315; the eboot is loaded at 0x900000000, as the 15/11 profiles show).
+[[nodiscard]] inline bool IsLabelPoll(uint64_t return_address) noexcept {
+	return return_address == 0x90114b305ull || return_address == 0x90114b315ull;
+}
+void NoteLabelPoll(uint64_t begin_ns, uint64_t end_ns) noexcept;
+
 // Guest main thread (RuntimeLinker::Execute).
 void MarkMainThread() noexcept;
 [[nodiscard]] bool OnMainThread() noexcept;

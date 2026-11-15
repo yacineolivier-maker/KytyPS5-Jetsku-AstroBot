@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/framePath.h"
 
+#include "common/threads.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include <algorithm>
@@ -112,6 +113,7 @@ enum Stage : uint32_t {
 	LabelDeferred,
 	AgcDone,
 	MainYield, // one scePthreadYield of the main thread (a yield to a ready thread can cost a slice)
+	FenceHold, // a submission held by the frame fence while the CP could run it
 	StageCount
 };
 
@@ -170,6 +172,15 @@ constexpr uint64_t    SpinGapNs             = 50'000; // a gap this short betwee
 
 std::atomic<uint64_t> g_agc_done_calls {0};
 
+// eboot 0x114b2f0 poll (any thread): time in its yields/sleeps plus the short gaps between them.
+std::atomic<uint64_t> g_poll_ns {0};
+std::atomic<uint64_t> g_polls {0};
+thread_local uint64_t t_poll_last_end = 0;
+
+// One record-time label in LabelSample is timed (KYTY_FRAME_PATH cost).
+constexpr uint32_t    LabelSample       = 8;
+thread_local uint32_t t_label_counter   = 0;
+
 thread_local uint64_t t_slice_enqueue_ns = 0;
 
 void Line(char* out, size_t size, const char* name, Histogram::Summary s) {
@@ -189,6 +200,9 @@ void Report(uint64_t window_ns) {
 	const auto label_def = take(LabelDeferred);
 	const auto agc       = take(AgcDone);
 	const auto yield_one = take(MainYield);
+	const auto fence     = take(FenceHold);
+	const auto poll_ns   = g_poll_ns.exchange(0, std::memory_order_relaxed);
+	const auto polls     = g_polls.exchange(0, std::memory_order_relaxed);
 	const auto frames    = g_agc_done_calls.exchange(0, std::memory_order_relaxed);
 	const auto subs      = g_submissions.exchange(0, std::memory_order_relaxed);
 	const auto misses    = g_tick_misses.exchange(0, std::memory_order_relaxed);
@@ -238,76 +252,84 @@ void Report(uint64_t window_ns) {
 	            pct(wait[static_cast<size_t>(Wait::Equeue)]),
 	            pct(wait[static_cast<size_t>(Wait::Sleep)]),
 	            pct(wait[static_cast<size_t>(Wait::Fault)]));
+	// The queue stage split: frame fence holds (the CP was free) versus the CP busy with earlier work.
+	std::printf("Kyty chemin image 10 s (suite) : barriere de trame %.2f/%.1f ms [n=%" PRIu64
+	            "] | CP occupe (traduction cumulee) %.0f ms/s | boucle etiquette GPU eboot 0x114b2f0 "
+	            "%.0f ms/s (%.0f appels/s, tous fils) | etiquettes : 1 sur %u mesuree
+",
+	            fence.mean_ms, fence.p95_ms, fence.count,
+	            translate.mean_ms * static_cast<double>(translate.count) / seconds,
+	            static_cast<double>(poll_ns) / 1e6 / seconds, static_cast<double>(polls) / seconds,
+	            LabelSample);
 	std::fflush(stdout);
 }
 
 void MonitorRun() {
+	// Polls the timeline counter every millisecond (a blocking high-resolution timer sleep, then one
+	// driver query) instead of waiting on it: the first version (vkWaitSemaphores per submission,
+	// which a driver may implement by spinning) went with ~28 -> 23.5 frames/s on 15/11. The GPU
+	// end is seen up to ~1 ms late (mean bias ~0.5 ms).
 	uint64_t next_report = NowNs() + ReportPeriodNs;
 	uint64_t last_report = NowNs();
-	bool     failed      = false; // the timeline wait failed (device lost): stages C-D stop
-	const auto maybe_report = [&] {
+	bool     failed      = false; // the counter query failed (device lost): stages C-D stop
+	std::deque<Pending> local;
+	for (;;) {
+		MasterSemaphore* master = nullptr;
+		{
+			std::unique_lock lock(g_mutex);
+			if (local.empty() && g_pending.empty()) {
+				const auto now     = NowNs();
+				const auto wait_ns = next_report > now ? next_report - now : 0;
+				g_cv.wait_for(lock, std::chrono::nanoseconds(wait_ns),
+				              [] { return g_stop || !g_pending.empty(); });
+			}
+			if (g_stop) {
+				return;
+			}
+			while (!g_pending.empty()) {
+				local.push_back(g_pending.front());
+				g_pending.pop_front();
+			}
+			master = g_master;
+		}
+		if (!local.empty() && master != nullptr && !failed) {
+			uint64_t counter = 0;
+			if (!master->CounterQuiet(counter)) {
+				failed = true;
+				local.clear();
+			} else {
+				const auto gpu_ns = NowNs();
+				while (!local.empty() && local.front().tick <= counter) {
+					const auto entry      = local.front();
+					local.pop_front();
+					const auto recorded   = LoadTick(g_recorded, entry.tick);
+					const auto dispatched = LoadTick(g_dispatched, entry.tick);
+					if (dispatched != 0 && dispatched >= entry.complete_ns && gpu_ns >= dispatched) {
+						if (recorded != 0 && recorded >= entry.complete_ns && dispatched >= recorded) {
+							g_hist[Record].Add(recorded - entry.complete_ns);
+							g_hist[Dispatch].Add(dispatched - recorded);
+						}
+						g_hist[Gpu].Add(gpu_ns - dispatched);
+					} else {
+						g_tick_misses.fetch_add(1, std::memory_order_relaxed);
+					}
+					if (entry.enqueue_ns != 0 && gpu_ns >= entry.enqueue_ns) {
+						g_hist[GuestToGpu].Add(gpu_ns - entry.enqueue_ns);
+					}
+				}
+				if (!local.empty()) {
+					Common::Thread::SleepMicro(1000);
+				}
+			}
+		} else if (failed) {
+			local.clear();
+		}
 		const auto now = NowNs();
 		if (now >= next_report) {
 			Report(now - last_report);
 			last_report = now;
 			next_report = now + ReportPeriodNs;
 		}
-	};
-	for (;;) {
-		Pending          entry;
-		MasterSemaphore* master = nullptr;
-		{
-			std::unique_lock lock(g_mutex);
-			const auto       wait_ns = next_report > NowNs() ? next_report - NowNs() : 0;
-			g_cv.wait_for(lock, std::chrono::nanoseconds(wait_ns),
-			              [] { return g_stop || !g_pending.empty(); });
-			if (g_stop) {
-				return;
-			}
-			if (!g_pending.empty()) {
-				entry = g_pending.front();
-				g_pending.pop_front();
-				master = g_master;
-			}
-		}
-		if (master != nullptr && !failed) {
-			// Waits for the tick in short steps (Detach stops it within one step).
-			for (;;) {
-				const int result = master->WaitQuiet(entry.tick, 5'000'000);
-				if (result > 0) {
-					break;
-				}
-				if (result < 0) {
-					failed = true;
-					break;
-				}
-				{
-					std::lock_guard lock(g_mutex);
-					if (g_stop) {
-						return;
-					}
-				}
-				maybe_report();
-			}
-			if (!failed) {
-				const auto gpu_ns      = NowNs();
-				const auto recorded    = LoadTick(g_recorded, entry.tick);
-				const auto dispatched  = LoadTick(g_dispatched, entry.tick);
-				if (dispatched != 0 && dispatched >= entry.complete_ns && gpu_ns >= dispatched) {
-					if (recorded != 0 && recorded >= entry.complete_ns && dispatched >= recorded) {
-						g_hist[Record].Add(recorded - entry.complete_ns);
-						g_hist[Dispatch].Add(dispatched - recorded);
-					}
-					g_hist[Gpu].Add(gpu_ns - dispatched);
-				} else {
-					g_tick_misses.fetch_add(1, std::memory_order_relaxed);
-				}
-				if (entry.enqueue_ns != 0 && gpu_ns >= entry.enqueue_ns) {
-					g_hist[GuestToGpu].Add(gpu_ns - entry.enqueue_ns);
-				}
-			}
-		}
-		maybe_report();
 	}
 }
 
@@ -382,7 +404,7 @@ void BeginSlice(uint64_t enqueue_ns) noexcept {
 
 void NoteLabelWrite() noexcept {
 	const auto enqueue = t_slice_enqueue_ns;
-	if (enqueue == 0) {
+	if (enqueue == 0 || (++t_label_counter % LabelSample) != 0) {
 		return;
 	}
 	const auto now = NowNs();
@@ -400,6 +422,21 @@ void NoteDeferredLabel(uint64_t completed_ns, uint64_t visible_ns) noexcept {
 void NoteAgcDone(uint64_t wait_ns) noexcept {
 	g_agc_done_calls.fetch_add(1, std::memory_order_relaxed);
 	g_hist[AgcDone].Add(wait_ns);
+}
+
+void NoteFenceHold(uint64_t ns) noexcept {
+	g_hist[FenceHold].Add(ns);
+}
+
+void NoteLabelPoll(uint64_t begin_ns, uint64_t end_ns) noexcept {
+	g_polls.fetch_add(1, std::memory_order_relaxed);
+	uint64_t ns = end_ns >= begin_ns ? end_ns - begin_ns : 0;
+	const auto last = t_poll_last_end;
+	if (last != 0 && begin_ns >= last && begin_ns - last < SpinGapNs) {
+		ns += begin_ns - last;
+	}
+	t_poll_last_end = end_ns;
+	g_poll_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 void MarkMainThread() noexcept {

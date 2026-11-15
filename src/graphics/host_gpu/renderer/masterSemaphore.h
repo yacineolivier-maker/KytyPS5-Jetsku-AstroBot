@@ -56,9 +56,9 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
-	// Astro Bot PC (KYTY_FRAME_PATH=1, framePath.h): waits up to timeout_ns for `tick` without
-	// counters, watchdog scopes or exit on error: 1 reached, 0 timed out, -1 failed.
-	[[nodiscard]] int WaitQuiet(uint64_t tick, uint64_t timeout_ns);
+	// Astro Bot PC (KYTY_FRAME_PATH=1, framePath.h): the timeline's counter, read without counters,
+	// watchdog scopes or exit on error (false: the query failed).
+	[[nodiscard]] bool CounterQuiet(uint64_t& value);
 
 	// Astro Bot PC (KYTY_CP_PAR=2b, cpParallel.h): tick ranges. Each lane segment reserves, in list
 	// order, a range of RangeTicks consecutive ticks (BeginRange, which returns the segment's order:

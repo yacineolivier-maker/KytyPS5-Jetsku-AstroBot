@@ -2837,6 +2837,9 @@ bool GuestGpu::Process(Submission& submission) {
 		}
 		if (FramePath::Enabled()) {
 			submission.frame_path_start_ns = FramePath::NowNs(); // Astro Bot PC (KYTY_FRAME_PATH)
+			if (submission.fence_hold_ns != 0 && submission.frame_path_start_ns > submission.fence_hold_ns) {
+				FramePath::NoteFenceHold(submission.frame_path_start_ns - submission.fence_hold_ns);
+			}
 		}
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
@@ -2944,6 +2947,9 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		PaceLog::NoteCpSubmission(submission.pace_enqueue_ns, submission.reset_processor);
 		if (FramePath::Enabled()) {
 			submission.frame_path_start_ns = FramePath::NowNs(); // Astro Bot PC (KYTY_FRAME_PATH)
+			if (submission.fence_hold_ns != 0 && submission.frame_path_start_ns > submission.fence_hold_ns) {
+				FramePath::NoteFenceHold(submission.frame_path_start_ns - submission.fence_hold_ns);
+			}
 		}
 		cp.SetSubmitId(++m_submit_id, submission.cp_par_context); // Astro Bot PC (2b: its lane)
 		// The frame fence's ordering point: the sequencer reads a fenced submission's command

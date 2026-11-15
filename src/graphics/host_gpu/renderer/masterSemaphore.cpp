@@ -128,19 +128,9 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
-int MasterSemaphore::WaitQuiet(uint64_t tick, uint64_t timeout_ns) {
-	if (m_gpu_tick.load(std::memory_order_acquire) >= tick) {
-		return 1;
-	}
-	vk::SemaphoreWaitInfo wait_info {};
-	wait_info.semaphoreCount = 1;
-	wait_info.pSemaphores    = &m_semaphore;
-	wait_info.pValues        = &tick;
-	const auto result        = m_graphics.device.waitSemaphores(&wait_info, timeout_ns);
-	if (result == vk::Result::eSuccess) {
-		return 1;
-	}
-	return result == vk::Result::eTimeout ? 0 : -1;
+bool MasterSemaphore::CounterQuiet(uint64_t& value) {
+	value = 0;
+	return m_graphics.device.getSemaphoreCounterValue(m_semaphore, &value) == vk::Result::eSuccess;
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {
