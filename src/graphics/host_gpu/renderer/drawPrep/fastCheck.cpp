@@ -27,7 +27,7 @@ constexpr std::array<uint8_t, kCauses> kConditionOf {
     3, 3, 3, 3,    // PrepMissing, PrepRefused, PlanNotQuiet, PipelineNotPlanned
     4, 4, 4, 4,    // TargetOp, Index8, RestartScan, MrtSplit
     5, 5,          // RunLateFallback, TargetsAcquired
-    6, 6, 6, 6,    // TextureMiss, TextureViewMiss, TextureDcc, Transition
+    6, 6, 6, 6, 6, 6, // TextureMiss, TextureViewMiss, TextureDcc, Transition, ImageAdopt, ImageOverlay
     7, 7, 7, 7, 7, // BufferWritten, BufferCreate, BufferSync, BufferStream, BufferRejoin
     8, 8, 8,       // SamplerMiss, OcclusionFlush, RecorderDrain
     9, 9, 9, 9,    // PendingOps, Submit, ServicesRun, SliceYield
@@ -39,7 +39,7 @@ constexpr std::array<const char*, kCauses> kNames {
     "prep-missing", "prep-refused", "plan-not-quiet", "pipeline-not-planned",
     "target-op", "index8", "restart-scan", "mrt-split",
     "run-late-fallback", "targets-acquired",
-    "texture-miss", "texture-view-miss", "texture-dcc", "transition",
+    "texture-miss", "texture-view-miss", "texture-dcc", "transition", "image-adopt", "image-overlay",
     "buffer-written", "buffer-create", "buffer-sync", "buffer-stream", "buffer-rejoin",
     "sampler-miss", "occlusion-flush", "recorder-drain",
     "pending-ops", "submit", "services", "slice-yield",

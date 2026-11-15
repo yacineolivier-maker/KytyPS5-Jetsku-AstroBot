@@ -1188,6 +1188,7 @@ CpParOverlay& GetCpParOverlay(uint32_t lane = 0) {
 } // namespace
 
 void Image::CpParTouchSlow() {
+	FastCheck::Fail(FastCheck::Cause::ImageOverlay); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 	auto&           overlay = GetCpParOverlay(CpPar::t_overlay_lane);
 	std::lock_guard lock(overlay.mutex);
 	auto [found, inserted] = overlay.entries.try_emplace(this);

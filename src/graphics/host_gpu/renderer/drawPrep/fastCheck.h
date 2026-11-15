@@ -45,6 +45,11 @@ enum class Cause : uint8_t {
 	TextureViewMiss,
 	TextureDcc,
 	Transition,
+	// (P3 step 2, strict) the image state is adopted without a barrier, or a younger lane's op
+	// swaps an image's state with its lane overlay (in place, for the rest of the op: no other lane
+	// may read that image meanwhile)
+	ImageAdopt,
+	ImageOverlay,
 	// 7: buffers read-only and clean
 	BufferWritten,
 	BufferCreate,

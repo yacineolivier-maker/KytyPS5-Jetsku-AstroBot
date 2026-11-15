@@ -6,6 +6,7 @@
 #include "common/slotVector.h"
 #include "graphics/guest_gpu/command_processor/cpParallel.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/fastCheck.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/image/keptRanges.h"
@@ -618,6 +619,7 @@ public:
 	void AdoptState(vk::PipelineStageFlags2 stage, vk::AccessFlags2 access,
 	                vk::ImageLayout layout) noexcept {
 		CpParTouch(); // Astro Bot PC (KYTY_CP_PAR=1b3)
+		FastCheck::Fail(FastCheck::Cause::ImageAdopt); // Astro Bot PC (KYTY_CP_PAR_FASTCHECK)
 		const uint64_t before = CpPar::HashBookActive() ? CpParStateHash() : 0; // Astro Bot PC
 		backing.state = {stage, access, layout};
 		NoteImageStateChange();

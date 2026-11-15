@@ -244,3 +244,98 @@ Limites connues : la copie de flux différée (`KYTY_STREAM_COPY_DEFER`, préré
 dès que le recorder a plusieurs flux (2a/2b) ; le mémo de plages (`RecordRangeFact`) et le mémo de
 liaison restent communs (W3) ; `KYTY_CP_OWNED_COUNTERS=1` (préréglage U59) garde ses compteurs non
 atomiques (W10) : sans effet tant que tout est sous le verrou.
+
+## 6. Chemin rapide (`KYTY_CP_PAR_FASTDRAW=2`) : pourquoi il n'est pas codé, et ce qui le débloque
+
+Mesure (session principale, Aerial Garden, C1/C2/prérequis actifs, contrôles à 0) : B 64,2 % et C
+60,7 % de dessins « fast » au sens de §3 (a). Causes seules restantes : B `targets-acquired` ~12 900,
+`texture-dcc` ~3 700, `head-waited` ~2 600, `submit` ~1 600, `slice-yield` ~1 500 ; C `buffer-written`
+~131 000, `targets-acquired` ~11 900, `submit` ~4 200, `texture-dcc` ~3 200. Repère : U59 sans 2b
+28,3 i/s en déplacement, MC 2b à tour de rôle 23,4.
+
+### Ce que la relecture du code a établi (bloquants du chemin rapide tel que spécifié en §3 (a))
+
+1. **La surcouche d'état d'image échange l'état en place pour toute la durée de l'opération.**
+   `Image::CpParTouchSlow` (`image\image.cpp`) met l'état de la voie plus jeune dans `backing.state`
+   de l'image commune, et `Image::CpParEndOp` ne le rend qu'à la fin de l'opération. Sous le verrou
+   global c'est sûr (une seule opération à la fois). Hors verrou, une autre voie qui lit l'image pendant
+   ce temps (même un `Transit` sans effet, un `DrawRunImagesUnchanged`) lit l'état de l'autre voie :
+   mauvais `oldLayout`, perte du GPU possible. `CpParTouch` est appelé par **toute** lecture ou
+   écriture d'état d'image d'une opération de voie plus jeune, y compris les transitions sans effet.
+   C4 « seulement si TransitIsNoOp » ne suffit donc pas : il faut qu'un dessin rapide ne lise ni
+   n'écrive aucun état d'image, ou que la surcouche cesse d'être en place (accès à l'état par un
+   accesseur qui redirige vers la surcouche de la voie du fil).
+2. **Des replis existent au milieu du dessin, après la préparation des liaisons.** Exemple :
+   `ExecutePreparedDraw` (`renderDraw.cpp`, bloc « late fallback ») : une continuation dont les images
+   ont changé reprend `DrawRunTargets` (acquisition des cibles, transitions, `FindImage` possible)
+   après `PrepareBindings`. De même `RebindAfterJoin`, et les recherches de tampons qui créent ou
+   synchronisent pendant `PrepareBindings`. Décisions et mutations sont entremêlées sur ~3 000 lignes
+   (`PrepareDrawRenderState`, `PrepareBindings`, `PrepareGraphicsBindings`, `AcquireVertexBuffers`) :
+   il n'existe pas de point « tout est décidé, rien n'est encore modifié ». Évaluer (a) « avant tout
+   enregistrement » demande donc un prédicat séparé, en lectures pures, qui reproduise ces décisions à
+   partir du plan de liaisons des ouvriers (`BindingPlan::vertex/pixel.ranges`, `texture_hashes`,
+   `samplers`, `vertex_ranges`, `pipeline`).
+3. **Un repli à mi-dessin hors verrou n'a pas de sortie sûre.** Relâcher le verrou partagé pour prendre
+   le verrou global au milieu d'un dessin laisse d'autres opérations changer des images et tampons déjà
+   résolus par ce dessin ; une montée de verrou partagé vers exclusif interbloque dès que deux voies
+   rapides la demandent.
+4. **Les mémos du cache de tampons sont écrits même sur un succès** (`ObtainReadBindingMemo` : copie
+   « chaude », époque, `touched` ; `RecordBinding`/`RecordRangeFact` sur un échec) : écritures
+   concurrentes entre voies rapides sur un même emplacement, donc entrée déchirée, donc mauvais tampon
+   lié.
+
+Conclusion : coder `KYTY_CP_PAR_FASTDRAW=2` maintenant donnerait soit un chemin rapide qui peut perdre le
+GPU (surcouche en place, replis à mi-dessin), soit un chemin si restreint qu'il ne gagne rien. Il n'est
+pas codé. Les prérequis C5/C6/C7, W6/W7/W9–W11, W14, R1–R6/R12/R13 n'ont d'effet qu'avec lui (sous le
+verrou global ils ne changent rien et ne peuvent pas être vérifiés) : ils seront faits avec lui.
+
+### Conception proposée (F2), à valider avant de coder
+
+- **Verrou de structure S** (`std::shared_mutex`) : toute opération sous le verrou des voies le prend en
+  exclusif ; un dessin rapide le prend en partagé du début à la fin. Les seules concurrences restantes
+  sont alors rapide contre rapide.
+- **Prédicat P avant tout enregistrement**, lectures pures sous S partagé, à partir du plan de liaisons :
+  emplacement prêt, préparation acceptée, plan `hw_checks_quiet`, pipeline prévu, aucune opération de
+  cible, cibles d'une continuation (images inchangées), chaque texture trouvée dans le mémo de
+  l'exécuteur avec sa vue, **aucun accès à l'état d'image** (continuation avec `keep_images`, ou voie la
+  plus ancienne, ou surcouche non en place), chaque tampon lié existant et propre (page présente dans
+  `m_page_table`, `IsInBounds`, aucune page sale CPU), aucune liaison écrite.
+- **Pendant le dessin rapide** : mémos de tampons en lecture seule (copie chaude, époque et
+  `RecordBinding` sautés), contacts LRU différés (fait), `PopReadyOperations` sauté, `RenderMutex` en
+  partagé, identité « fil GPU » de voie rapide aux seuls sites de lecture (`RelaxedDirtySnapshot`,
+  `RelaxedNothingToUpload`, `IsGpuCleanForRead`, `ObtainReadBindingMemo`), compteurs non atomiques par
+  voie. Une page devenue sale côté CPU après P (écriture invitée concurrente) n'est pas téléversée par ce
+  dessin : équivalent à un dessin exécuté avant l'écriture ; le dessin lent suivant téléverse.
+- **Filet** : chaque point de marquage FASTCHECK (création, synchronisation, liaison écrite, transition,
+  surcouche, soumission…) devient en mode rapide un arrêt explicite (« fast path invariant violated at
+  … ») plutôt qu'une mutation sans verrou ; avec `KYTY_CP_PAR_VERIFY=1`, revalidation de P sous le verrou
+  global après le dessin (« fast draw stale ») et registre des dépendances étendu aux images et cibles.
+
+Pour mesurer ce que P laisserait passer **sans rien changer**, FASTCHECK compte désormais aussi
+`image-adopt` (état adopté sans barrière) et `image-overlay` (une opération de voie plus jeune touche
+l'état d'une image : échange en place). Si `image-overlay` est fréquent sur B et C, la surcouche non en
+place (point 1) est le vrai prochain chantier, avant le chemin rapide.
+
+### buffer-written (cause seule n° 1 de C, ~131 000 / 10 s) : proposition, non codée
+
+Une liaison écrite fait aujourd'hui (`ObtainBufferNow`/`ObtainWrittenBuffer`, `bufferCache.cpp`) :
+synchronisation écrite (souvent sautée si la plage appartient déjà au GPU, `WrittenSyncSkip`),
+`PreserveImagesForGpuWrite`, `MarkContentWritten`, ajout à `m_gpu_modified_ranges`,
+`CleanVerdict::Invalidate`, `NoteBufferContentWrite` (`m_write_ticks`, vidage anticipé),
+`ForgetKnownFills`. Classe « écriture stable » proposée, sûre si chaque test est exact : plage déjà
+entièrement au GPU (`IsRangeGpuOwned`), déjà contenue dans `m_gpu_modified_ranges`, aucun remplissage
+connu, aucune image sur la plage (test pur de ce que `PreserveImagesForGpuWrite` ferait). Il ne reste
+alors que `MarkContentWritten` (compteur de révision, en `fetch_add` atomique) et le tick d'écriture
+(journal par voie ajouté sous le verrou global à la prochaine opération lente, vidé avant toute lecture
+de `m_write_ticks`, comme les contacts LRU différés). Le vrai risque n'est pas la perte du GPU mais
+l'**ordre entre voies** : une voie plus jeune qui écrit une plage qu'une plus ancienne lit encore
+(« dependency hazards » / « order violations » de `NoteLaneBuffer`, déjà comptés). À garder sous
+`KYTY_CP_PAR_VERIFY=1` et à n'activer que si ces compteurs restent à 0 en simultané.
+
+### Surcoût de 2b (23,4 contre 28,3 i/s)
+
+À traiter avant ou avec le chemin rapide. Piste peu coûteuse : `LaneSegmentOldest` prend
+`m_operation_mutex` à chaque opération (`commandScheduler.cpp`, appel dans `graphicsRun.cpp`, W14),
+mutex aussi pris par les soumissions et les opérations différées de toutes les voies ; le rendre sans
+verrou demande de vérifier que `m_turn` n'avance que sous le verrou des voies (non vérifié). Un profil
+échantillonné de la build MC 2b à tour de rôle contre U59 dirait où vont les 5 i/s.
