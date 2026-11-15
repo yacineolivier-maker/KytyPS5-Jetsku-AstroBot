@@ -28,6 +28,7 @@
 #include <atomic>
 #include <bit>
 #include <cerrno>
+#include <cstdio>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -3900,17 +3901,134 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 	return OK;
 }
 
+// Astro Bot PC (KYTY_GUEST_YIELD_BACKOFF=<yields>[,<max_us>], default off): guest threads other
+// than the main one that yield in a burst (calls less than 100 us apart: Astro Bot's tbb workers
+// looking for work, eboot 0xaee4a0-0xaee726, ~26 % of each of 11 threads on 15/11) yield as
+// before for the first <yields> calls of the burst, then sleep on the high-resolution timer:
+// 60 us, doubled at each further call, up to <max_us> (default 200). The core goes to the
+// emulator's threads instead of a SwitchToThread loop; the price is a later wake-up when work
+// arrives. Every 10 s: "Kyty attente active invitee 10 s : ...". The main thread never sleeps.
+namespace {
+struct GuestYieldBackoffConfig {
+	uint32_t after  = 0; // 0: off
+	uint32_t max_us = 200;
+};
+
+const GuestYieldBackoffConfig& GuestYieldBackoff() {
+	static const GuestYieldBackoffConfig config = [] {
+		GuestYieldBackoffConfig c;
+		const char*             value = std::getenv("KYTY_GUEST_YIELD_BACKOFF");
+		if (value != nullptr && *value != 0) {
+			char* end = nullptr;
+			c.after   = static_cast<uint32_t>(std::strtoul(value, &end, 10));
+			if (end != nullptr && *end == ',') {
+				c.max_us = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10));
+			}
+			c.max_us = std::clamp<uint32_t>(c.max_us, 60u, 5000u);
+		}
+		if (c.after != 0) {
+			std::printf("Kyty attente active invitee : sommeil apres %u yields en rafale, jusqu'a %u us "
+			            "(KYTY_GUEST_YIELD_BACKOFF, hors fil principal)\n",
+			            c.after, c.max_us);
+			std::fflush(stdout);
+		}
+		return c;
+	}();
+	return config;
+}
+
+constexpr uint64_t GuestYieldBurstGapNs = 100'000;
+
+std::atomic<uint64_t> g_backoff_yields {0};   // yields made (bursts included)
+std::atomic<uint64_t> g_backoff_sleeps {0};   // sleeps instead of a yield
+std::atomic<uint64_t> g_backoff_sleep_ns {0}; // time slept
+std::atomic<uint64_t> g_backoff_report_ns {0};
+
+uint64_t BackoffNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void GuestYieldBackoffReport(uint64_t now) {
+	auto last = g_backoff_report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_backoff_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ull ||
+	    !g_backoff_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const double seconds  = static_cast<double>(now - last) / 1e9;
+	const auto   yields   = g_backoff_yields.exchange(0, std::memory_order_relaxed);
+	const auto   sleeps   = g_backoff_sleeps.exchange(0, std::memory_order_relaxed);
+	const auto   slept_ns = g_backoff_sleep_ns.exchange(0, std::memory_order_relaxed);
+	std::printf("Kyty attente active invitee 10 s : %.0f yields/s, %.0f sommeils/s (moyenne %.0f us), "
+	            "%.0f ms/s dormis (tous fils hors principal)\n",
+	            static_cast<double>(yields) / seconds, static_cast<double>(sleeps) / seconds,
+	            sleeps != 0 ? static_cast<double>(slept_ns) / 1e3 / static_cast<double>(sleeps) : 0.0,
+	            static_cast<double>(slept_ns) / 1e6 / seconds);
+	std::fflush(stdout);
+}
+
+// True when it handled the yield (the backoff is on and this is not the main thread).
+bool GuestYieldBackoffOnce() {
+	const auto& config = GuestYieldBackoff();
+	if (config.after == 0 || ::Libs::Graphics::FramePath::OnMainThread()) {
+		return false;
+	}
+	static thread_local uint32_t burst    = 0;
+	static thread_local uint64_t last_end = 0;
+	const auto                   now      = BackoffNowNs();
+	if (last_end == 0 || now < last_end || now - last_end > GuestYieldBurstGapNs) {
+		burst = 0;
+	}
+	if (burst < UINT32_MAX) {
+		burst++;
+	}
+	if (burst <= config.after) {
+		g_backoff_yields.fetch_add(1, std::memory_order_relaxed);
+		SchedulerBackoffOnce();
+	} else {
+		const uint32_t step = std::min<uint32_t>(burst - config.after - 1u, 7u);
+		const uint32_t us   = std::min<uint32_t>(config.max_us, 60u << step);
+		Common::Thread::SleepMicro(us);
+		g_backoff_sleeps.fetch_add(1, std::memory_order_relaxed);
+		g_backoff_sleep_ns.fetch_add(BackoffNowNs() - now, std::memory_order_relaxed);
+	}
+	last_end = BackoffNowNs();
+	GuestYieldBackoffReport(last_end);
+	return true;
+}
+} // namespace
+
 void KYTY_SYSV_ABI PthreadYield() {
 	// Placement samples of spinning guest threads (the fence poller), every 4096th yield.
 	static thread_local uint32_t placement_yields = 0;
 	if ((++placement_yields & 4095u) == 0u) {
 		Common::SamplePlacement(Common::ThreadRole::Guest);
 	}
-	if (::Libs::Graphics::FramePath::Enabled() && ::Libs::Graphics::FramePath::OnMainThread()) {
-		// Astro Bot PC (KYTY_FRAME_PATH): the main thread's yields and the spins between them.
-		const auto begin = ::Libs::Graphics::FramePath::NowNs();
-		SchedulerBackoffOnce();
-		::Libs::Graphics::FramePath::NoteMainYield(begin, ::Libs::Graphics::FramePath::NowNs());
+	if (::Libs::Graphics::FramePath::Enabled()) {
+		// Astro Bot PC (KYTY_FRAME_PATH): the main thread's yields and the spins between them, and
+		// the GPU-label poll of eboot 0x114b2f0 on any thread.
+		const auto ra   = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+		const bool main = ::Libs::Graphics::FramePath::OnMainThread();
+		const bool poll = ::Libs::Graphics::FramePath::IsLabelPoll(ra);
+		if (main || poll) {
+			const auto begin = ::Libs::Graphics::FramePath::NowNs();
+			SchedulerBackoffOnce();
+			const auto end = ::Libs::Graphics::FramePath::NowNs();
+			if (main) {
+				::Libs::Graphics::FramePath::NoteMainYield(begin, end);
+			}
+			if (poll) {
+				::Libs::Graphics::FramePath::NoteLabelPoll(begin, end);
+			}
+			return;
+		}
+	}
+	if (GuestYieldBackoffOnce()) {
 		return;
 	}
 	SchedulerBackoffOnce();
@@ -4148,6 +4266,15 @@ int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 	// signal check a system call return makes (SleepMicroWithSignalPoll).
 	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
 	    ::Libs::Graphics::FramePath::Wait::Sleep); // Astro Bot PC (KYTY_FRAME_PATH)
+	if (::Libs::Graphics::FramePath::Enabled() &&
+	    ::Libs::Graphics::FramePath::IsLabelPoll(
+	        reinterpret_cast<uint64_t>(__builtin_return_address(0)))) {
+		// Astro Bot PC (KYTY_FRAME_PATH): the GPU-label poll of eboot 0x114b2f0.
+		const auto begin = ::Libs::Graphics::FramePath::NowNs();
+		SleepMicroWithSignalPoll(microseconds);
+		::Libs::Graphics::FramePath::NoteLabelPoll(begin, ::Libs::Graphics::FramePath::NowNs());
+		return OK;
+	}
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
