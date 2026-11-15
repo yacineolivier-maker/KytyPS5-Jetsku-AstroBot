@@ -10,9 +10,11 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -201,6 +203,19 @@ public:
 	// rings of the replay or of the recording side).
 	bool               EnableLanes2b();
 	[[nodiscard]] bool Lanes2b() const noexcept { return m_lanes_2b; }
+	// Astro Bot PC (KYTY_CP_PAR=2b): tick ranges (MasterSemaphore::EnableRanges) are on with 2b.
+	// Every lane segment (BeginContextSegment) reserves the next range, in list order: its order.
+	// Its hand-off submit takes the range's last tick; its Switch packet carries the order, and the
+	// replay hands no buffer of a later order to the queue before that Switch (CommandRecorder::
+	// EnableRangeOrder). Producer side, the "turn" is the order of the oldest segment not ended:
+	//  - a submit of a younger segment that is not its hand-off waits for its turn (counted);
+	//  - an operation deferred by a younger segment's thread (DeferOperation,
+	//    DeferPriorityOperation) is held with that segment and queued when it becomes the oldest,
+	//    so both queues stay in tick order (counted).
+	// Executed in turn (P2 steps 1-2), the lanes are always the oldest: nothing waits, nothing is
+	// held.
+	// The thread's lane for the tick ranges (MasterSemaphore::SetThreadTickLane).
+	static void SetThreadTickLane(uint32_t lane) noexcept { MasterSemaphore::SetThreadTickLane(lane); }
 	[[nodiscard]] bool Lanes() const noexcept { return m_lanes; }
 	[[nodiscard]] uint32_t LaneCount() const noexcept { return m_lane_count; }
 	// The calling thread's context (0 unless it records into stream 1).
@@ -286,6 +301,34 @@ private:
 	std::unique_ptr<CommandPool> m_command_pool_b;
 	bool                         m_lanes = false;
 	bool                         m_lanes_2b = false; // Astro Bot PC (KYTY_CP_PAR=2b)
+	// Astro Bot PC (KYTY_CP_PAR=2b, tick ranges, above; m_operation_mutex): each lane's open
+	// segment order (UINT64_MAX: none), the turn, segments ended before their turn, the operations
+	// held per segment order, the turn's waiters; the last tick submitted (the hand-off submit in
+	// progress is a thread-local flag of commandScheduler.cpp).
+	struct HeldOperations {
+		std::vector<PendingOperation> normal;
+		std::vector<PendingOperation> priority;
+	};
+	std::array<uint64_t, MaxLanes>           m_lane_order {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+	uint64_t                                 m_turn = 0;
+	std::set<uint64_t>                       m_ended_early;
+	std::map<uint64_t, HeldOperations>       m_held;
+	std::condition_variable                  m_turn_changed;
+
+	std::atomic<uint64_t>                    m_last_submit_tick {0};
+	// m_operation_mutex held: segment `order` ended (the turn moves on; held operations of the new
+	// oldest segment are queued).
+	void EndOrderLocked(uint64_t order);
+	void AdvanceTurnLocked();
+	// m_operation_mutex held: the calling thread's segment order if its operations must be held
+	// (a younger segment), else UINT64_MAX.
+	[[nodiscard]] uint64_t HoldOrderLocked() const noexcept;
+	// The calling thread's lane: a submit that is not its hand-off waits for its turn.
+	void WaitLaneTurn(uint32_t lane);
+	// Everything submitted so far (2b: the last submitted tick; otherwise CurrentTick() - 1).
+	[[nodiscard]] uint64_t LastSubmittedTick() const noexcept {
+		return m_lanes_2b ? m_last_submit_tick.load(std::memory_order_acquire) : CurrentTick() - 1;
+	}
 	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): lanes 2.. (index = lane): wrappers, dynamic states
 	// and command pools (null below index 2 and unless EnableLanes(3+)); the lanes in use.
 	std::array<std::unique_ptr<CommandBuffer>, MaxLanes> m_command_x;

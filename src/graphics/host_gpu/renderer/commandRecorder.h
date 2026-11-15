@@ -87,6 +87,13 @@ public:
 	// replay); start-up only, before any packet of the streams. Returns whether it is on.
 	bool               EnableLaneReplay();
 	[[nodiscard]] bool LaneReplay() const noexcept { return m_lane_replay; }
+	// Astro Bot PC (KYTY_CP_PAR=2b, tick ranges: MasterSemaphore::EnableRanges): after
+	// EnableLaneReplay, start-up only. A Submit packet of a segment of order k (its lane_order) is
+	// handed to the queue only once every segment of a lower order has ended (its Switch packet
+	// replayed, carrying its order: EndStreamSegment(target, order)); a Switch waits for its own
+	// turn and ends it. Replaces the "previous tick" gate (ticks have gaps).
+	void EnableRangeOrder();
+	void EndStreamSegment(uint32_t target, uint64_t order);
 	static void                   SetThreadStream(uint32_t stream) noexcept;
 	[[nodiscard]] static uint32_t ThreadStream() noexcept;
 	// The calling thread's stream: ends its segment (the replay continues in the other ring).
@@ -114,6 +121,7 @@ public:
 		ProducerEncoder().DeferBegin(command, tick, record_ns);
 	}
 	[[nodiscard]] bool BeginPending() noexcept { return ProducerEncoder().BeginPending(); }
+	void               FlushPendingBegin() { ProducerEncoder().FlushPendingBegin(); }
 	void               CancelPendingBegin() noexcept { ProducerEncoder().CancelPendingBegin(); }
 	// Hands the current command buffer to the recorder for vkEndCommandBuffer and submission.
 	void Submit(const CommandStream::SubmitPacket& submit);
@@ -223,9 +231,16 @@ private:
 	struct LaneReplayer;
 	void RunLane(LaneReplayer& lane, std::stop_token stop);
 	void ConsumeLane(LaneReplayer& lane);
-	void WaitSubmitTurn(uint64_t tick, uint32_t stream);
+	void WaitSubmitTurn(const CommandStream::SubmitPacket& packet, uint32_t stream);
 	std::array<std::unique_ptr<LaneReplayer>, MaxStreams> m_lane_replayers;
 	bool                                                  m_lane_replay = false;
+	// Astro Bot PC (KYTY_CP_PAR=2b, tick ranges): the range order gate (EnableRangeOrder). m_turn:
+	// the order of the oldest segment whose Switch was not replayed yet.
+	bool                  m_range_order = false;
+	std::atomic<uint64_t> m_turn {0};
+	void                  WaitTurn(uint64_t order, uint32_t stream);
+	// A replayed Switch packet of stream `stream` (lane replay): its order ends.
+	void EndOrder(const CommandStream::Header& header, uint32_t stream);
 
 	// Verify-hook registry slot (MaxRecorders when not registered).
 	size_t m_registry_slot = SIZE_MAX;

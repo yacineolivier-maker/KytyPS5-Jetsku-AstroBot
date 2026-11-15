@@ -31,6 +31,64 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics, bool track_dispatch)
 	    reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)));
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2b, masterSemaphore.h): tick ranges.
+void MasterSemaphore::EnableRanges() {
+	if (Ranges()) {
+		return;
+	}
+	m_range_base = m_current_tick.load(std::memory_order_acquire);
+	(void)BeginRange(0);
+	m_oldest_lane.store(0, std::memory_order_relaxed);
+	m_ranges.store(true, std::memory_order_release);
+}
+
+uint64_t MasterSemaphore::BeginRange(uint32_t lane) {
+	EXIT_IF(lane >= MaxRangeLanes);
+	// The order and the range are taken together by the lane holding the turn to begin (in list
+	// order: one segment begins at a time, under the scheduler's operation lock).
+	const auto order = m_next_order.fetch_add(1, std::memory_order_acq_rel);
+	const auto base  = m_current_tick.fetch_add(RangeTicks, std::memory_order_acq_rel);
+	m_lane_end[lane] = base + RangeTicks - 1u;
+	m_lane_tick[lane].store(base, std::memory_order_release);
+	return order;
+}
+
+bool MasterSemaphore::TryReleaseRange(uint32_t lane) {
+	EXIT_IF(lane >= MaxRangeLanes);
+	const auto end  = m_lane_end[lane];
+	const auto base = end + 1u - RangeTicks;
+	if (m_lane_tick[lane].load(std::memory_order_relaxed) != base) {
+		return false; // the segment submitted: its range end must be signalled
+	}
+	auto expected = end + 1u;
+	if (!m_current_tick.compare_exchange_strong(expected, base, std::memory_order_acq_rel)) {
+		return false; // a later range was reserved
+	}
+	m_lane_tick[lane].store(end + 1u, std::memory_order_release); // closed
+	return true;
+}
+
+uint64_t MasterSemaphore::NextLaneTick(uint32_t lane, bool range_end) {
+	EXIT_IF(lane >= MaxRangeLanes);
+	const auto tick = m_lane_tick[lane].load(std::memory_order_relaxed);
+	const auto end  = m_lane_end[lane];
+	if (tick > end) {
+		EXIT("Kyty CpPar 2b: lane %u submits outside its tick range (tick %" PRIu64 ", range end %" PRIu64
+		     ")\n",
+		     lane, tick, end);
+	}
+	if (range_end) {
+		m_lane_tick[lane].store(end + 1u, std::memory_order_release);
+		return end;
+	}
+	if (tick == end) {
+		EXIT("Kyty CpPar 2b: lane %u used up its tick range (%" PRIu64 " submits in one segment)\n", lane,
+		     RangeTicks - 1u);
+	}
+	m_lane_tick[lane].store(tick + 1u, std::memory_order_release);
+	return tick;
+}
+
 MasterSemaphore::~MasterSemaphore() {
 	if (m_semaphore != nullptr) {
 		m_graphics.device.destroySemaphore(m_semaphore, nullptr);

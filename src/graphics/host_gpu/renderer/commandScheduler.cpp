@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/watchdogSubmit.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +36,9 @@
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+// Astro Bot PC (KYTY_CP_PAR=2b, tick ranges): the calling lane thread's Submit is its segment's
+// hand-off (EndContextSegment): it takes the range's last tick and never waits for its turn.
+static thread_local bool t_lane_end_submit = false;
 // Astro Bot PC (KYTY_CP_PAR=1b5, commandScheduler.h): the calling thread's interrupt capture.
 static thread_local CommandScheduler::PriorityCapture t_priority_capture = nullptr;
 
@@ -194,7 +198,7 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit({}, true);
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.Wait(LastSubmittedTick()); // Astro Bot PC (KYTY_CP_PAR=2b: tick ranges have gaps)
 	if (m_recorder != nullptr) {
 		// Every tick was recorded and handed to the queue: stop the recorder thread before the
 		// timing ring (its single producer until now) and the pool are used from here.
@@ -287,7 +291,7 @@ void CommandScheduler::Finish() {
 	if (!(m_lanes ? Cmd() : m_command).IsInvalid()) { // Astro Bot PC (KYTY_CP_PAR=2a)
 		Submit({}, true);
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.Wait(LastSubmittedTick()); // Astro Bot PC (KYTY_CP_PAR=2b: tick ranges have gaps)
 	BeginNext();
 	PopPendingOperations();
 }
@@ -410,6 +414,14 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 		if (Profiler::AggregateEnabled()) {
 			m_diagnostic_generic_completion = true;
 		}
+		if (m_lanes_2b) {
+			// Astro Bot PC (KYTY_CP_PAR=2b): a younger segment's operation waits for its turn.
+			if (const auto order = HoldOrderLocked(); order != UINT64_MAX) {
+				m_held[order].normal.push_back({std::move(operation), CurrentTick()});
+				CpPar::NoteLaneStat(MasterSemaphore::ThreadTickLane(), CpPar::LaneStat::HeldOperations, 1);
+				return;
+			}
+		}
 		m_pending_operations.push({std::move(operation), CurrentTick()});
 		return;
 	}
@@ -448,6 +460,14 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 				m_diagnostic_eop_completion = true;
 			} else {
 				m_diagnostic_generic_completion = true;
+			}
+		}
+		if (m_lanes_2b) {
+			// Astro Bot PC (KYTY_CP_PAR=2b): a younger segment's operation waits for its turn.
+			if (const auto order = HoldOrderLocked(); order != UINT64_MAX) {
+				m_held[order].priority.push_back({std::move(operation), CurrentTick()});
+				CpPar::NoteLaneStat(MasterSemaphore::ThreadTickLane(), CpPar::LaneStat::HeldOperations, 1);
+				return;
 			}
 		}
 		const bool was_empty = m_priority_operations.empty();
@@ -731,8 +751,81 @@ bool CommandScheduler::EnableLanes2b() {
 	    m_eop_timestamps != nullptr || !m_recorder->EnableLaneReplay()) {
 		return false;
 	}
+	// Tick ranges (commandScheduler.h): lane 0's current recording is the segment of order 0.
+	m_master.EnableRanges();
+	m_recorder->EnableRangeOrder();
+	{
+		std::lock_guard lock(m_operation_mutex);
+		m_lane_order.fill(UINT64_MAX);
+		m_lane_order[0] = 0;
+		m_turn          = 0;
+	}
 	m_lanes_2b = true;
 	return true;
+}
+
+// Astro Bot PC (KYTY_CP_PAR=2b, commandScheduler.h): the producer-side turn.
+uint64_t CommandScheduler::HoldOrderLocked() const noexcept {
+	const auto lane = MasterSemaphore::ThreadTickLane();
+	if (lane >= MaxLanes) {
+		return UINT64_MAX; // not a lane thread: queued (its tick is the oldest segment's)
+	}
+	const auto order = m_lane_order[lane];
+	return order != UINT64_MAX && order != m_turn ? order : UINT64_MAX;
+}
+
+void CommandScheduler::AdvanceTurnLocked() {
+	m_turn++;
+	const auto held = m_held.find(m_turn);
+	if (held == m_held.end()) {
+		return;
+	}
+	// The new oldest segment's held operations: their ticks are above every queued one (older
+	// segments' ranges), so both queues stay in tick order.
+	const bool was_empty = m_priority_operations.empty();
+	for (auto& operation: held->second.normal) {
+		m_pending_operations.push(std::move(operation));
+	}
+	for (auto& operation: held->second.priority) {
+		m_priority_operations.push(std::move(operation));
+	}
+	const bool priority = !held->second.priority.empty();
+	m_held.erase(held);
+	if (priority && (was_empty || !PriorityWakeupsBatched())) {
+		m_priority_available.notify_one();
+	}
+}
+
+void CommandScheduler::EndOrderLocked(uint64_t order) {
+	if (order == m_turn) {
+		AdvanceTurnLocked();
+		while (m_ended_early.erase(m_turn) != 0) {
+			AdvanceTurnLocked();
+		}
+	} else {
+		EXIT_IF(order < m_turn || !m_ended_early.insert(order).second);
+	}
+	uint32_t oldest = UINT32_MAX;
+	for (uint32_t lane = 0; lane < m_lane_count && lane < MaxLanes; lane++) {
+		if (m_lane_order[lane] == m_turn) {
+			oldest = lane;
+		}
+	}
+	m_master.SetOldestLane(oldest);
+	m_turn_changed.notify_all();
+}
+
+void CommandScheduler::WaitLaneTurn(uint32_t lane) {
+	std::unique_lock lock(m_operation_mutex);
+	if (lane >= MaxLanes || m_lane_order[lane] == UINT64_MAX || m_lane_order[lane] == m_turn) {
+		return;
+	}
+	const auto          start = CpPar::NowNs();
+	HangWatchdog::Scope wait("cp-par-2b-submit-turn", reinterpret_cast<uint64_t>(this), lane,
+	                         m_lane_order[lane], m_turn);
+	m_turn_changed.wait(lock, [this, lane] { return m_lane_order[lane] == m_turn; });
+	CpPar::NoteLaneStat(lane, CpPar::LaneStat::SubmitTurnWaits, 1);
+	CpPar::NoteLaneStat(lane, CpPar::LaneStat::SubmitTurnNs, CpPar::NowNs() - start);
 }
 
 CommandBuffer& CommandScheduler::BeginLaneCommand() {
@@ -766,6 +859,16 @@ void CommandScheduler::BeginContextSegment() {
 		EXIT_IF(!command.IsInvalid() || command.m_rendering || command.m_direct_window ||
 		        !command.m_pending.Empty());
 		m_segment_submits[context] = m_submits[context];
+		if (m_lanes_2b) {
+			// Astro Bot PC (KYTY_CP_PAR=2b): the segment's tick range, in list order.
+			std::lock_guard lock(m_operation_mutex);
+			const auto      order = m_master.BeginRange(context);
+			EXIT_IF(m_lane_order[context] != UINT64_MAX || order < m_turn);
+			m_lane_order[context] = order;
+			if (order == m_turn) {
+				m_master.SetOldestLane(context);
+			}
+		}
 		BeginLaneCommand();
 		m_segment_packets[context] = m_recorder->StreamPackets(context);
 		return;
@@ -812,7 +915,14 @@ CommandScheduler::SegmentCounts CommandScheduler::EndContextSegment() {
 			}
 			command.EndRendering();
 			command.FlushBarriers();
-			if (m_recorder->BeginPending()) {
+			// Astro Bot PC (KYTY_CP_PAR=2b): a segment skips its hand-off only if it can give its tick
+			// range back (MasterSemaphore::TryReleaseRange); otherwise it submits, empty.
+			bool skip = m_recorder->BeginPending();
+			if (skip && m_lanes_2b) {
+				std::lock_guard lock(m_operation_mutex);
+				skip = m_master.TryReleaseRange(context);
+			}
+			if (skip) {
 				EXIT_IF(command.m_rendering || !command.m_pending.Empty());
 				command.CloseDirectWindow();
 				m_recorder->CancelPendingBegin();
@@ -820,9 +930,14 @@ CommandScheduler::SegmentCounts CommandScheduler::EndContextSegment() {
 				command.m_buffer    = nullptr;
 				counts.lane_skipped = true;
 			} else {
+				// Astro Bot PC (KYTY_CP_PAR=2b): a Begin still pending is encoded (empty hand-off).
+				m_recorder->FlushPendingBegin();
 				// Empty: only the Begin packet (or a drain marker) was encoded since the segment began.
 				const bool empty = m_recorder->StreamPackets(context) - m_segment_packets[context] <= 1;
+				// Astro Bot PC (KYTY_CP_PAR=2b): the hand-off submit takes the range's last tick.
+				t_lane_end_submit = m_lanes_2b;
 				Submit({}, false);
+				t_lane_end_submit = false;
 				counts.lane_submitted     = true;
 				counts.lane_empty         = empty;
 				counts.new_command_buffer = true;
@@ -831,7 +946,19 @@ CommandScheduler::SegmentCounts CommandScheduler::EndContextSegment() {
 			command.CloseDirectWindow();
 		}
 		// The Switch names the lane taking the token (N lanes: the replay cannot guess it).
-		m_recorder->EndStreamSegment(CpPar::HandoffTarget());
+		if (m_lanes_2b) {
+			// Astro Bot PC (KYTY_CP_PAR=2b): the Switch ends the segment's order for the replay; the
+			// producer-side turn moves on. (Only this thread writes its lane's entry: read unlocked;
+			// the Switch is encoded outside the lock, its ring may be full.)
+			const auto order = m_lane_order[context];
+			EXIT_IF(order == UINT64_MAX);
+			m_recorder->EndStreamSegment(CpPar::HandoffTarget(), order);
+			std::lock_guard lock(m_operation_mutex);
+			m_lane_order[context] = UINT64_MAX;
+			EndOrderLocked(order);
+		} else {
+			m_recorder->EndStreamSegment(CpPar::HandoffTarget());
+		}
 		counts.packets          = m_recorder->StreamPackets(context) - m_segment_packets[context];
 		counts.submits          = m_submits[context] - m_segment_submits[context];
 		m_segment_tick[context] = CurrentTick();
@@ -996,10 +1123,20 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		packet.debug_arg2   = command.m_debug_arg2;
 		packet.debug_arg3   = command.m_debug_arg3;
 		packet.debug_arg4   = command.m_debug_arg4;
+		if (m_lanes_2b && !t_lane_end_submit) {
+			// Astro Bot PC (KYTY_CP_PAR=2b): a younger segment submits only once it is the oldest.
+			WaitLaneTurn(LaneIndex());
+		}
 		{
 			std::lock_guard lock(m_operation_mutex);
 			count_boundary();
-			packet.tick = m_master.NextTick();
+			// Astro Bot PC (KYTY_CP_PAR=2b): the calling lane's tick range.
+			packet.tick = m_lanes_2b ? m_master.NextLaneTick(LaneIndex(), t_lane_end_submit)
+			                         : m_master.NextTick();
+			if (m_lanes_2b) {
+				packet.lane_order = m_lane_order[LaneIndex()]; // the replay's order gate
+			}
+			m_last_submit_tick.store(packet.tick, std::memory_order_release);
 			packet.submit.AddSignal(m_master.Handle(), packet.tick);
 			packet.preserve_completion =
 			    (force_completion || m_preserve_current_completion) ? 1u : 0u;

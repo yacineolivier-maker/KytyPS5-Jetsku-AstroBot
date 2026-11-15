@@ -162,6 +162,9 @@ struct SubmitPacket {
 	// Verify: the producer's digest and packet count of this command buffer since its Begin.
 	uint64_t cb_digest  = 0;
 	uint64_t cb_packets = 0;
+	// Astro Bot PC (KYTY_CP_PAR=2b, tick ranges): the order of the lane segment that submits it
+	// (UINT64_MAX: none, no order gate).
+	uint64_t lane_order = UINT64_MAX;
 };
 struct BeginRenderingPacket {
 	vk::Rect2D         area {};

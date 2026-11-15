@@ -305,7 +305,7 @@ struct CommandRecorder::NativeExecutor {
 		EXIT_IF(command == nullptr);
 		if (owner.m_lane_replay) {
 			// Astro Bot PC (KYTY_CP_PAR=2b): every earlier tick reaches the queue first.
-			owner.WaitSubmitTurn(p.tick, stream);
+			owner.WaitSubmitTurn(p, stream);
 		}
 		uint64_t* dispatch_ns = nullptr;
 		if (owner.m_timing != nullptr) {
@@ -736,7 +736,15 @@ bool CommandRecorder::EnableLaneReplay() {
 	return true;
 }
 
-void CommandRecorder::WaitSubmitTurn(uint64_t tick, uint32_t stream) {
+void CommandRecorder::WaitSubmitTurn(const CommandStream::SubmitPacket& packet, uint32_t stream) {
+	if (m_range_order) {
+		// Tick ranges: every segment of a lower order ended first.
+		if (packet.lane_order != UINT64_MAX) {
+			WaitTurn(packet.lane_order, stream);
+		}
+		return;
+	}
+	const auto tick = packet.tick;
 	// Ticks are allocated in list order and every one has a Submit packet in some ring: the
 	// previous tick reaches the queue first.
 	if (tick <= 1 || m_recorded_tick.load(std::memory_order_acquire) + 1u >= tick) {
@@ -771,6 +779,58 @@ void CommandRecorder::WaitSubmitTurn(uint64_t tick, uint32_t stream) {
 	CpPar::NoteLaneStat(stream, CpPar::LaneStat::ReplayTurnNs, NowNs() - start);
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2b, commandRecorder.h): the range order gate.
+void CommandRecorder::EnableRangeOrder() {
+	EXIT_IF(!m_lane_replay);
+	m_range_order = true;
+}
+
+void CommandRecorder::WaitTurn(uint64_t order, uint32_t stream) {
+	if (m_turn.load(std::memory_order_acquire) >= order) {
+		return;
+	}
+	const auto          start = NowNs();
+	HangWatchdog::Scope wait("recorder-lane-order", reinterpret_cast<uint64_t>(this), order, stream);
+	bool                ready = false;
+	while (NowNs() - start < m_idle_policy.spin_ns) {
+		if (m_turn.load(std::memory_order_acquire) >= order) {
+			ready = true;
+			break;
+		}
+		for (uint32_t i = 0; i < 64; i++) {
+#if defined(_M_X64) || defined(__x86_64__)
+			_mm_pause();
+#endif
+		}
+	}
+	if (!ready) {
+		for (;;) {
+			const auto value = m_turn.load(std::memory_order_seq_cst);
+			if (value >= order || m_stop.load(std::memory_order_acquire)) {
+				break;
+			}
+			m_turn.wait(value, std::memory_order_acquire);
+		}
+	}
+	CpPar::NoteLaneStat(stream, CpPar::LaneStat::ReplayTurnWaits, 1);
+	CpPar::NoteLaneStat(stream, CpPar::LaneStat::ReplayTurnNs, NowNs() - start);
+}
+
+void CommandRecorder::EndOrder(const CommandStream::Header& header, uint32_t stream) {
+	if (!m_range_order) {
+		return;
+	}
+	const CommandStream::SiteBlock*   site   = nullptr;
+	const CommandStream::VerifyBlock* verify = nullptr;
+	CommandStream::Reader reader(&header, CommandStream::Detail::PayloadOffset(header, &site, &verify));
+	const auto order = reader.Get<CommandStream::DrainMarkerPacket>().serial &
+	                   ((uint64_t {1} << 56u) - 1u);
+	WaitTurn(order, stream);
+	EXIT_IF(m_turn.load(std::memory_order_acquire) != order);
+	m_turn.store(order + 1u, std::memory_order_seq_cst);
+	m_turn.notify_all();
+}
+
 void CommandRecorder::RunLane(LaneReplayer& lane, std::stop_token stop) {
 	switch (lane.stream) {
 		case 1: KYTY_PROFILER_THREAD("CP recorder B"); break;
@@ -795,8 +855,11 @@ void CommandRecorder::ConsumeLane(LaneReplayer& lane) {
 	uint64_t           since        = 0;
 	auto&              ring         = *lane.ring;
 	while (const auto* header = ring.Peek()) {
-		// The Switch packets only ordered the single replay of 2a: skipped.
-		if (header->op != Op::Wrap && header->op != Op::Switch) {
+		// The Switch packets only ordered the single replay of 2a: skipped (with tick ranges, they
+		// end their segment's order).
+		if (header->op == Op::Switch) {
+			EndOrder(*header, lane.stream);
+		} else if (header->op != Op::Wrap) {
 			CommandStream::Replay(*header, *lane.exec, lane.replay, &OnMismatch, this);
 		}
 		ring.Advance(header->size);
@@ -818,6 +881,13 @@ constexpr uint32_t SwitchTargetShift = 56;
 void CommandRecorder::EndStreamSegment() {
 	EXIT_IF(m_stream_count < 2);
 	ProducerEncoder().SwitchStream(++m_switch_serial);
+}
+
+// Astro Bot PC (KYTY_CP_PAR=2b, commandRecorder.h): the order in the serial's low bits.
+void CommandRecorder::EndStreamSegment(uint32_t target, uint64_t order) {
+	EXIT_IF(m_stream_count < 2 || target >= m_stream_count || !m_range_order ||
+	        order >= (uint64_t {1} << SwitchTargetShift));
+	ProducerEncoder().SwitchStream(order | (uint64_t {target + 1u} << SwitchTargetShift));
 }
 
 void CommandRecorder::EndStreamSegment(uint32_t target) {
@@ -1036,6 +1106,7 @@ void CommandRecorder::ConsumeAvailable() {
 		auto& ring = *m_consume_ring;
 		if (header->op == Op::Switch && m_stream_count > 1 && m_lane_replay) {
 			// Astro Bot PC (KYTY_CP_PAR=2b): stream 0 only; the other rings have their own replay.
+			EndOrder(*header, 0);
 			ring.Advance(header->size);
 			since += header->size;
 			continue;

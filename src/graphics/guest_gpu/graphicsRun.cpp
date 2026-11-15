@@ -832,6 +832,9 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					// a new native buffer of its own pool; GetRenderExecutor is then the lane's).
 					const uint32_t stream = CpPar::ThreadLane(); // Astro Bot PC (2a: N lanes)
 					CommandRecorder::SetThreadStream(stream);
+					if (CpPar::Lanes2b()) {
+						CommandScheduler::SetThreadTickLane(stream); // Astro Bot PC (2b: tick ranges)
+					}
 					gpu->m_renderer.GetCommandScheduler().BeginContextSegment();
 					gpu->m_renderer.GetRenderExecutor().CpParForgetCommandShadows();
 					CpPar::BeginSegment(stream);
@@ -2244,6 +2247,10 @@ void GuestGpu::ThreadRun(void* data) {
 	(void)CpCommit::Parts();
 	// KYTY_RENDER_LOCK_ASYMMETRIC (RenderMutex): this thread is the renderer lock's owner.
 	gpu->m_renderer.GetMutex().BecomeOwner();
+	if (CpPar::Lanes2b()) {
+		// Astro Bot PC (KYTY_CP_PAR=2b): lane A's tick range (MasterSemaphore::EnableRanges).
+		CommandScheduler::SetThreadTickLane(0);
+	}
 	if (CpPar::Concurrent()) {
 		// Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): this thread holds the CP op lock except at
 		// its interleave points and while it waits for the run-ahead.

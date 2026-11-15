@@ -240,6 +240,16 @@
 //    native executor's Submit). Needs no KYTY_GPU_TIMING, GPU op profiler or KYTY_EOP_TIMESTAMPS=gpu
 //    (otherwise 2b runs as 2a). A "CpPar 10s: 2b" line reports each lane's replay (busy time, waits
 //    for its turn).
+//  - tick ranges (step 2, MasterSemaphore::EnableRanges, CommandScheduler): each lane segment
+//    reserves, in list order, a range of ticks (its "order"); its submits take the range's ticks
+//    in turn and its hand-off submit the range's last one, so the tick a lane records for is known
+//    while it records, even with older lanes still recording (no provisional tick to translate:
+//    everything deferred to CurrentTick() completes with the buffer holding the recording or a
+//    later one). The replay hands a buffer to the queue only once every lower order has ended (the
+//    Switch packet now carries the segment's order). Producer side, a younger segment's submit
+//    that is not its hand-off waits for its turn, and the operations it defers are held until its
+//    turn (queues stay in tick order). Executed in turn, nothing waits and nothing is held (the
+//    2b line counts both).
 
 #include <cstdint>
 
@@ -493,6 +503,9 @@ enum class LaneStat : uint32_t {
 	ReplayBusyNs,    // the lane's replay thread replaying its ring
 	ReplayTurnWaits, // the lane's replay thread waited for its turn to hand a buffer to the queue
 	ReplayTurnNs,
+	SubmitTurnWaits, // tick ranges: a younger segment's submit (not its hand-off) waited for its turn
+	SubmitTurnNs,
+	HeldOperations,  // tick ranges: operations deferred by a younger segment, held until its turn
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

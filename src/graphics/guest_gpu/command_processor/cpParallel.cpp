@@ -1327,9 +1327,12 @@ void MaybeReport() {
 			const auto n = [&v](LaneStat stat) { return v[static_cast<size_t>(stat)]; };
 			char item[512];
 			std::snprintf(item, sizeof(item),
-			              "%s%c: replay %.1f ms busy, turn waits %" PRIu64 " (%.1f ms)",
+			              "%s%c: replay %.1f ms busy, turn waits %" PRIu64 " (%.1f ms); submit turn "
+			              "waits %" PRIu64 " (%.1f ms), held operations %" PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
-			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs));
+			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs),
+			              n(LaneStat::SubmitTurnWaits), ms(LaneStat::SubmitTurnNs),
+			              n(LaneStat::HeldOperations));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());
