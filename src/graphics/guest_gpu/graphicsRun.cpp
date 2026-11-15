@@ -825,9 +825,10 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					const auto counts = gpu->m_renderer.GetCommandScheduler().EndContextSegment();
 					CpPar::EndSegment(stream, counts.packets, counts.submits,
 					                  counts.new_command_buffer);
-					if (counts.lane_submitted) {
-						// Astro Bot PC (KYTY_CP_PAR=2a): the lane's buffer went to the queue.
-						CpPar::NoteLaneHandoff(stream, counts.lane_empty);
+					if (counts.lane_submitted || counts.lane_skipped) {
+						// Astro Bot PC (KYTY_CP_PAR=2a): the lane's buffer went to the queue, or back
+						// to its pool (lazy begin: nothing encoded).
+						CpPar::NoteLaneHandoff(stream, counts.lane_empty, counts.lane_skipped);
 					}
 				}
 				gpu->m_renderer.GetMutex().ResignOwner();

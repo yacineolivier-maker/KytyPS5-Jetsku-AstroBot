@@ -58,6 +58,7 @@ struct Stats {
 	// Astro Bot PC (KYTY_CP_PAR=2a): per lane, hand-off submits and the empty ones among them.
 	std::array<std::atomic<uint64_t>, 2> lane_submits {};
 	std::array<std::atomic<uint64_t>, 2> lane_empty {};
+	std::array<std::atomic<uint64_t>, 2> lane_skipped {}; // lazy begin: no submit at the hand-off
 	std::atomic<uint64_t>                fixups_needed_total {0};
 	// KYTY_CP_PAR=1b3: run-ahead starts and ops, promotions by reason, merges and insertions with
 	// their fix-ups, op lock waits per thread, time both threads were busy (overlap).
@@ -977,9 +978,13 @@ void EndSegment(uint32_t context, uint64_t packets, uint64_t submits, bool new_c
 	t_segment    = -1;
 }
 
-void NoteLaneHandoff(uint32_t context, bool empty) {
+void NoteLaneHandoff(uint32_t context, bool empty, bool skipped) {
 	const size_t index = context != 0 ? 1 : 0;
 	auto&        stats = GetStats();
+	if (skipped) {
+		stats.lane_skipped[index].fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	stats.lane_submits[index].fetch_add(1, std::memory_order_relaxed);
 	if (empty) {
 		stats.lane_empty[index].fetch_add(1, std::memory_order_relaxed);
@@ -1208,9 +1213,11 @@ void MaybeReport() {
 		const auto sub_b   = take(stats.lane_submits[1]);
 		const auto empty_a = take(stats.lane_empty[0]);
 		const auto empty_b = take(stats.lane_empty[1]);
-		std::printf("CpPar 10s: 2a lanes: hand-off submits A %" PRIu64 " (empty %" PRIu64 "), B %" PRIu64
-		            " (empty %" PRIu64 ")\n",
-		            sub_a, empty_a, sub_b, empty_b);
+		const auto skip_a  = take(stats.lane_skipped[0]);
+		const auto skip_b  = take(stats.lane_skipped[1]);
+		std::printf("CpPar 10s: 2a lanes: hand-off submits A %" PRIu64 " (empty %" PRIu64
+		            ", skipped %" PRIu64 "), B %" PRIu64 " (empty %" PRIu64 ", skipped %" PRIu64 ")\n",
+		            sub_a, empty_a, skip_a, sub_b, empty_b, skip_b);
 	}
 	std::fflush(stdout);
 }

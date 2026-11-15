@@ -702,6 +702,8 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 		// position (cpParallel.h): an insertion merges it first.
 		CpPar::BeforeRecorderDrain();
 	}
+	// Astro Bot PC (KYTY_CP_PAR=2a, lazy begin): a direct window records into a begun native buffer.
+	ProducerEncoder().FlushPendingBegin();
 	const CpGaps::Scope gap(CpGaps::Cat::RecorderWait);
 	HangWatchdog::Scope wait("recorder-drain", reinterpret_cast<uint64_t>(this),
 	                         HangWatchdog::Enabled() ? m_ring.WritePosition() : 0,

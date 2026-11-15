@@ -174,6 +174,9 @@ public:
 		// own native buffer; nothing had been recorded into it since the segment began.
 		bool     lane_submitted = false;
 		bool     lane_empty     = false;
+		// Astro Bot PC (KYTY_CP_PAR=2a, lazy begin): nothing was encoded into the lane's buffer (its
+		// Begin was still pending): it went back to the pool, nothing was submitted.
+		bool     lane_skipped   = false;
 	};
 	void          BeginContextSegment();
 	SegmentCounts EndContextSegment();
@@ -202,6 +205,9 @@ private:
 		KYTY_CLASS_NO_COPY(CommandPool);
 
 		vk::CommandBuffer Commit();
+		// Astro Bot PC (KYTY_CP_PAR=2a, lazy begin): `buffer`, committed and never begun nor
+		// submitted, is free again.
+		void Return(vk::CommandBuffer buffer);
 		// KYTY_CP_RECORDER: the recorder records from this pool; growing it (the only pool call
 		// the recording thread makes) drains the recorder first.
 		void SetRecorder(CommandRecorder* recorder) noexcept { m_recorder = recorder; }

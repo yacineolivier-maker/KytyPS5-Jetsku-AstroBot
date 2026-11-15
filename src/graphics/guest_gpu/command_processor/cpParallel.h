@@ -432,8 +432,9 @@ void ForgetImage(const void* image);
 void BeginSegment(uint32_t context);
 void EndSegment(uint32_t context, uint64_t packets, uint64_t submits, bool new_command_buffer);
 // Astro Bot PC (KYTY_CP_PAR=2a): a lane's segment ended with its hand-off submit (its own native
-// command buffer handed to the queue, in list order); `empty`: nothing was recorded in it.
-void NoteLaneHandoff(uint32_t context, bool empty);
+// command buffer handed to the queue, in list order); `empty`: nothing was recorded in it;
+// `skipped` (lazy begin): nothing was encoded, the buffer went back to its pool unsubmitted.
+void NoteLaneHandoff(uint32_t context, bool empty, bool skipped);
 
 enum class Fallback : uint32_t {
 	NoSequencer, // KYTY_CP_SEQ is not 1 (or the sequencer is off): no op ring to split

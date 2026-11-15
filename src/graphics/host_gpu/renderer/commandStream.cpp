@@ -818,6 +818,11 @@ void Ring::WakeConsumer() noexcept {
 // Encoder
 
 Encoder::Writer Encoder::Open(Op op, uint64_t payload, bool barrier) {
+	if (m_begin_pending) [[unlikely]] {
+		// Astro Bot PC (KYTY_CP_PAR=2a, lazy begin): the first packet of the buffer.
+		EXIT_IF(op == Op::Switch || op == Op::Begin);
+		EmitPendingBegin();
+	}
 	const bool     site   = m_options.all_sites || (barrier && m_options.barrier_sites);
 	const bool     verify = m_options.verify;
 	const uint64_t bytes  = sizeof(Header) + (site ? sizeof(SiteBlock) : 0u) +
@@ -877,6 +882,19 @@ void Encoder::Begin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns
 	auto w       = Open(Op::Begin, Sz<BeginPacket>(), false);
 	w.Put(BeginPacket {command, tick, record_ns});
 	Close(w, m_options.verify ? VerifyHash::Begin(command, tick) : 0);
+}
+
+// Astro Bot PC (KYTY_CP_PAR=2a, commandStream.h): lazy begin.
+void Encoder::DeferBegin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns) {
+	EXIT_IF(m_begin_pending || m_options.verify);
+	m_pending_begin = BeginPacket {command, tick, record_ns};
+	m_begin_pending = true;
+}
+
+void Encoder::EmitPendingBegin() {
+	EXIT_IF(!m_begin_pending);
+	m_begin_pending = false;
+	Begin(m_pending_begin.command, m_pending_begin.tick, m_pending_begin.record_ns);
 }
 
 void Encoder::Submit(const SubmitPacket& submit) {

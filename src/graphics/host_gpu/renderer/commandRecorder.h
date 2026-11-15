@@ -84,6 +84,14 @@ public:
 	}
 	// Begin of a guest command buffer: the native buffer the CP picked from its pool.
 	void Begin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns);
+	// Astro Bot PC (KYTY_CP_PAR=2a, lazy begin): the calling thread's stream keeps the Begin
+	// packet pending until its next packet (CommandStream::Encoder::DeferBegin); a Drain encodes it
+	// first. BeginPending: nothing was encoded since; CancelPendingBegin drops it.
+	void DeferBegin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns) {
+		ProducerEncoder().DeferBegin(command, tick, record_ns);
+	}
+	[[nodiscard]] bool BeginPending() noexcept { return ProducerEncoder().BeginPending(); }
+	void               CancelPendingBegin() noexcept { ProducerEncoder().CancelPendingBegin(); }
 	// Hands the current command buffer to the recorder for vkEndCommandBuffer and submission.
 	void Submit(const CommandStream::SubmitPacket& submit);
 	// Waits until the recorder has executed every packet encoded so far (a direct window may then

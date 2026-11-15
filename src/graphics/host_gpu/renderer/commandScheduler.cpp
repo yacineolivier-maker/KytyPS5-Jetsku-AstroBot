@@ -123,6 +123,17 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	return m_buffers[*found];
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2a, commandScheduler.h).
+void CommandScheduler::CommandPool::Return(vk::CommandBuffer buffer) {
+	for (size_t index = 0; index < m_buffers.size(); ++index) {
+		if (m_buffers[index] == buffer) {
+			m_ticks[index] = 0;
+			return;
+		}
+	}
+	EXIT("CommandPool::Return: unknown command buffer\n");
+}
+
 bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
@@ -697,7 +708,10 @@ CommandBuffer& CommandScheduler::BeginLaneCommand() {
 	// As BeginCommand with the recorder: the recorder begins the native buffer (in this lane's
 	// ring) and stamps KYTY_GPU_TIMING / GpuOpProfiler with this recording's tick. In turn, no
 	// other lane submits before this buffer does, so the tick is the one Submit allocates.
-	m_recorder->Begin(command.m_buffer, m_master.CurrentTick(), m_gpu_timing ? GpuTiming::NowNs() : 0);
+	// Lazy begin: the Begin packet is encoded only before the buffer's first packet (or a drain);
+	// a segment that encodes nothing gives the buffer back (EndContextSegment).
+	m_recorder->DeferBegin(command.m_buffer, m_master.CurrentTick(),
+	                       m_gpu_timing ? GpuTiming::NowNs() : 0);
 	if (m_eop_timestamps) {
 		m_eop_timestamps->BeginCommand(command.StateSink());
 	}
@@ -746,12 +760,35 @@ CommandScheduler::SegmentCounts CommandScheduler::EndContextSegment() {
 		// in list order (Submit ends rendering, flushes the barrier batch, closes the direct window
 		// and allocates the tick), then the Switch packet ends the ring segment.
 		SegmentCounts counts;
-		const bool    empty = m_recorder->StreamPackets(context) == m_segment_packets[context];
 		if (!command.IsInvalid()) {
-			Submit({}, false);
-			counts.lane_submitted     = true;
-			counts.lane_empty         = empty;
-			counts.new_command_buffer = true;
+			// Lazy begin: what Submit would encode before its packet comes first (the owner's
+			// end-of-buffer work, the rendering end, the barrier batch); if the buffer's Begin is
+			// still pending after that, nothing was encoded into it: it goes back to the pool and
+			// nothing is submitted (no tick allocated; work deferred to the current tick waits for
+			// the next submit, never less).
+			if (m_pre_submit_hook != nullptr && !m_in_pre_submit && Active()) {
+				m_in_pre_submit = true;
+				m_pre_submit_hook(m_pre_submit_hook_context);
+				m_in_pre_submit = false;
+				EXIT_IF(command.IsInvalid());
+			}
+			command.EndRendering();
+			command.FlushBarriers();
+			if (m_recorder->BeginPending()) {
+				EXIT_IF(command.m_rendering || !command.m_pending.Empty());
+				command.CloseDirectWindow();
+				m_recorder->CancelPendingBegin();
+				(context != 0 ? *m_command_pool_b : m_command_pool).Return(command.m_buffer);
+				command.m_buffer    = nullptr;
+				counts.lane_skipped = true;
+			} else {
+				// Empty: only the Begin packet (or a drain marker) was encoded since the segment began.
+				const bool empty = m_recorder->StreamPackets(context) - m_segment_packets[context] <= 1;
+				Submit({}, false);
+				counts.lane_submitted     = true;
+				counts.lane_empty         = empty;
+				counts.new_command_buffer = true;
+			}
 		} else {
 			command.CloseDirectWindow();
 		}

@@ -673,6 +673,18 @@ public:
 	uint64_t DrainMarker(uint64_t serial);
 	// Astro Bot PC (KYTY_CP_PAR=1b2): an Op::Switch packet (DrainMarkerPacket payload), published.
 	void SwitchStream(uint64_t serial);
+	// Astro Bot PC (KYTY_CP_PAR=2a, lazy begin): the Begin packet is kept pending and encoded just
+	// before the next packet of any other kind (Switch excepted: a pending Begin there is an error;
+	// the owner cancels it first). FlushPendingBegin encodes it now (a recorder drain must reach a
+	// begun native buffer); CancelPendingBegin drops it (nothing was encoded for that buffer).
+	void DeferBegin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns);
+	[[nodiscard]] bool BeginPending() const noexcept { return m_begin_pending; }
+	void FlushPendingBegin() {
+		if (m_begin_pending) {
+			EmitPendingBegin();
+		}
+	}
+	void CancelPendingBegin() noexcept { m_begin_pending = false; }
 
 	void beginRendering(const vk::RenderingInfo& info);
 	void endRendering();
@@ -785,6 +797,10 @@ private:
 	uint64_t  m_bytes      = 0;
 	uint64_t  m_cb_digest  = 0;
 	uint64_t  m_cb_packets = 0;
+	// Astro Bot PC (KYTY_CP_PAR=2a): the pending Begin packet (DeferBegin).
+	void        EmitPendingBegin();
+	bool        m_begin_pending = false;
+	BeginPacket m_pending_begin {};
 };
 
 class Encoder::Writer {
