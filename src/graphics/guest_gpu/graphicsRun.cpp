@@ -756,12 +756,19 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					if (CpPar::GetMode() == CpPar::Mode::Lanes2a) {
 						// Astro Bot PC (KYTY_CP_PAR=2a, cpParallel.h): each lane's own native command
 						// buffers (pool) and RenderExecutor, submitted at every hand-off.
-						if (m_renderer.HasLaneExecutor() &&
-						    m_renderer.GetCommandScheduler().EnableLanes()) {
-							CpPar::g_lanes = true;
-							std::printf("Kyty CpPar: 2a lanes: each lane has its own command pool, "
+						// N lanes (KYTY_CP_PAR_LANES): lane k = ranks k + 1, k + 1 + N, ... of a frame.
+						const uint32_t lanes = CpPar::RequestedLanes();
+						static_assert(CpPar::MaxLanes == CommandScheduler::MaxLanes &&
+						              CpPar::MaxLanes == CommandRecorder::MaxStreams);
+						if (m_renderer.LaneExecutors() + 1 >= lanes &&
+						    m_renderer.GetCommandScheduler().EnableLanes(lanes)) {
+							CpPar::g_lane_count = lanes;
+							CpPar::g_lanes      = true;
+							std::printf("Kyty CpPar: 2a lanes (%u): each lane has its own command pool, "
 							            "native command buffers and RenderExecutor; a lane's buffer is "
-							            "submitted at every hand-off (list order)\n");
+							            "submitted at every hand-off (list order) unless nothing was "
+							            "encoded in it (lazy begin)\n",
+							            lanes);
 						} else {
 							std::printf("Kyty CpPar: 2a lanes unavailable; running as 1b2\n");
 						}
@@ -808,7 +815,7 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 				if (CpPar::StreamsActive()) {
 					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context begins a segment (2a: in
 					// a new native buffer of its own pool; GetRenderExecutor is then the lane's).
-					const uint32_t stream = CpPar::OnResolver2() ? 1u : 0u;
+					const uint32_t stream = CpPar::ThreadLane(); // Astro Bot PC (2a: N lanes)
 					CommandRecorder::SetThreadStream(stream);
 					gpu->m_renderer.GetCommandScheduler().BeginContextSegment();
 					gpu->m_renderer.GetRenderExecutor().CpParForgetCommandShadows();
@@ -820,7 +827,7 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 				if (CpPar::StreamsActive()) {
 					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context ends its segment (still
 					// owning the renderer), the merge point of its image states.
-					const uint32_t stream = CpPar::OnResolver2() ? 1u : 0u;
+					const uint32_t stream = CpPar::ThreadLane(); // Astro Bot PC (2a: N lanes)
 					CommandRecorder::SetThreadStream(stream);
 					const auto counts = gpu->m_renderer.GetCommandScheduler().EndContextSegment();
 					CpPar::EndSegment(stream, counts.packets, counts.submits,
@@ -1346,27 +1353,31 @@ DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
 // snapshot ring. m_emit_b / m_resolve_b are only ever set in 1b1 mode, and the B objects only
 // exist then: otherwise these are m_draw_prep and the sequencer's one snapshot ring.
 DrawPrep::Engine* CommandProcessor::EmitPrep() const {
-	return m_emit_b && m_draw_prep_b != nullptr ? m_draw_prep_b.get() : m_draw_prep.get();
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): the context's engine (B, C or D).
+	auto* engine = m_emit_lane != 0 ? LanePrep(m_emit_lane) : nullptr;
+	return engine != nullptr ? engine : m_draw_prep.get();
 }
 
 DrawPrep::Engine* CommandProcessor::ResolvePrep() const {
 	// Astro Bot PC (KYTY_CP_PAR=1b3): the calling thread's context (two resolvers at once).
-	const bool b = CpPar::Concurrent() ? t_cp_par_resolve_b : m_resolve_b;
-	return b && m_draw_prep_b != nullptr ? m_draw_prep_b.get() : m_draw_prep.get();
+	const uint32_t lane   = CpPar::Concurrent() ? (t_cp_par_resolve_b ? 1u : 0u) : m_resolve_lane;
+	auto*          engine = lane != 0 ? LanePrep(lane) : nullptr;
+	return engine != nullptr ? engine : m_draw_prep.get();
 }
 
 CpSeq::SnapshotRing& CommandProcessor::EmitSnapshots() const {
-	return m_sequencer->Snapshots(m_emit_b ? 1u : 0u);
+	return m_sequencer->Snapshots(m_emit_lane);
 }
 
 CpSeq::SnapshotRing& CommandProcessor::ResolveSnapshots() const {
-	const bool b = CpPar::Concurrent() ? t_cp_par_resolve_b : m_resolve_b; // Astro Bot PC (1b3)
-	return m_sequencer->Snapshots(b ? 1u : 0u);
+	// Astro Bot PC (1b3: the calling thread's context; 2a: N lanes).
+	const uint32_t lane = CpPar::Concurrent() ? (t_cp_par_resolve_b ? 1u : 0u) : m_resolve_lane;
+	return m_sequencer->Snapshots(lane);
 }
 
 void CommandProcessor::CpParWindowCounts(uint32_t context, uint64_t& published,
                                          uint64_t& retired) const {
-	const auto* engine = context != 0 ? m_draw_prep_b.get() : m_draw_prep.get();
+	const auto* engine = context != 0 ? LanePrep(context) : m_draw_prep.get();
 	published          = 0;
 	retired            = 0;
 	if (engine != nullptr) {
@@ -2144,7 +2155,9 @@ void GuestGpu::Enqueue(Submission submission) {
 	if (CpPar::Enabled() && submission.queue_id == 0 &&
 	    submission.type == SubmissionType::Graphics) {
 		m_cp_par_rank = submission.reset_processor ? 1u : m_cp_par_rank + 1u;
-		if ((m_cp_par_rank % 2u) == 0u) {
+		// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): rank r -> context (r - 1) % N (N = 2: even -> B).
+		const uint32_t context = (m_cp_par_rank - 1u) % CpPar::ContextCount();
+		if (context != 0) {
 			if (m_sequencer == nullptr) {
 				CpPar::NoteFallback(CpPar::Fallback::NoSequencer);
 			} else if (CpSeq::VerifyMode() != 0 || !CpPar::Started()) {
@@ -2152,7 +2165,7 @@ void GuestGpu::Enqueue(Submission submission) {
 			} else if (!submission.constant_commands.empty()) {
 				CpPar::NoteFallback(CpPar::Fallback::Handoff);
 			} else {
-				submission.cp_par_context = 1;
+				submission.cp_par_context = context;
 			}
 		}
 	}
@@ -2645,20 +2658,23 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	} else {
 		// Astro Bot PC (KYTY_CP_PAR=1a): context B: this slice runs on CP resolver #2 with the
 		// same code, while this thread waits (serving its requests: service commands, flips).
+		// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): on the resolver of the submission's lane.
 		struct Slice {
 			CommandProcessor* cp;
 			Submission*       submission;
 			bool              handoff;
 			Pm4ProcessResult  result;
-		} slice {&cp, &submission, false, Pm4ProcessResult::Complete};
+			uint32_t          lane;
+		} slice {&cp, &submission, false, Pm4ProcessResult::Complete, submission.cp_par_context};
 		CpPar::RunSlice(
+		    slice.lane,
 		    [](void* argument) {
 			    auto&      s     = *static_cast<Slice*>(argument);
 			    const auto start = CpPar::NowNs();
 			    s.result = s.cp->ResolveSubmission(s.submission->command_execution,
 			                                       s.submission->sequence, s.submission->commands,
-			                                       s.handoff, 1);
-			    CpPar::NoteResolveTime(1, CpPar::NowNs() - start);
+			                                       s.handoff, s.lane);
+			    CpPar::NoteResolveTime(s.lane, CpPar::NowNs() - start);
 		    },
 		    &slice);
 		result  = slice.result;
@@ -5813,6 +5829,11 @@ void CommandProcessor::AttachSequencer(CpSeq::Sequencer* sequencer) {
 		// Astro Bot PC (KYTY_CP_PAR=1a): resolver context B's ring (cpParallel.h).
 		m_ops_b.reset(new CpSeq::OpStream(OpRingBytes()));
 		m_ops_b->SetSpinNs(CpSeq::SequencerSpinNs());
+		// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): contexts C, D (KYTY_CP_PAR_LANES).
+		for (uint32_t lane = 2; lane < CpPar::RequestedLanes(); lane++) {
+			m_ops_more[lane].reset(new CpSeq::OpStream(OpRingBytes()));
+			m_ops_more[lane]->SetSpinNs(CpSeq::SequencerSpinNs());
+		}
 	}
 	// The draw-prep engine's producer is the sequencer from now on: create it before either
 	// thread can look at it.
@@ -5824,16 +5845,22 @@ void CommandProcessor::AttachSequencer(CpSeq::Sequencer* sequencer) {
 	if (m_ops_b != nullptr && CpPar::SeparateWindows()) {
 		// Astro Bot PC (KYTY_CP_PAR=1b1): context B's own snapshot ring and, with parallel draw
 		// prep, its own engine (window and workers), created before either thread looks at them.
-		sequencer->AddSnapshotRingB();
+		sequencer->AddSnapshotRings(CpPar::RequestedLanes()); // Astro Bot PC (2a: N lanes)
 		if (m_draw_prep != nullptr && m_draw_prep->Parallel()) {
-			m_draw_prep_b.reset(new DrawPrep::Engine(
-			    m_renderer,
-			    [] {
-				    if (g_gpu_state != nullptr && !(CpPar::Concurrent() && CpPar::RunAheadDirty())) { // Astro Bot PC (1b3)
-					    g_gpu_state->ProcessCommands();
-				    }
-			    },
-			    [this] { MaybeFlushIdleGpu(); }, true));
+			auto make_engine = [this](uint32_t lane) {
+				return new DrawPrep::Engine(
+				    m_renderer,
+				    [] {
+					    if (g_gpu_state != nullptr && !(CpPar::Concurrent() && CpPar::RunAheadDirty())) { // Astro Bot PC (1b3)
+						    g_gpu_state->ProcessCommands();
+					    }
+				    },
+				    [this] { MaybeFlushIdleGpu(); }, lane);
+			};
+			m_draw_prep_b.reset(make_engine(1));
+			for (uint32_t lane = 2; lane < CpPar::RequestedLanes(); lane++) {
+				m_draw_prep_more[lane].reset(make_engine(lane)); // Astro Bot PC (2a: N lanes)
+			}
 		}
 		std::printf("Kyty CpPar: context B has its own snapshot ring (%u entries)%s\n",
 		            sequencer->Snapshots(1).Capacity(),
@@ -5847,6 +5874,9 @@ void CommandProcessor::DetachSequencer() {
 	CpSeq::OpView view;
 	EXIT_IF(m_ops->Peek(view)); // every op executed
 	EXIT_IF(m_ops_b != nullptr && m_ops_b->Peek(view)); // Astro Bot PC (KYTY_CP_PAR)
+	for (const auto& ops: m_ops_more) {
+		EXIT_IF(ops != nullptr && ops->Peek(view)); // Astro Bot PC (KYTY_CP_PAR=2a, N lanes)
+	}
 	m_front_mode = FrontMode::Direct;
 	m_sequencer  = nullptr;
 	m_pending_writes.clear();
@@ -6278,8 +6308,8 @@ bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
 	auto& sequencer = *m_sequencer;
 	// Astro Bot PC (KYTY_CP_PAR=1a): this submission's ops go to its resolver context's ring,
 	// numbered after the ops of the other ring (one global op order). Off: always m_ops.
-	if (auto* ring = intake.context != 0 && m_ops_b != nullptr ? m_ops_b.get() : m_ops.get();
-	    ring != m_emit_ops) {
+	auto* lane_ring = intake.context != 0 ? OpsOf(intake.context) : nullptr; // Astro Bot PC (2a)
+	if (auto* ring = lane_ring != nullptr ? lane_ring : m_ops.get(); ring != m_emit_ops) {
 		ring->SetNextSequence(m_emit_ops->Emitted());
 		m_emit_ops = ring;
 		if (CpPar::SeparateWindows()) {
@@ -6287,9 +6317,14 @@ bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
 			// context's window and ring, with that context's pending-op lists (speculative slots
 			// never outlive their stream: none is pending here).
 			EXIT_IF(EmitPrep() != nullptr && EmitPrep()->SpeculativeSlots() != 0);
-			m_emit_b = ring == m_ops_b.get();
-			std::swap(m_published_ops, m_published_ops_parked);
-			std::swap(m_snapshot_ops, m_snapshot_ops_parked);
+			// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): park the lists of the context left, take the
+			// ones of the context entered (two contexts: the former single swap).
+			const uint32_t entered = ring == m_ops.get() ? 0u : intake.context;
+			std::swap(m_published_ops, m_published_ops_parked[m_emit_lane]);
+			std::swap(m_snapshot_ops, m_snapshot_ops_parked[m_emit_lane]);
+			std::swap(m_published_ops, m_published_ops_parked[entered]);
+			std::swap(m_snapshot_ops, m_snapshot_ops_parked[entered]);
+			m_emit_lane = entered;
 		}
 	}
 	if (intake.graphics && intake.frame_fence != 0) {
@@ -7680,11 +7715,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 	KYTY_PROFILER_BLOCK("CommandProcessor::Resolve");
 	ListCensus::BeginList(submission); // Astro Bot PC (KYTY_CP_PAR_CENSUS2)
 	// Astro Bot PC (KYTY_CP_PAR=1a): the resolver context's op ring (always m_ops when off).
-	EXIT_IF(context != 0 && m_ops_b == nullptr);
-	auto& ops = context != 0 ? *m_ops_b : *m_ops;
+	EXIT_IF(OpsOf(context) == nullptr); // Astro Bot PC (KYTY_CP_PAR=2a: contexts 0..N-1)
+	auto& ops = *OpsOf(context);
 	// Astro Bot PC (KYTY_CP_PAR=1b1): ResolvePrep / ResolveSnapshots follow this context (only
 	// read by the op executions below; the next ResolveSubmission sets it again).
-	m_resolve_b = context != 0 && CpPar::SeparateWindows();
+	m_resolve_lane = CpPar::SeparateWindows() ? context : 0u;
 	const CpGaps::Scope gap(CpGaps::Cat::Resolver);
 	EXIT_IF(g_current_execution != nullptr || m_front_mode != FrontMode::Thread);
 	handoff                   = false;

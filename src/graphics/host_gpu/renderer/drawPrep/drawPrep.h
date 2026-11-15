@@ -265,8 +265,10 @@ public:
 	// packet records anything, so a flush there splits no packet.
 	// Astro Bot PC (KYTY_CP_PAR=1b1): `context_b` makes the engine of resolver context B (its own
 	// window and worker set, "DrawPrep B#k", KYTY_CP_PAR_B_WORKERS / KYTY_CP_PAR_B_HOT).
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): `lane` 1..3 = context B, C, D ("DrawPrep C#k"...),
+	// same worker settings; its workers read that lane's RenderExecutor memo.
 	Engine(RenderContext& renderer, std::function<void()> service_commands,
-	       std::function<void()> after_commit, bool context_b = false);
+	       std::function<void()> after_commit, uint32_t lane = 0);
 	~Engine();
 	Engine(const Engine&)            = delete;
 	Engine& operator=(const Engine&) = delete;

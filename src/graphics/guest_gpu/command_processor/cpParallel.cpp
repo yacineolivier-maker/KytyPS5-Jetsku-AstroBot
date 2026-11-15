@@ -30,35 +30,35 @@ namespace Libs::Graphics::CpPar {
 namespace {
 
 struct Stats {
-	std::array<std::atomic<uint64_t>, 2> completed {};
-	std::array<std::atomic<uint64_t>, 2> resolve_ns {};
+	std::array<std::atomic<uint64_t>, MaxLanes> completed {};
+	std::array<std::atomic<uint64_t>, MaxLanes> resolve_ns {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Fallback::Count)> fallbacks {};
 	std::atomic<uint64_t> slices_b {0};        // RunSlice hand-offs
 	std::atomic<uint64_t> bounces_service {0}; // service commands run on Thread_Gpu for B
 	std::atomic<uint64_t> bounces_flip {0};    // Flip / WaitFlipDone ops run on Thread_Gpu for B
 	// KYTY_CP_PAR=1b1 (NotePrep): per context, committed / fallen-back draws since the last line,
 	// the window totals (published, retired) now, and at the last line (Thread_Gpu only).
-	std::array<std::atomic<uint64_t>, 2> prep_committed {};
-	std::array<std::atomic<uint64_t>, 2> prep_fell_back {};
-	std::array<std::atomic<uint64_t>, 2> window_published {};
-	std::array<std::atomic<uint64_t>, 2> window_retired {};
-	std::array<uint64_t, 2>              reported_published {};
-	std::array<uint64_t, 2>              reported_retired {};
+	std::array<std::atomic<uint64_t>, MaxLanes> prep_committed {};
+	std::array<std::atomic<uint64_t>, MaxLanes> prep_fell_back {};
+	std::array<std::atomic<uint64_t>, MaxLanes> window_published {};
+	std::array<std::atomic<uint64_t>, MaxLanes> window_retired {};
+	std::array<uint64_t, MaxLanes>       reported_published {};
+	std::array<uint64_t, MaxLanes>       reported_retired {};
 	// KYTY_CP_PAR=1b2 (EndSegment, FixUpImage): per context, segments, packets encoded in its
 	// ring, Submit packets among them, native command buffers it recorded into (first segment in
 	// each); image fix-ups checked at merge points and those that would not be no-ops; image
 	// accesses outside any segment.
-	std::array<std::atomic<uint64_t>, 2> segments {};
-	std::array<std::atomic<uint64_t>, 2> segment_packets {};
-	std::array<std::atomic<uint64_t>, 2> segment_submits {};
-	std::array<std::atomic<uint64_t>, 2> segment_buffers {};
-	std::array<std::atomic<uint64_t>, 2> fixups_checked {};
-	std::array<std::atomic<uint64_t>, 2> fixups_needed {};
+	std::array<std::atomic<uint64_t>, MaxLanes> segments {};
+	std::array<std::atomic<uint64_t>, MaxLanes> segment_packets {};
+	std::array<std::atomic<uint64_t>, MaxLanes> segment_submits {};
+	std::array<std::atomic<uint64_t>, MaxLanes> segment_buffers {};
+	std::array<std::atomic<uint64_t>, MaxLanes> fixups_checked {};
+	std::array<std::atomic<uint64_t>, MaxLanes> fixups_needed {};
 	std::atomic<uint64_t>                image_outside {0};
 	// Astro Bot PC (KYTY_CP_PAR=2a): per lane, hand-off submits and the empty ones among them.
-	std::array<std::atomic<uint64_t>, 2> lane_submits {};
-	std::array<std::atomic<uint64_t>, 2> lane_empty {};
-	std::array<std::atomic<uint64_t>, 2> lane_skipped {}; // lazy begin: no submit at the hand-off
+	std::array<std::atomic<uint64_t>, MaxLanes> lane_submits {};
+	std::array<std::atomic<uint64_t>, MaxLanes> lane_empty {};
+	std::array<std::atomic<uint64_t>, MaxLanes> lane_skipped {}; // lazy begin: no submit at the hand-off
 	std::atomic<uint64_t>                fixups_needed_total {0};
 	// KYTY_CP_PAR=1b3: run-ahead starts and ops, promotions by reason, merges and insertions with
 	// their fix-ups, op lock waits per thread, time both threads were busy (overlap).
@@ -72,8 +72,8 @@ struct Stats {
 	std::atomic<uint64_t> merge_images {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Insertion::Count)> insertions {};
 	std::atomic<uint64_t> insertion_fixups {0};
-	std::array<std::atomic<uint64_t>, 2> lock_wait_ns {};
-	std::array<std::atomic<uint64_t>, 2> lock_takes {};
+	std::array<std::atomic<uint64_t>, MaxLanes> lock_wait_ns {};
+	std::array<std::atomic<uint64_t>, MaxLanes> lock_takes {};
 	std::atomic<uint64_t> overlap_ns {0};
 	// Astro Bot PC (KYTY_CP_PAR=1b4): run-ahead ops by kind, its waits satisfied by its own writes,
 	// its writes to checked addresses, Thread_Gpu's interleave points, cross accesses, book sizes.
@@ -118,7 +118,15 @@ Stats& GetStats() {
 	return stats;
 }
 
-thread_local bool t_resolver2 = false;
+// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): the calling thread's resolver context (0: Thread_Gpu or
+// any other thread; k: CP resolver #k+1; the 1b3 run-ahead thread: 1).
+thread_local uint32_t t_lane = 0;
+// Index of a context in the per-context statistics (contexts 0 and 1 outside 2a).
+inline size_t LaneIndex(uint32_t context) noexcept {
+	return context < MaxLanes ? context : MaxLanes - 1;
+}
+// The lane taking the token at the hand-off in progress (CpPar::HandoffTarget).
+std::atomic<uint32_t> g_handoff_target {0};
 thread_local bool t_busy      = false; // Astro Bot PC (KYTY_CP_PAR=1b3): NoteBusy's last state
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): image state bookkeeping (cpParallel.h). An image's state is a
@@ -132,7 +140,7 @@ struct ImageBook {
 		std::unordered_map<const void*, uint64_t>  last;
 	};
 	std::mutex                                 mutex;
-	std::array<Segment, 2>                     segments;
+	std::array<Segment, MaxLanes>                  segments;
 	std::unordered_map<const void*, uint64_t>  merged;
 };
 
@@ -158,14 +166,18 @@ void FixUpImage(uint32_t context, const void* image, uint64_t global, uint64_t e
 	if (stats.fixups_needed_total.fetch_add(1, std::memory_order_relaxed) < 16) {
 		std::printf("Kyty CpPar: image %p of a context %c segment was found in state 0x%016" PRIx64
 		            ", the merged segments left it in 0x%016" PRIx64 " (fix-up not a no-op)\n",
-		            image, context != 0 ? 'B' : 'A', entry, global);
+		            image, LaneLetter(context), entry, global);
 	}
 }
 
 // The token: exactly one of Thread_Gpu and resolver #2 runs CP work at any time.
+// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): one Resolver2 per lane 1..N-1 ("CP resolver #k+1"),
+// still in turn: Thread_Gpu hands the token to one of them at a time.
+class Resolver2;
+thread_local Resolver2* t_resolver = nullptr; // the resolver object of the calling resolver thread
 class Resolver2 {
 public:
-	explicit Resolver2(const Hooks& hooks): m_hooks(hooks) {
+	Resolver2(const Hooks& hooks, uint32_t lane): m_hooks(hooks), m_lane(lane) {
 		m_thread = std::thread([this] { Run(); });
 	}
 	~Resolver2() {
@@ -184,8 +196,8 @@ public:
 
 	// Thread_Gpu.
 	void RunSlice(Task task, void* argument) {
-		EXIT_IF(t_resolver2);
-		Give();
+		EXIT_IF(t_lane != 0);
+		GiveToLane();
 		{
 			std::unique_lock lock(m_mutex);
 			EXIT_IF(m_state != State::Idle);
@@ -207,7 +219,7 @@ public:
 				lock.unlock();
 				Take();
 				request(request_argument);
-				Give();
+				GiveToLane();
 				lock.lock();
 				m_state = State::Slice;
 				m_wake_b.notify_one();
@@ -219,8 +231,8 @@ public:
 
 	// Resolver #2, inside a slice.
 	void RunOnGpuThread(Task task, void* argument) {
-		EXIT_IF(!t_resolver2);
-		Give();
+		EXIT_IF(t_lane != m_lane);
+		GiveToGpuThread();
 		{
 			std::unique_lock lock(m_mutex);
 			EXIT_IF(m_state != State::Slice);
@@ -237,11 +249,24 @@ private:
 	enum class State : uint8_t { Idle, Slice, Request, SliceDone, Stop };
 
 	void Take() { m_hooks.take(m_hooks.context); }
-	void Give() { m_hooks.give(m_hooks.context); }
+	// Astro Bot PC (KYTY_CP_PAR=2a): the giver names the taker first (HandoffTarget).
+	void GiveToLane() {
+		g_handoff_target.store(m_lane, std::memory_order_relaxed);
+		m_hooks.give(m_hooks.context);
+	}
+	void GiveToGpuThread() {
+		g_handoff_target.store(0, std::memory_order_relaxed);
+		m_hooks.give(m_hooks.context);
+	}
 
 	void Run() {
-		t_resolver2 = true;
-		KYTY_PROFILER_THREAD("CP resolver #2");
+		t_lane     = m_lane;
+		t_resolver = this;
+		switch (m_lane) {
+			case 1: KYTY_PROFILER_THREAD("CP resolver #2"); break;
+			case 2: KYTY_PROFILER_THREAD("CP resolver #3"); break;
+			default: KYTY_PROFILER_THREAD("CP resolver #4"); break;
+		}
 		// Like Thread_Gpu, whose work it does in turn.
 		Common::RaiseCurrentThreadPriority();
 		std::unique_lock lock(m_mutex);
@@ -255,7 +280,7 @@ private:
 			lock.unlock();
 			Take();
 			task(argument);
-			Give();
+			GiveToGpuThread();
 			lock.lock();
 			m_state = State::SliceDone;
 			m_wake_a.notify_one();
@@ -263,6 +288,7 @@ private:
 	}
 
 	Hooks                   m_hooks;
+	uint32_t                m_lane = 1;
 	std::mutex              m_mutex;
 	std::condition_variable m_wake_a; // Thread_Gpu waits on it
 	std::condition_variable m_wake_b; // resolver #2 waits on it
@@ -274,7 +300,8 @@ private:
 	std::thread             m_thread;
 };
 
-std::unique_ptr<Resolver2> g_resolver2;
+// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): index = lane (1..N-1); [0] unused.
+std::array<std::unique_ptr<Resolver2>, MaxLanes> g_resolvers;
 
 // Astro Bot PC (KYTY_CP_PAR=1b3, cpParallel.h): the CP op lock. FIFO (tickets), so that two
 // contending threads alternate op by op; `last` is the previous holder.
@@ -390,7 +417,7 @@ public:
 
 private:
 	void Run() {
-		t_resolver2 = true;
+		t_lane = 1;
 		KYTY_PROFILER_THREAD("CP resolver #2");
 		Common::RaiseCurrentThreadPriority();
 		std::unique_lock lock(m_mutex);
@@ -734,7 +761,7 @@ void OpLockRelease(uint32_t who) {
 }
 
 void StartRunAheadThread() {
-	EXIT_IF(g_resolver2 != nullptr || g_runahead != nullptr);
+	EXIT_IF(g_resolvers[1] != nullptr || g_runahead != nullptr);
 	g_runahead = std::make_unique<RunAheadThread>();
 	std::printf("Kyty CpPar: CP resolver #2 started (run-ahead)\n");
 }
@@ -856,34 +883,73 @@ uint64_t NowNs() {
 	                                 .count());
 }
 
+uint32_t RequestedLanes() {
+	static const uint32_t lanes = [] {
+		if (GetMode() != Mode::Lanes2a) {
+			return 2u;
+		}
+		const auto* value = std::getenv("KYTY_CP_PAR_LANES");
+		if (value == nullptr || *value == '\0') {
+			return 2u;
+		}
+		const auto parsed = std::strtoul(value, nullptr, 10);
+		const auto count  = static_cast<uint32_t>(std::clamp<unsigned long>(parsed, 2ul, MaxLanes));
+		if (count != parsed) {
+			std::printf("Kyty CpPar: KYTY_CP_PAR_LANES must be 2..%u (got '%s'): %u\n", MaxLanes,
+			            value, count);
+		}
+		return count;
+	}();
+	return lanes;
+}
+
+uint32_t ThreadLane() noexcept {
+	return t_lane;
+}
+
+uint32_t HandoffTarget() noexcept {
+	return g_handoff_target.load(std::memory_order_relaxed);
+}
+
 void Start(const Hooks& hooks) {
-	EXIT_IF(g_resolver2 != nullptr || hooks.take == nullptr || hooks.give == nullptr);
-	g_resolver2 = std::make_unique<Resolver2>(hooks);
-	std::printf("Kyty CpPar: CP resolver #2 started\n");
+	EXIT_IF(g_resolvers[1] != nullptr || hooks.take == nullptr || hooks.give == nullptr);
+	// Astro Bot PC (KYTY_CP_PAR=2a): one resolver per lane after A (one outside 2a).
+	const uint32_t count = ContextCount();
+	for (uint32_t lane = 1; lane < count; lane++) {
+		g_resolvers[lane] = std::make_unique<Resolver2>(hooks, lane);
+	}
+	std::printf("Kyty CpPar: CP resolver #2%s started\n",
+	            count == 2 ? "" : (count == 3 ? " and #3" : " to #4"));
 }
 
 void Stop() {
-	g_resolver2.reset();
+	for (auto& resolver: g_resolvers) {
+		resolver.reset();
+	}
 	g_runahead.reset(); // Astro Bot PC (KYTY_CP_PAR=1b3)
 }
 
 bool Started() {
-	return g_resolver2 != nullptr || g_runahead != nullptr;
+	return g_resolvers[1] != nullptr || g_runahead != nullptr;
 }
 
 void RunSlice(Task task, void* argument) {
-	EXIT_IF(g_resolver2 == nullptr);
+	RunSlice(1, task, argument);
+}
+
+void RunSlice(uint32_t lane, Task task, void* argument) {
+	EXIT_IF(lane == 0 || lane >= MaxLanes || g_resolvers[lane] == nullptr);
 	GetStats().slices_b.fetch_add(1, std::memory_order_relaxed);
-	g_resolver2->RunSlice(task, argument);
+	g_resolvers[lane]->RunSlice(task, argument);
 }
 
 void RunOnGpuThread(Task task, void* argument) {
-	EXIT_IF(g_resolver2 == nullptr);
-	g_resolver2->RunOnGpuThread(task, argument);
+	EXIT_IF(t_resolver == nullptr);
+	t_resolver->RunOnGpuThread(task, argument);
 }
 
 bool OnResolver2() noexcept {
-	return t_resolver2;
+	return t_lane != 0;
 }
 
 void NoteFallback(Fallback reason) {
@@ -891,11 +957,11 @@ void NoteFallback(Fallback reason) {
 }
 
 void NoteCompleted(uint32_t context) {
-	GetStats().completed[context != 0 ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+	GetStats().completed[LaneIndex(context)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteResolveTime(uint32_t context, uint64_t ns) {
-	GetStats().resolve_ns[context != 0 ? 1 : 0].fetch_add(ns, std::memory_order_relaxed);
+	GetStats().resolve_ns[LaneIndex(context)].fetch_add(ns, std::memory_order_relaxed);
 }
 
 void NoteBounce(bool flip_op) {
@@ -905,7 +971,7 @@ void NoteBounce(bool flip_op) {
 
 void NotePrep(uint32_t context, uint64_t committed, uint64_t fell_back, uint64_t published,
               uint64_t retired) {
-	const size_t index = context != 0 ? 1 : 0;
+	const size_t index = LaneIndex(context);
 	auto&        stats = GetStats();
 	stats.prep_committed[index].fetch_add(committed, std::memory_order_relaxed);
 	stats.prep_fell_back[index].fetch_add(fell_back, std::memory_order_relaxed);
@@ -939,7 +1005,7 @@ void ForgetImage(const void* image) {
 }
 
 void BeginSegment(uint32_t context) {
-	const size_t    index = context != 0 ? 1 : 0;
+	const size_t    index = LaneIndex(context);
 	auto&           book  = GetImageBook();
 	std::lock_guard lock(book.mutex);
 	EXIT_IF(book.segments[index].open);
@@ -948,7 +1014,7 @@ void BeginSegment(uint32_t context) {
 }
 
 void EndSegment(uint32_t context, uint64_t packets, uint64_t submits, bool new_command_buffer) {
-	const size_t index = context != 0 ? 1 : 0;
+	const size_t index = LaneIndex(context);
 	auto&        stats = GetStats();
 	stats.segments[index].fetch_add(1, std::memory_order_relaxed);
 	stats.segment_packets[index].fetch_add(packets, std::memory_order_relaxed);
@@ -979,7 +1045,7 @@ void EndSegment(uint32_t context, uint64_t packets, uint64_t submits, bool new_c
 }
 
 void NoteLaneHandoff(uint32_t context, bool empty, bool skipped) {
-	const size_t index = context != 0 ? 1 : 0;
+	const size_t index = LaneIndex(context);
 	auto&        stats = GetStats();
 	if (skipped) {
 		stats.lane_skipped[index].fetch_add(1, std::memory_order_relaxed);
@@ -1209,15 +1275,15 @@ void MaybeReport() {
 	}
 	if (Lanes()) {
 		// Astro Bot PC (KYTY_CP_PAR=2a): the hand-off submits of each lane over the last 10 s.
-		const auto sub_a   = take(stats.lane_submits[0]);
-		const auto sub_b   = take(stats.lane_submits[1]);
-		const auto empty_a = take(stats.lane_empty[0]);
-		const auto empty_b = take(stats.lane_empty[1]);
-		const auto skip_a  = take(stats.lane_skipped[0]);
-		const auto skip_b  = take(stats.lane_skipped[1]);
-		std::printf("CpPar 10s: 2a lanes: hand-off submits A %" PRIu64 " (empty %" PRIu64
-		            ", skipped %" PRIu64 "), B %" PRIu64 " (empty %" PRIu64 ", skipped %" PRIu64 ")\n",
-		            sub_a, empty_a, skip_a, sub_b, empty_b, skip_b);
+		std::string lanes;
+		for (uint32_t lane = 0; lane < g_lane_count && lane < MaxLanes; lane++) {
+			char item[128];
+			std::snprintf(item, sizeof(item), "%s%c %" PRIu64 " (empty %" PRIu64 ", skipped %" PRIu64 ")",
+			              lane == 0 ? "" : ", ", LaneLetter(lane), take(stats.lane_submits[lane]),
+			              take(stats.lane_empty[lane]), take(stats.lane_skipped[lane]));
+			lanes += item;
+		}
+		std::printf("CpPar 10s: 2a lanes (%u): hand-off submits %s\n", g_lane_count, lanes.c_str());
 	}
 	std::fflush(stdout);
 }

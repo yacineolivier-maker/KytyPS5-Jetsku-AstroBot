@@ -221,6 +221,15 @@
 // submit per hand-off (empty when the segment recorded nothing: counted). Image layouts: 1b2's
 // bookkeeping (fix-ups must be no-ops). A "CpPar 10s: 2a lanes ..." line reports the hand-off
 // submits per lane and the empty ones.
+// Lazy begin: a lane's Begin packet stays pending in its encoder until its first packet (or a
+// recorder drain, which every direct window starts with); a segment that encoded nothing gives its
+// native buffer back to the pool and submits nothing ("skipped").
+// N lanes (KYTY_CP_PAR_LANES=2|3|4, default 2): contexts A..D, rank r of a frame -> context
+// (r - 1) % N, one "CP resolver #k+1" thread per lane k >= 1, each lane with its own op ring,
+// snapshot ring, draw-prep engine, recorder stream, wrapper, dynamic state, command pool and
+// RenderExecutor. Still in turn: Thread_Gpu hands the token to one lane at a time (RunSlice(lane));
+// the giver's Switch packet names the taker (HandoffTarget), so the one recorder thread follows
+// the rings in list order.
 
 #include <cstdint>
 
@@ -293,6 +302,28 @@ inline bool g_deferred = false;
 inline bool g_lanes = false;
 [[nodiscard]] inline bool Lanes() noexcept {
 	return g_lanes;
+}
+// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): at most MaxLanes resolver contexts (A = Thread_Gpu,
+// B, C, D = CP resolver #2, #3, #4). KYTY_CP_PAR_LANES=2|3|4 (2a only, default 2), read once:
+// RequestedLanes() is what the start-up creates rings, snapshot rings, draw-prep engines and
+// RenderExecutors for (2 in every other mode). g_lane_count: set with g_lanes (the lanes in use).
+// ContextCount(): the rank split's modulus, (rank - 1) % ContextCount() -> context.
+inline constexpr uint32_t MaxLanes = 4;
+[[nodiscard]] uint32_t    RequestedLanes();
+inline uint32_t           g_lane_count = 2;
+[[nodiscard]] inline uint32_t ContextCount() noexcept {
+	return g_lanes ? g_lane_count : 2u;
+}
+// The calling thread's resolver context: 0 for Thread_Gpu (and any other thread), k for CP
+// resolver #k+1 (the 1b3 run-ahead thread: 1).
+[[nodiscard]] uint32_t ThreadLane() noexcept;
+// The lane that takes the token at the hand-off in progress (set before the giver's give hook):
+// a lane always gives it back to Thread_Gpu (0); Thread_Gpu gives it to the slice's lane. The
+// giver's Switch packet names it (2a).
+[[nodiscard]] uint32_t HandoffTarget() noexcept;
+// Letter of a lane in the console lines ('A'..'D').
+[[nodiscard]] inline char LaneLetter(uint32_t lane) noexcept {
+	return static_cast<char>('A' + (lane < MaxLanes ? lane : MaxLanes - 1));
 }
 // "1b5", "1b4" or "1b3" (the concurrent mode's name in the console lines).
 [[nodiscard]] inline const char* ConcurrentName() noexcept {
@@ -463,6 +494,8 @@ void Stop();
 // Thread_Gpu: runs `task` on resolver #2 and waits until it returns, serving its RunOnGpuThread
 // requests meanwhile.
 void RunSlice(Task task, void* argument);
+// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): the same on the resolver of lane `lane` (1..N-1).
+void RunSlice(uint32_t lane, Task task, void* argument);
 // Resolver #2, inside a RunSlice task: runs `task` on Thread_Gpu (with the token) and waits.
 void RunOnGpuThread(Task task, void* argument);
 // The calling thread is resolver #2.

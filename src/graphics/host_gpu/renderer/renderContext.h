@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <shared_mutex>
@@ -137,16 +138,21 @@ public:
 	// Astro Bot PC (KYTY_CP_PAR=2a, cpParallel.h): the calling thread's lane's executor (lane B:
 	// the thread records into recorder stream 1, CP resolver #2); lane A's otherwise and in every
 	// other mode (no lane executor).
+	// N lanes: lane k (recorder stream k, CP resolver #k+1) has executor k.
 	RenderExecutor& GetRenderExecutor() {
-		if (m_render_executor_b != nullptr && CommandScheduler::ThreadContext() != 0) {
-			return *m_render_executor_b;
+		if (m_lane_executors != 0) {
+			if (const auto lane = CommandScheduler::ThreadContext(); lane != 0 && lane <= m_lane_executors) {
+				return *m_render_executors_x[lane];
+			}
 		}
 		return m_render_executor;
 	}
 	RenderExecutor& GetRenderExecutor(uint32_t lane) {
-		return lane != 0 && m_render_executor_b != nullptr ? *m_render_executor_b : m_render_executor;
+		return lane != 0 && lane <= m_lane_executors ? *m_render_executors_x[lane] : m_render_executor;
 	}
-	[[nodiscard]] bool HasLaneExecutor() const noexcept { return m_render_executor_b != nullptr; }
+	[[nodiscard]] bool HasLaneExecutor() const noexcept { return m_lane_executors != 0; }
+	// Executors of lanes after A (lanes 1..LaneExecutors() have their own).
+	[[nodiscard]] uint32_t LaneExecutors() const noexcept { return m_lane_executors; }
 	OcclusionCounter&   GetOcclusionCounter() { return m_occlusion_counter; }
 	LodStatsCounter&    GetLodStats() { return m_lod_stats; }
 
@@ -206,8 +212,10 @@ private:
 	GraphicContext&           m_graphics;
 	RenderMutex               m_mutex;
 	RenderExecutor            m_render_executor;
-	// Astro Bot PC (KYTY_CP_PAR=2a): lane B's executor (null in every other mode).
-	std::unique_ptr<RenderExecutor> m_render_executor_b;
+	// Astro Bot PC (KYTY_CP_PAR=2a): the executors of lanes B, C, D (index = lane, [0] unused;
+	// none in every other mode) and how many exist.
+	std::array<std::unique_ptr<RenderExecutor>, CommandScheduler::MaxLanes> m_render_executors_x;
+	uint32_t                                                                m_lane_executors = 0;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
 	PipelineCache             m_pipeline_cache;

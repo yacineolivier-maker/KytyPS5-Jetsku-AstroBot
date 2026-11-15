@@ -128,7 +128,12 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		// the command processor makes context B's draw-prep engine (its workers read B's memo).
 		// Lanes need the recorder in thread mode without verify (CommandRecorder::
 		// EnableSecondStream); otherwise 2a runs as 1b1 and nothing selects this executor.
-		m_render_executor_b = std::make_unique<RenderExecutor>(*this);
+		// N lanes (KYTY_CP_PAR_LANES): one per lane after A.
+		const uint32_t lanes = std::min(CpPar::RequestedLanes(), CommandScheduler::MaxLanes);
+		for (uint32_t lane = 1; lane < lanes; lane++) {
+			m_render_executors_x[lane] = std::make_unique<RenderExecutor>(*this);
+		}
+		m_lane_executors = lanes - 1;
 	}
 	// What guest write tracking costs on this PC (faultCost.h), measured before the GPU caches
 	// take their first fault.

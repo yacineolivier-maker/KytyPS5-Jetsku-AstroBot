@@ -663,27 +663,64 @@ uint32_t CommandRecorder::ThreadStream() noexcept {
 }
 
 bool CommandRecorder::EnableSecondStream() {
-	if (m_mode != Mode::Thread || VerifyEnabled() || m_encoder_b != nullptr) {
+	if (m_mode != Mode::Thread || VerifyEnabled() || m_stream_count != 1) {
 		return false;
 	}
 	// Created before the producer of stream 1 exists and before the replay can see a Switch
 	// packet (the first one is encoded by stream 0's first hand-off).
-	m_ring_b    = std::make_unique<CommandStream::Ring>(RingBytes());
-	m_encoder_b = std::make_unique<CommandStream::Encoder>(
-	    *m_ring_b, MakeOptions(m_mode, this, &AfterCommitThunk));
+	m_rings_x[1]    = std::make_unique<CommandStream::Ring>(RingBytes());
+	m_encoders_x[1] = std::make_unique<CommandStream::Encoder>(
+	    *m_rings_x[1], MakeOptions(m_mode, this, &AfterCommitThunk));
+	m_stream_count = 2;
 	return true;
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2a, commandRecorder.h).
+bool CommandRecorder::EnableStreams(uint32_t count) {
+	if (m_stream_count < 2 || count > MaxStreams) {
+		return false;
+	}
+	// Before any producer of these streams exists; the replay reaches a ring only through a
+	// Switch packet naming it, published after this.
+	for (uint32_t stream = m_stream_count; stream < count; stream++) {
+		m_rings_x[stream]    = std::make_unique<CommandStream::Ring>(RingBytes());
+		m_encoders_x[stream] = std::make_unique<CommandStream::Encoder>(
+		    *m_rings_x[stream], MakeOptions(m_mode, this, &AfterCommitThunk));
+	}
+	m_stream_count = std::max(m_stream_count, count);
+	return true;
+}
+
+namespace {
+// Astro Bot PC (KYTY_CP_PAR=2a): a Switch packet's serial carries its target ring in its top byte
+// (target + 1; 0: the other ring of two, as in 1b2 / 1b3).
+constexpr uint32_t SwitchTargetShift = 56;
+} // namespace
+
 void CommandRecorder::EndStreamSegment() {
-	EXIT_IF(m_encoder_b == nullptr);
+	EXIT_IF(m_stream_count < 2);
 	ProducerEncoder().SwitchStream(++m_switch_serial);
+}
+
+void CommandRecorder::EndStreamSegment(uint32_t target) {
+	EXIT_IF(m_stream_count < 2 || target >= m_stream_count);
+	const uint64_t serial = (++m_switch_serial & ((uint64_t {1} << SwitchTargetShift) - 1u)) |
+	                        (uint64_t {target + 1u} << SwitchTargetShift);
+	ProducerEncoder().SwitchStream(serial);
 }
 
 bool CommandRecorder::StreamsIdle() const noexcept {
 	// Each producer's last packet before the other stream's segment is a published (kicked)
 	// Switch: the idle producer's ring is compared up to its published position.
-	return m_ring.Consumed() == m_ring.PublishedPosition() &&
-	       (m_ring_b == nullptr || m_ring_b->Consumed() == m_ring_b->PublishedPosition());
+	if (m_ring.Consumed() != m_ring.PublishedPosition()) {
+		return false;
+	}
+	for (uint32_t stream = 1; stream < m_stream_count; stream++) {
+		if (m_rings_x[stream]->Consumed() != m_rings_x[stream]->PublishedPosition()) {
+			return false;
+		}
+	}
+	return true;
 }
 
 void CommandRecorder::Begin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns) {
@@ -697,7 +734,7 @@ void CommandRecorder::Submit(const CommandStream::SubmitPacket& submit) {
 }
 
 void CommandRecorder::Drain(const void* site_key, bool is_site) {
-	if (m_encoder_b != nullptr && CpPar::Concurrent()) {
+	if (m_stream_count > 1 && CpPar::Concurrent()) {
 		// Astro Bot PC (KYTY_CP_PAR=1b3): a drain of the run-ahead cannot reach its unmerged
 		// position (cpParallel.h): an insertion merges it first.
 		CpPar::BeforeRecorderDrain();
@@ -716,7 +753,7 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	// Astro Bot PC (KYTY_CP_PAR=1b2): the calling thread's ring; idle only when both rings are
 	// (the replay reaches this ring's marker after the other ring's earlier segments).
 	auto&      ring = ProducerRing();
-	const bool idle = ring.Consumed() == ring.WritePosition() && (m_ring_b == nullptr || StreamsIdle());
+	const bool idle = ring.Consumed() == ring.WritePosition() && (m_stream_count == 1 || StreamsIdle());
 	if (idle) {
 		m_idle_drains++;
 	} else {
@@ -787,14 +824,16 @@ void CommandRecorder::Stop() {
 	m_test_stall.store(false, std::memory_order_release);
 	if (m_mode == Mode::Thread) {
 		m_ring.WaitConsumed(m_ring.WritePosition(), m_drain_policy, m_drain_stats);
-		if (m_ring_b != nullptr) {
-			// Astro Bot PC (KYTY_CP_PAR=1b2): stream 1's producer is stopped (resolver #2 joined).
-			m_ring_b->WaitConsumed(m_ring_b->PublishedPosition(), m_drain_policy, m_drain_stats);
+		for (uint32_t stream = 1; stream < m_stream_count; stream++) {
+			// Astro Bot PC (KYTY_CP_PAR=1b2): stream 1's producer is stopped (resolver #2 joined;
+			// 2a: every lane's resolver).
+			auto& ring = *m_rings_x[stream];
+			ring.WaitConsumed(ring.PublishedPosition(), m_drain_policy, m_drain_stats);
 		}
 		m_stop.store(true, std::memory_order_seq_cst);
 		m_ring.WakeConsumer();
-		if (m_ring_b != nullptr) {
-			m_ring_b->WakeConsumer();
+		for (uint32_t stream = 1; stream < m_stream_count; stream++) {
+			m_rings_x[stream]->WakeConsumer();
 		}
 		m_thread.request_stop();
 		if (m_thread.joinable()) {
@@ -864,10 +903,21 @@ void CommandRecorder::ConsumeAvailable() {
 	// Switch packet releases this ring and continues in the other one.
 	while (const auto* header = m_consume_ring->Peek()) {
 		auto& ring = *m_consume_ring;
-		if (header->op == Op::Switch && m_ring_b != nullptr) {
+		if (header->op == Op::Switch && m_stream_count > 1) {
+			// Astro Bot PC (KYTY_CP_PAR=2a): the target ring named by the serial's top byte.
+			const CommandStream::SiteBlock*   site   = nullptr;
+			const CommandStream::VerifyBlock* verify = nullptr;
+			CommandStream::Reader reader(header, CommandStream::Detail::PayloadOffset(*header, &site, &verify));
+			const auto target =
+			    static_cast<uint32_t>(reader.Get<CommandStream::DrainMarkerPacket>().serial >> SwitchTargetShift);
 			ring.Advance(header->size);
 			ring.Release(m_consumer_stats);
-			m_consume_ring = &ring == &m_ring ? m_ring_b.get() : &m_ring;
+			if (target != 0) {
+				EXIT_IF(target > m_stream_count);
+				m_consume_ring = target == 1 ? &m_ring : m_rings_x[target - 1].get();
+			} else {
+				m_consume_ring = &ring == &m_ring ? m_rings_x[1].get() : &m_ring;
+			}
 			since          = 0;
 			continue;
 		}

@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/commandStream.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -65,12 +66,24 @@ public:
 	// to ring, starting in stream 0. Thread mode without verify only; call before any packet of
 	// stream 1 (returns false, nothing changed, otherwise).
 	bool EnableSecondStream();
-	[[nodiscard]] bool DualStreams() const noexcept { return m_encoder_b != nullptr; }
-	[[nodiscard]] CommandStream::Encoder& EncoderB() noexcept { return *m_encoder_b; }
+	[[nodiscard]] bool DualStreams() const noexcept { return m_stream_count > 1; }
+	[[nodiscard]] CommandStream::Encoder& EncoderB() noexcept { return *m_encoders_x[1]; }
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): streams 2..count-1 (rings and encoders) after
+	// EnableSecondStream, at most MaxStreams in all, before any packet of them. Returns false
+	// (nothing changed) without stream 1.
+	static constexpr uint32_t MaxStreams = 4;
+	bool EnableStreams(uint32_t count);
+	[[nodiscard]] uint32_t StreamCount() const noexcept { return m_stream_count; }
+	[[nodiscard]] CommandStream::Encoder& StreamEncoder(uint32_t stream) noexcept {
+		return stream != 0 ? *m_encoders_x[stream] : m_encoder;
+	}
 	static void                   SetThreadStream(uint32_t stream) noexcept;
 	[[nodiscard]] static uint32_t ThreadStream() noexcept;
 	// The calling thread's stream: ends its segment (the replay continues in the other ring).
+	// Astro Bot PC (KYTY_CP_PAR=2a): `target` names the ring the replay continues in (the lane
+	// taking the token); without it (1b2, 1b3: two streams) the replay goes to the other ring.
 	void EndStreamSegment();
+	void EndStreamSegment(uint32_t target);
 	// Astro Bot PC (KYTY_CP_PAR=1b3): the calling thread's ring, bytes written but not released by
 	// the replay yet, and its capacity (its producer only).
 	[[nodiscard]] uint64_t StreamBacklog() noexcept {
@@ -80,7 +93,7 @@ public:
 	[[nodiscard]] uint64_t StreamCapacity() noexcept { return ProducerRing().Capacity(); }
 	// Packets encoded so far by stream stream (its producer thread).
 	[[nodiscard]] uint64_t StreamPackets(uint32_t stream) const noexcept {
-		return stream != 0 && m_encoder_b != nullptr ? m_encoder_b->Packets() : m_encoder.Packets();
+		return stream != 0 && stream < m_stream_count ? m_encoders_x[stream]->Packets() : m_encoder.Packets();
 	}
 	// Begin of a guest command buffer: the native buffer the CP picked from its pool.
 	void Begin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns);
@@ -178,15 +191,20 @@ private:
 	// Astro Bot PC (KYTY_CP_PAR=1b2): stream 1 (null unless EnableSecondStream), the ring the
 	// replay reads now (consumer-local), the Switch packets it followed and the serial of the last
 	// Switch encoded (producers, in turn).
-	std::unique_ptr<CommandStream::Ring>    m_ring_b;
-	std::unique_ptr<CommandStream::Encoder> m_encoder_b;
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): streams 1..m_stream_count-1, index = stream ([0]
+	// unused: stream 0 is m_ring / m_encoder).
+	std::array<std::unique_ptr<CommandStream::Ring>, MaxStreams>    m_rings_x;
+	std::array<std::unique_ptr<CommandStream::Encoder>, MaxStreams> m_encoders_x;
+	uint32_t                                m_stream_count  = 1;
 	CommandStream::Ring*                    m_consume_ring  = nullptr;
 	uint64_t                                m_switch_serial = 0;
 	[[nodiscard]] CommandStream::Ring& ProducerRing() noexcept {
-		return m_ring_b != nullptr && ThreadStream() != 0 ? *m_ring_b : m_ring;
+		const auto stream = ThreadStream();
+		return stream != 0 && stream < m_stream_count ? *m_rings_x[stream] : m_ring;
 	}
 	[[nodiscard]] CommandStream::Encoder& ProducerEncoder() noexcept {
-		return m_encoder_b != nullptr && ThreadStream() != 0 ? *m_encoder_b : m_encoder;
+		const auto stream = ThreadStream();
+		return stream != 0 && stream < m_stream_count ? *m_encoders_x[stream] : m_encoder;
 	}
 	// Every packet of both streams executed (both rings consumed up to what was published).
 	[[nodiscard]] bool StreamsIdle() const noexcept;

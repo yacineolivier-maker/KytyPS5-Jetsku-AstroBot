@@ -135,7 +135,12 @@ public:
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept {
-		return m_dual && ThreadContext() != 0 ? m_dynamic_state_b : m_dynamic_state;
+		if (!m_dual) {
+			return m_dynamic_state;
+		}
+		// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): lanes 2.. have their own.
+		const auto lane = ThreadContext();
+		return lane == 0 ? m_dynamic_state : (lane == 1 ? m_dynamic_state_b : *m_dynamic_state_x[lane]);
 	}
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
@@ -186,17 +191,30 @@ public:
 	// (BeginContextSegment) and ends by submitting it (EndContextSegment, the merge in list order,
 	// where its tick is allocated). Execution stays in turn: at most one wrapper names a native
 	// buffer at any time (Submit checks it).
-	bool               EnableLanes();
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): `count` lanes (2..MaxLanes); lanes 2.. get their own
+	// wrapper, DynamicState, command pool and recorder stream (CommandRecorder::EnableStreams).
+	static constexpr uint32_t MaxLanes = 4;
+	bool               EnableLanes(uint32_t count = 2);
 	[[nodiscard]] bool Lanes() const noexcept { return m_lanes; }
+	[[nodiscard]] uint32_t LaneCount() const noexcept { return m_lane_count; }
 	// The calling thread's context (0 unless it records into stream 1).
 	[[nodiscard]] static uint32_t ThreadContext() noexcept;
 
 private:
 	[[nodiscard]] CommandBuffer& Cmd() noexcept {
-		return m_dual && ThreadContext() != 0 ? m_command_b : m_command;
+		return m_dual ? LaneCmd(ThreadContext()) : m_command;
 	}
 	[[nodiscard]] const CommandBuffer& Cmd() const noexcept {
-		return m_dual && ThreadContext() != 0 ? m_command_b : m_command;
+		return m_dual ? const_cast<CommandScheduler*>(this)->LaneCmd(ThreadContext()) : m_command;
+	}
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): the wrapper of context `lane` (dual contexts on).
+	[[nodiscard]] CommandBuffer& LaneCmd(uint32_t lane) noexcept {
+		return lane == 0 ? m_command : (lane == 1 ? m_command_b : *m_command_x[lane]);
+	}
+	// The calling thread's context as an index of the per-context arrays.
+	[[nodiscard]] static uint32_t LaneIndex() noexcept {
+		const auto lane = ThreadContext();
+		return lane < MaxLanes ? lane : MaxLanes - 1;
 	}
 	class CommandPool {
 	public:
@@ -254,13 +272,22 @@ private:
 	DynamicState                 m_dynamic_state;
 	DynamicState                 m_dynamic_state_b;
 	bool                         m_dual = false;
-	std::array<uint64_t, 2>      m_segment_packets {};
-	std::array<uint64_t, 2>      m_segment_submits {};
-	std::array<uint64_t, 2>      m_submits {};
-	std::array<uint64_t, 2>      m_segment_tick {};
+	std::array<uint64_t, MaxLanes> m_segment_packets {};
+	std::array<uint64_t, MaxLanes> m_segment_submits {};
+	std::array<uint64_t, MaxLanes> m_submits {};
+	std::array<uint64_t, MaxLanes> m_segment_tick {};
 	// Astro Bot PC (KYTY_CP_PAR=2a): lane B's command pool (null unless EnableLanes), lanes on.
 	std::unique_ptr<CommandPool> m_command_pool_b;
 	bool                         m_lanes = false;
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): lanes 2.. (index = lane): wrappers, dynamic states
+	// and command pools (null below index 2 and unless EnableLanes(3+)); the lanes in use.
+	std::array<std::unique_ptr<CommandBuffer>, MaxLanes> m_command_x;
+	std::array<std::unique_ptr<DynamicState>, MaxLanes>  m_dynamic_state_x;
+	std::array<std::unique_ptr<CommandPool>, MaxLanes>   m_command_pool_x;
+	uint32_t                                             m_lane_count = 1;
+	[[nodiscard]] CommandPool& LanePool(uint32_t lane) noexcept {
+		return lane == 0 ? m_command_pool : (lane == 1 ? *m_command_pool_b : *m_command_pool_x[lane]);
+	}
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

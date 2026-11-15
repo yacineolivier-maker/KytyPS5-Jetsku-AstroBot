@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "loader/gameCapture.h"
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -544,8 +545,15 @@ private:
 	// thread). m_resolve_b: the resolver executes one (set by ResolveSubmission; the two
 	// resolvers run in turn, the token orders the accesses).
 	std::unique_ptr<DrawPrep::Engine, DrawPrepDeleter> m_draw_prep_b;
-	bool                                               m_emit_b    = false;
-	bool                                               m_resolve_b = false;
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): the engines of contexts C, D (index = context; null
+	// below 2), and the contexts the sequencer emits for / the resolver executes (0..3; 0 or 1
+	// outside 2a; "b" above = context != 0).
+	std::array<std::unique_ptr<DrawPrep::Engine, DrawPrepDeleter>, 4> m_draw_prep_more;
+	uint32_t                                                           m_emit_lane    = 0;
+	uint32_t                                                           m_resolve_lane = 0;
+	[[nodiscard]] DrawPrep::Engine* LanePrep(uint32_t context) const noexcept {
+		return context == 1 ? m_draw_prep_b.get() : (context >= 2 && context < 4 ? m_draw_prep_more[context].get() : nullptr);
+	}
 	// Packets processed, for the CP's placement samples (common/cpuPlacement.h).
 	uint32_t m_placement_packets = 0;
 
@@ -568,6 +576,14 @@ private:
 	// context-B submission). Sequencer thread only.
 	std::unique_ptr<CpSeq::OpStream, OpStreamDeleter> m_ops_b;
 	CpSeq::OpStream*                                  m_emit_ops = nullptr;
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): the op rings of contexts C, D (index = context).
+	std::array<std::unique_ptr<CpSeq::OpStream, OpStreamDeleter>, 4> m_ops_more;
+	// Context `context`'s op ring (null when it has none).
+	[[nodiscard]] CpSeq::OpStream* OpsOf(uint32_t context) const noexcept {
+		return context == 0 ? m_ops.get()
+		       : context == 1 ? m_ops_b.get()
+		       : (context < 4 ? m_ops_more[context].get() : nullptr);
+	}
 	// KYTY_CP_SEQ_VERIFY: the reference front following this processor's streams.
 	std::unique_ptr<CpSeq::Verifier, VerifierDeleter> m_verifier;
 	// Reference front: the verifier its ops are captured by.
@@ -619,8 +635,9 @@ private:
 	std::deque<uint64_t> m_snapshot_ops;
 	// Astro Bot PC (KYTY_CP_PAR=1b1): the same lists of the resolver context the sequencer is not
 	// parsing for (swapped with the two above when it switches context).
-	std::deque<uint64_t> m_published_ops_parked;
-	std::deque<uint64_t> m_snapshot_ops_parked;
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): per context (index = context).
+	std::array<std::deque<uint64_t>, 4> m_published_ops_parked;
+	std::array<std::deque<uint64_t>, 4> m_snapshot_ops_parked;
 	// Astro Bot PC (KYTY_CP_PAR=1b3): sequencer, the sequence + 1 of the last op of the current
 	// submission that is not quiet for the oldest context (CpPar::PublishStreamEnd).
 	uint64_t m_cp_par_last_sync = 0;

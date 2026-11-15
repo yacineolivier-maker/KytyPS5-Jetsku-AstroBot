@@ -40,6 +40,7 @@
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -132,13 +133,21 @@ public:
 	// Astro Bot PC (KYTY_CP_PAR=1b1, cpParallel.h): resolver context B's own snapshot ring, created
 	// before Start (CommandProcessor::AttachSequencer). Snapshots(1) is context B's ring when it
 	// exists, otherwise the shared one.
-	void AddSnapshotRingB() {
-		if (m_snapshots_b == nullptr) {
-			m_snapshots_b = std::make_unique<SnapshotRing>(m_snapshots.Capacity());
+	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): AddSnapshotRings(count) creates the rings of contexts
+	// 1..count-1 (B, C, D); Snapshots(k) is context k's ring when it exists.
+	static constexpr uint32_t MaxContexts = 4;
+	void AddSnapshotRingB() { AddSnapshotRings(2); }
+	void AddSnapshotRings(uint32_t count) {
+		for (uint32_t context = 1; context < count && context < MaxContexts; context++) {
+			if (m_snapshots_x[context] == nullptr) {
+				m_snapshots_x[context] = std::make_unique<SnapshotRing>(m_snapshots.Capacity());
+			}
 		}
 	}
 	[[nodiscard]] SnapshotRing& Snapshots(uint32_t context) noexcept {
-		return context != 0 && m_snapshots_b != nullptr ? *m_snapshots_b : m_snapshots;
+		return context != 0 && context < MaxContexts && m_snapshots_x[context] != nullptr
+		           ? *m_snapshots_x[context]
+		           : m_snapshots;
 	}
 
 	// ---- Sequencer thread (the processor's front) ----
@@ -194,7 +203,8 @@ private:
 
 	CommandProcessor& m_processor;
 	SnapshotRing      m_snapshots;
-	std::unique_ptr<SnapshotRing> m_snapshots_b; // Astro Bot PC (KYTY_CP_PAR=1b1)
+	// Astro Bot PC (KYTY_CP_PAR=1b1; 2a: N lanes): index = context, [0] unused.
+	std::array<std::unique_ptr<SnapshotRing>, MaxContexts> m_snapshots_x;
 	uint64_t          m_spin_ns = 0;
 
 	std::mutex              m_intake_mutex;

@@ -1230,13 +1230,14 @@ struct Engine::Workers {
 };
 
 Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
-               std::function<void()> after_commit, bool context_b)
+               std::function<void()> after_commit, uint32_t lane)
     : m_renderer(renderer), m_mode(GetMode()), m_service_commands(std::move(service_commands)),
       m_after_commit(std::move(after_commit)), m_inline_slot(std::make_unique<Slot>()) {
 	if (RepeatTrace::Enabled()) {
 		RepeatTrace::SetRenderContext(&m_renderer);
 	}
 	if (m_mode == Mode::Parallel) {
+		const bool context_b = lane != 0; // Astro Bot PC (KYTY_CP_PAR=1b1; 2a: any lane after A)
 		const auto window  = EnvUnsigned("KYTY_DRAW_PREP_WINDOW", 32, 2, 1024);
 		// Astro Bot PC (KYTY_CP_PAR=1b1): resolver context B's engine has its own, smaller worker
 		// set (KYTY_CP_PAR_B_WORKERS, default 3) with KYTY_CP_PAR_B_HOT (default 1) hot workers.
@@ -1267,10 +1268,13 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
 		                                      uint64_t {spin_us} * 1000u, hot, wake_backlog,
 		                                      uint64_t {cold_spin_us} * 1000u, steal, cold_token,
-		                                      context_b ? "DrawPrep B#%u" : "DrawPrep#%u");
+		                                      lane == 0   ? "DrawPrep#%u"
+		                                      : lane == 1 ? "DrawPrep B#%u"
+		                                      : lane == 2 ? "DrawPrep C#%u"
+		                                                  : "DrawPrep D#%u");
 		// Astro Bot PC (KYTY_CP_PAR=2a): context B's workers read lane B's memo (if it has one).
 		m_workers->plan_context =
-		    MakeBindingPlanContext(m_renderer, &m_renderer.GetRenderExecutor(context_b ? 1u : 0u));
+		    MakeBindingPlanContext(m_renderer, &m_renderer.GetRenderExecutor(lane));
 		LOGF("DrawPrep%s: parallel mode, window=%u workers=%u spin=%uus hot=%u wake_backlog=%u "
 		     "cold_spin=%uus cold_token=%d steal=%u steal_after=%uus cert=%s verify=%d\n",
 		     context_b ? " (CpPar context B)" : "", m_workers->window.Capacity(), workers, spin_us,
