@@ -131,6 +131,10 @@ inline size_t LaneIndex(uint32_t context) noexcept {
 std::atomic<uint32_t> g_handoff_target {0};
 // Astro Bot PC (KYTY_CP_PAR=2b): the lane whose request Thread_Gpu is serving (UINT32_MAX: none).
 thread_local uint32_t t_serving_lane = UINT32_MAX;
+// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): lane thread, its slice task left the list unfinished
+// (SetListUnfinished); it is giving the token for a RunOnGpuThread request.
+thread_local bool t_list_unfinished = false;
+thread_local bool t_giving_request  = false;
 thread_local bool t_busy      = false; // Astro Bot PC (KYTY_CP_PAR=1b3): NoteBusy's last state
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): image state bookkeeping (cpParallel.h). An image's state is a
@@ -240,7 +244,9 @@ public:
 	// Resolver #2, inside a slice.
 	void RunOnGpuThread(Task task, void* argument) {
 		EXIT_IF(t_lane != m_lane);
+		t_giving_request = true; // Astro Bot PC (2b, obstacle 3): the give hook keeps the segment
 		GiveToGpuThread();
+		t_giving_request = false;
 		{
 			std::unique_lock lock(m_mutex);
 			EXIT_IF(m_state != State::Slice);
@@ -287,8 +293,10 @@ private:
 			auto*      argument = m_argument;
 			lock.unlock();
 			Take();
-			task(argument);
+			t_list_unfinished = false;
+			task(argument); // Astro Bot PC (2b, obstacle 3): may call SetListUnfinished
 			GiveToGpuThread();
+			t_list_unfinished = false;
 			lock.lock();
 			m_state = State::SliceDone;
 			m_wake_a.notify_one();
@@ -1151,6 +1159,48 @@ bool LaneReserveEnabled() {
 	return enabled;
 }
 
+bool LaneKeepEnabled() {
+	// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3, cpParallel.h).
+	static const bool enabled = [] {
+		if (GetMode() != Mode::Lanes2b) {
+			return false;
+		}
+		const auto* value = std::getenv("KYTY_CP_PAR_KEEP");
+		const bool  on    = value == nullptr || std::strcmp(value, "0") != 0;
+		std::printf("Kyty CpPar: 2b lanes keep their segment to the end of their list (Thread_Gpu "
+		            "records into it meanwhile): %s (KYTY_CP_PAR_KEEP)\n",
+		            on ? "on" : "off");
+		return on;
+	}();
+	return enabled;
+}
+
+void SetListUnfinished(bool unfinished) noexcept {
+	t_list_unfinished = unfinished;
+}
+
+bool ListUnfinished() noexcept {
+	return t_list_unfinished;
+}
+
+bool GivingForRequest() noexcept {
+	return t_giving_request;
+}
+
+void AdoptSegment(uint32_t context) {
+	const size_t    index = LaneIndex(context);
+	auto&           book  = GetImageBook();
+	std::lock_guard lock(book.mutex);
+	EXIT_IF(t_segment >= 0);
+	if (book.segments[index].open) {
+		t_segment = static_cast<int>(index);
+	}
+}
+
+void DropSegment() {
+	t_segment = -1; // the segment stays open (its lane resumes it)
+}
+
 void LaneLockAcquire() {
 	if (t_lane_lock_depth++ != 0) {
 		return;
@@ -1472,7 +1522,9 @@ void MaybeReport() {
 			              "; overlay ops %" PRIu64 ", images %" PRIu64 ", fix-ups %" PRIu64
 			              ", impossible %" PRIu64 ", left %" PRIu64 "; retries pending at list start %"
 			              PRIu64 "; orders reserved at hand-out %" PRIu64 ", unreserved begins %" PRIu64
-			              ", list-end closures %" PRIu64,
+			              ", list-end closures %" PRIu64 "; segments kept over slices %" PRIu64
+			              ", over bounces %" PRIu64 ", resumed without closing %" PRIu64 " (not oldest %"
+			              PRIu64 "), delegated recordings %" PRIu64 ", open at list end %" PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
 			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs),
 			              n(LaneStat::SubmitTurnWaits), ms(LaneStat::SubmitTurnNs),
@@ -1486,7 +1538,10 @@ void MaybeReport() {
 			              n(LaneStat::OverlayImages), n(LaneStat::OverlayFixups),
 			              n(LaneStat::OverlayImpossible), n(LaneStat::OverlayLeft),
 			              n(LaneStat::ForeignRetries), n(LaneStat::ReservedOrders),
-			              n(LaneStat::UnreservedBegins), n(LaneStat::ListEndClosures));
+			              n(LaneStat::UnreservedBegins), n(LaneStat::ListEndClosures),
+			              n(LaneStat::KeptSlices), n(LaneStat::KeptBounces),
+			              n(LaneStat::ResumedSegments), n(LaneStat::ResumedNotOldest),
+			              n(LaneStat::DelegatedRecordings), n(LaneStat::OpenAtListEnd));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());

@@ -557,6 +557,12 @@ enum class LaneStat : uint32_t {
 	ReservedOrders,     // obstacle 2: segment orders Thread_Gpu reserved for the lane at the hand-out
 	UnreservedBegins,   //       a lane (not A) began a segment without a reserved order (0 expected)
 	ListEndClosures,    //       lane A's segment closed (and reopened) at the end of an A list
+	KeptSlices,         // obstacle 3: a slice ended (suspended / yielded) with the lane's segment kept open
+	KeptBounces,        //       a flip / service bounce with the lane's segment kept open
+	ResumedSegments,    //       the lane took the token back into its kept segment (no closing)
+	ResumedNotOldest,   //       ... while its segment was not the oldest (0 expected)
+	DelegatedRecordings, //      Thread_Gpu took the token and recorded into the lane's kept segment
+	OpenAtListEnd,      //       a lane's list completed with its segment still open (0 expected)
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
@@ -573,6 +579,21 @@ void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
 // list: segment orders follow list order whatever thread begins first. On in 2b unless
 // KYTY_CP_PAR_RESERVE=0.
 [[nodiscard]] bool LaneReserveEnabled();
+// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): a lane keeps its segment open until the end of its
+// list. When it gives the token back for a request (flip, service: GivingForRequest) or at the end
+// of a slice that did not complete its list (suspended wait, starved, yielded: the slice task calls
+// SetListUnfinished on the lane thread), its segment does not end; Thread_Gpu, taking the token,
+// records into that kept segment (its recording stream, tick lane and image book segment:
+// AdoptSegment / DropSegment) until it gives the token back to the lane, which resumes the
+// segment without beginning a new one. So no list handed out later can get an order older than
+// the rest of an unfinished list. On in 2b unless KYTY_CP_PAR_KEEP=0 (then every slice and bounce
+// ends the segment, as before).
+[[nodiscard]] bool LaneKeepEnabled();
+void               SetListUnfinished(bool unfinished) noexcept;
+[[nodiscard]] bool ListUnfinished() noexcept;
+[[nodiscard]] bool GivingForRequest() noexcept;
+void               AdoptSegment(uint32_t context);
+void               DropSegment();
 void               LaneLockAcquire();
 void               LaneLockRelease();
 [[nodiscard]] bool LaneLockHeld() noexcept;

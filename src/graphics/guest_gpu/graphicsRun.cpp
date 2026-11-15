@@ -102,6 +102,11 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3, cpParallel.h LaneKeepEnabled): the lane whose segment
+// is kept open while the token is back at Thread_Gpu (UINT32_MAX: none; at most one in turn, queue
+// 0 being FIFO), and, on Thread_Gpu, the lane whose kept segment it records into.
+static std::atomic<uint32_t>          g_cp_par_kept_lane {UINT32_MAX};
+static thread_local uint32_t          t_cp_par_adopted = UINT32_MAX;
 // KYTY_CP_SEQ=1: the sequencer thread (the graphics front); only it emits thread-mode ops.
 static thread_local bool g_sequencer_thread = false;
 
@@ -839,6 +844,32 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context begins a segment (2a: in
 					// a new native buffer of its own pool; GetRenderExecutor is then the lane's).
 					const uint32_t stream = CpPar::ThreadLane(); // Astro Bot PC (2a: N lanes)
+					if (const auto kept = g_cp_par_kept_lane.load(std::memory_order_acquire);
+					    CpPar::Lanes2b() && kept != UINT32_MAX) {
+						// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): a segment is kept open (its list
+						// unfinished): no segment begins.
+						auto& scheduler = gpu->m_renderer.GetCommandScheduler();
+						if (stream == kept) {
+							// The lane resumes its own kept segment.
+							g_cp_par_kept_lane.store(UINT32_MAX, std::memory_order_release);
+							CommandRecorder::SetThreadStream(stream);
+							CommandScheduler::SetThreadTickLane(stream);
+							CpPar::NoteLaneStat(stream, CpPar::LaneStat::ResumedSegments, 1);
+							if (!scheduler.LaneSegmentOldest(stream)) {
+								CpPar::NoteLaneStat(stream, CpPar::LaneStat::ResumedNotOldest, 1);
+							}
+							return;
+						}
+						// Thread_Gpu records into the kept segment until it gives the token back to
+						// that lane (its stream, tick range, executor, image book segment).
+						EXIT_IF(stream != 0 || t_cp_par_adopted != UINT32_MAX);
+						CommandRecorder::SetThreadStream(kept);
+						CommandScheduler::SetThreadTickLane(kept);
+						CpPar::AdoptSegment(kept);
+						t_cp_par_adopted = kept;
+						CpPar::NoteLaneStat(kept, CpPar::LaneStat::DelegatedRecordings, 1);
+						return;
+					}
 					CommandRecorder::SetThreadStream(stream);
 					if (CpPar::Lanes2b()) {
 						CommandScheduler::SetThreadTickLane(stream); // Astro Bot PC (2b: tick ranges)
@@ -850,7 +881,31 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 			};
 			hooks.give = [](void* context) {
 				auto* gpu = static_cast<GuestGpu*>(context);
-				if (CpPar::StreamsActive()) {
+				bool  end = CpPar::StreamsActive();
+				if (end && CpPar::Lanes2b() && t_cp_par_adopted != UINT32_MAX) {
+					// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): Thread_Gpu gives the kept segment
+					// back to its lane (which resumes it); nothing ends, nothing is reserved.
+					EXIT_IF(CpPar::ThreadLane() != 0 || CpPar::HandoffTarget() != t_cp_par_adopted);
+					CpPar::DropSegment();
+					CommandRecorder::SetThreadStream(0);
+					CommandScheduler::SetThreadTickLane(0);
+					t_cp_par_adopted = UINT32_MAX;
+					end              = false;
+				} else if (end && CpPar::Lanes2b() && CpPar::ThreadLane() != 0 &&
+				           CpPar::LaneKeepEnabled() &&
+				           (CpPar::GivingForRequest() || CpPar::ListUnfinished())) {
+					// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): the lane's list is unfinished (a
+					// request bounce, or a suspended / yielded slice): its segment stays open.
+					const uint32_t stream = CpPar::ThreadLane();
+					EXIT_IF(g_cp_par_kept_lane.load(std::memory_order_relaxed) != UINT32_MAX);
+					g_cp_par_kept_lane.store(stream, std::memory_order_release);
+					CpPar::NoteLaneStat(stream,
+					                    CpPar::GivingForRequest() ? CpPar::LaneStat::KeptBounces
+					                                              : CpPar::LaneStat::KeptSlices,
+					                    1);
+					end = false;
+				}
+				if (end) {
 					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context ends its segment (still
 					// owning the renderer), the merge point of its image states.
 					const uint32_t stream = CpPar::ThreadLane(); // Astro Bot PC (2a: N lanes)
@@ -2730,10 +2785,19 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 			                                       s.submission->sequence, s.submission->commands,
 			                                       s.handoff, s.lane);
 			    CpPar::NoteResolveTime(s.lane, CpPar::NowNs() - start);
+			    // Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): the give hook that follows keeps the
+			    // lane's segment open while its list is unfinished.
+			    CpPar::SetListUnfinished(s.result != Pm4ProcessResult::Complete);
 		    },
 		    &slice);
 		result  = slice.result;
 		handoff = slice.handoff;
+		if (CpPar::Lanes2b() && result == Pm4ProcessResult::Complete &&
+		    m_renderer.GetCommandScheduler().LaneOrderOpen(slice.lane)) {
+			// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3) control: the list's last slice ended its
+			// segment (0 expected).
+			CpPar::NoteLaneStat(slice.lane, CpPar::LaneStat::OpenAtListEnd, 1);
+		}
 	}
 	if (CpPar::Enabled() && !handoff && result == Pm4ProcessResult::Complete &&
 	    submission.type == SubmissionType::Graphics) {
@@ -6972,7 +7036,9 @@ static void CpParLaneOverlayAtEnd(CommandScheduler& scheduler, uint32_t lane) {
 // of the take hook, on Thread_Gpu for its own lane A (no token passes).
 void GuestGpu::CpParCloseLaneA() {
 	auto& scheduler = m_renderer.GetCommandScheduler();
-	EXIT_IF(CpPar::OnResolver2() || CommandRecorder::ThreadStream() != 0);
+	EXIT_IF(CpPar::OnResolver2() || CommandRecorder::ThreadStream() != 0 ||
+	        t_cp_par_adopted != UINT32_MAX ||
+	        g_cp_par_kept_lane.load(std::memory_order_relaxed) != UINT32_MAX);
 	if (!CpPar::LaneLockHeld()) {
 		scheduler.WaitSegmentTurn(); // never waits in turn (A is the only open segment)
 	}
