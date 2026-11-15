@@ -237,7 +237,7 @@
 //    B".., CommandRecorder::EnableLaneReplay); the recorder thread replays stream 0 only and the
 //    Switch packets no longer chain the rings. The native buffers are still handed to the queue in
 //    list order: a replay thread hands a buffer over only after every earlier one (gate in the
-//    native executor's Submit). Needs no KYTY_GPU_TIMING, GPU op profiler or KYTY_EOP_TIMESTAMPS=gpu
+//    native executor's Submit). Needs no KYTY_GPU_TIMING or GPU op profiler (KYTY_EOP_TIMESTAMPS=gpu: allowed since 3a)
 //    (otherwise 2b runs as 2a). A "CpPar 10s: 2b" line reports each lane's replay (busy time, waits
 //    for its turn).
 //  - tick ranges (step 2, MasterSemaphore::EnableRanges, CommandScheduler): each lane segment

@@ -56,6 +56,10 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(layout == nullptr);
 
+	if (m_master_semaphore.Ranges()) {
+		// Astro Bot PC (KYTY_CP_PAR=2b): the pool retires at the largest tick of its users.
+		m_current_pool_tick = std::max(m_current_pool_tick, m_master_semaphore.CurrentTick());
+	}
 	auto& batch = m_sets[layout];
 	if (batch.size != 0) {
 		return batch.sets[--batch.size];
@@ -64,7 +68,10 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		return batch.sets[--batch.size];
 	}
 
-	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
+	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.Ranges()
+	                                                 ? m_current_pool_tick
+	                                                 : m_master_semaphore.CurrentTick());
+	m_current_pool_tick = 0;
 	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
 		m_current_pool = pool;
 		m_pending_pools.pop_front();

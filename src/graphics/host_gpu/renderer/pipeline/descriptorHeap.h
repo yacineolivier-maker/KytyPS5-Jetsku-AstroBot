@@ -37,6 +37,9 @@ private:
 	MasterSemaphore&                                    m_master_semaphore;
 	vk::DescriptorPool                                  m_current_pool = nullptr;
 	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_pending_pools;
+	// Astro Bot PC (KYTY_CP_PAR=2b, tick ranges): the largest tick any set of the current pool was
+	// handed out at; the pool retires at it (a lane's tick may be below another lane's).
+	uint64_t                                            m_current_pool_tick = 0;
 	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
 };
 

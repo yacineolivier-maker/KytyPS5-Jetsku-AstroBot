@@ -779,7 +779,7 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 									            "order\n");
 								} else {
 									std::printf("Kyty CpPar: 2b unavailable (KYTY_GPU_TIMING, GPU op "
-									            "profiler or KYTY_EOP_TIMESTAMPS=gpu on); running as "
+									            "profiler on); running as "
 									            "2a\n");
 								}
 							}

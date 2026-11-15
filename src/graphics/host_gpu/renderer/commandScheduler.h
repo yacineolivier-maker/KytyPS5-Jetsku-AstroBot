@@ -199,8 +199,10 @@ public:
 	bool               EnableLanes(uint32_t count = 2);
 	// Astro Bot PC (KYTY_CP_PAR=2b, cpParallel.h): after EnableLanes, start-up only. Each lane's
 	// stream gets its own replay thread (CommandRecorder::EnableLaneReplay). Refused (2a goes on)
-	// with KYTY_GPU_TIMING, the GPU op profiler or KYTY_EOP_TIMESTAMPS=gpu (single-producer
-	// rings of the replay or of the recording side).
+	// with KYTY_GPU_TIMING or the GPU op profiler (single-producer rings of the replay).
+	// KYTY_EOP_TIMESTAMPS=gpu is allowed: its ring is used by the recording side only (lanes in
+	// turn), its slot resets and timestamp writes are commands ordered on the GPU by the queue order,
+	// and its read queue is in tick order (ticks stay increasing in list order).
 	bool               EnableLanes2b();
 	[[nodiscard]] bool Lanes2b() const noexcept { return m_lanes_2b; }
 	// Astro Bot PC (KYTY_CP_PAR=2b): tick ranges (MasterSemaphore::EnableRanges) are on with 2b.

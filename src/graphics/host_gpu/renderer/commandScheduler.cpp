@@ -748,7 +748,7 @@ bool CommandScheduler::EnableLanes2b() {
 		return true;
 	}
 	if (!m_lanes || m_recorder == nullptr || m_gpu_timing != nullptr || m_gpu_ops ||
-	    m_eop_timestamps != nullptr || !m_recorder->EnableLaneReplay()) {
+	    !m_recorder->EnableLaneReplay()) {
 		return false;
 	}
 	// Tick ranges (commandScheduler.h): lane 0's current recording is the segment of order 0.
