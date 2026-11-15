@@ -1969,7 +1969,7 @@ void MaybeReport() {
 			              "%s%c: active %.1f ms, slices handed out %" PRIu64 " (back unfinished %" PRIu64
 			              "); turn waits:%s; out-of-turn submits %" PRIu64 ", visible ops not oldest %" PRIu64
 			              ", out of order %" PRIu64 ", dependency hazards %" PRIu64
-			              ", services left to the oldest %" PRIu64 ", retires held for younger %" PRIu64 ", fence holds %" PRIu64 " (timeouts %" PRIu64 "), unfinished-slice flushes %" PRIu64 ", resumed before younger %" PRIu64 ", out-of-order ends %" PRIu64,
+			              ", services left to the oldest %" PRIu64 ", retires held for younger %" PRIu64 ", fence holds %" PRIu64 " (timeouts %" PRIu64 "), unfinished-slice flushes %" PRIu64 ", resumed before younger %" PRIu64 ", out-of-order ends %" PRIu64 ", began beside a kept segment %" PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane),
 			              static_cast<double>(n(LaneStat::ActiveNs)) / 1e6, n(LaneStat::Dispatched),
 			              n(LaneStat::CollectedUnfinished), waits.empty() ? " none" : waits.c_str(),
@@ -1977,7 +1977,7 @@ void MaybeReport() {
 			              n(LaneStat::VisibleOutOfOrder), n(LaneStat::DependencyHazards),
 			              n(LaneStat::YoungerServices), n(LaneStat::RetiresHeld), n(LaneStat::FenceHolds), n(LaneStat::FenceTimeouts),
 			              n(LaneStat::UnfinishedFlushes), n(LaneStat::ResumedBeforeYounger),
-			              n(LaneStat::OutOfOrderEnds));
+			              n(LaneStat::OutOfOrderEnds), n(LaneStat::BeganBesideKept));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b concurrent (%u): overlap 2+ lanes %.1f ms, 3+ lanes %.1f ms; most "

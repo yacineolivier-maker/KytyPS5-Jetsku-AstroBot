@@ -579,6 +579,7 @@ enum class LaneStat : uint32_t {
 	UnfinishedFlushes,  //       an unfinished slice's recording submitted at its end
 	ResumedBeforeYounger, //     a resumed unfinished list placed before younger lists already out
 	OutOfOrderEnds,     //       a list out ended (and is kept) while not at the front of the flights (0 expected)
+	BeganBesideKept,    //       the lane began its slice's segment while an older lane's was kept
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);

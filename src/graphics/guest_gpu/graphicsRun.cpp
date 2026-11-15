@@ -134,6 +134,28 @@ struct CpParPublished {
 };
 CpParPublished g_cp_par_pub;
 } // namespace
+
+// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3 / KYTY_CP_PAR_CONCURRENT=1): a broken invariant of the
+// kept segments; stops with the state that explains it (calling thread's lane, the lane concerned,
+// the kept lane, Thread_Gpu's adopted segment, and the lists out as last published by Thread_Gpu).
+static void CpParHookFatal(const char* what, uint32_t lane, uint32_t kept) {
+	char flights[160] = {};
+	size_t used = 0;
+	const auto count = g_cp_par_pub.flights.load(std::memory_order_relaxed);
+	for (uint32_t i = 0; i < std::min<uint32_t>(count, 4u) && used + 40 < sizeof(flights); i++) {
+		used += static_cast<size_t>(std::snprintf(
+		    flights + used, sizeof(flights) - used, " [list %llu lane %c%s]",
+		    static_cast<unsigned long long>(g_cp_par_pub.flight_seq[i].load(std::memory_order_relaxed)),
+		    CpPar::LaneLetter(g_cp_par_pub.flight_lane[i].load(std::memory_order_relaxed)),
+		    g_cp_par_pub.flight_done[i].load(std::memory_order_relaxed) != 0 ? " ended" : ""));
+	}
+	EXIT("Kyty CpPar 2b: %s: calling thread lane %c, lane %c, kept lane %c, adopted by Thread_Gpu %c, "
+	     "concurrent %d; lists out (last published) %u:%s\n",
+	     what, CpPar::LaneLetter(CpPar::ThreadLane()), lane == UINT32_MAX ? '-' : CpPar::LaneLetter(lane),
+	     kept == UINT32_MAX ? '-' : CpPar::LaneLetter(kept),
+	     t_cp_par_adopted == UINT32_MAX ? '-' : CpPar::LaneLetter(t_cp_par_adopted),
+	     CpPar::LaneConcurrent() ? 1 : 0, count, flights);
+}
 // KYTY_CP_SEQ=1: the sequencer thread (the graphics front); only it emits thread-mode ops.
 static thread_local bool g_sequencer_thread = false;
 
@@ -898,8 +920,14 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					// Astro Bot PC (KYTY_CP_PAR=1b2): this thread's context begins a segment (2a: in
 					// a new native buffer of its own pool; GetRenderExecutor is then the lane's).
 					const uint32_t stream = CpPar::ThreadLane(); // Astro Bot PC (2a: N lanes)
+					// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): a lane handed a list (its order reserved
+					// at the hand-out) may begin its slice after an older lane, still out then, kept
+					// its unfinished segment: that kept segment is not its own, it begins its own
+					// (younger) segment as usual (start-up stop of 15/11 19 h 30). Only the kept lane
+					// resumes and only Thread_Gpu adopts.
 					if (const auto kept = g_cp_par_kept_lane.load(std::memory_order_acquire);
-					    CpPar::Lanes2b() && kept != UINT32_MAX) {
+					    CpPar::Lanes2b() && kept != UINT32_MAX &&
+					    (!CpPar::LaneConcurrent() || stream == kept || stream == 0)) {
 						// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): a segment is kept open (its list
 						// unfinished): no segment begins.
 						auto& scheduler = gpu->m_renderer.GetCommandScheduler();
@@ -916,13 +944,19 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 						}
 						// Thread_Gpu records into the kept segment until it gives the token back to
 						// that lane (its stream, tick range, executor, image book segment).
-						EXIT_IF(stream != 0 || t_cp_par_adopted != UINT32_MAX);
+						if (stream != 0 || t_cp_par_adopted != UINT32_MAX) {
+							CpParHookFatal("a segment begins while another lane's is kept", stream, kept);
+						}
 						CommandRecorder::SetThreadStream(kept);
 						CommandScheduler::SetThreadTickLane(kept);
 						CpPar::AdoptSegment(kept);
 						t_cp_par_adopted = kept;
 						CpPar::NoteLaneStat(kept, CpPar::LaneStat::DelegatedRecordings, 1);
 						return;
+					}
+					if (CpPar::LaneConcurrent() && stream != 0 &&
+					    g_cp_par_kept_lane.load(std::memory_order_acquire) != UINT32_MAX) {
+						CpPar::NoteLaneStat(stream, CpPar::LaneStat::BeganBesideKept, 1);
 					}
 					CommandRecorder::SetThreadStream(stream);
 					if (CpPar::Lanes2b()) {
@@ -960,7 +994,10 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 				if (end && CpPar::Lanes2b() && t_cp_par_adopted != UINT32_MAX) {
 					// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): Thread_Gpu gives the kept segment
 					// back to its lane (which resumes it); nothing ends, nothing is reserved.
-					EXIT_IF(CpPar::ThreadLane() != 0 || CpPar::HandoffTarget() != t_cp_par_adopted);
+					if (CpPar::ThreadLane() != 0 || CpPar::HandoffTarget() != t_cp_par_adopted) {
+						CpParHookFatal("the adopted segment is given to another lane", CpPar::HandoffTarget(),
+						               g_cp_par_kept_lane.load(std::memory_order_relaxed));
+					}
 					CpPar::DropSegment();
 					CommandRecorder::SetThreadStream(0);
 					CommandScheduler::SetThreadTickLane(0);
@@ -972,7 +1009,10 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 3): the lane's list is unfinished (a
 					// request bounce, or a suspended / yielded slice): its segment stays open.
 					const uint32_t stream = CpPar::ThreadLane();
-					EXIT_IF(g_cp_par_kept_lane.load(std::memory_order_relaxed) != UINT32_MAX);
+					if (g_cp_par_kept_lane.load(std::memory_order_relaxed) != UINT32_MAX) {
+						CpParHookFatal("a lane keeps its segment while another is kept", stream,
+						               g_cp_par_kept_lane.load(std::memory_order_relaxed));
+					}
 					g_cp_par_kept_lane.store(stream, std::memory_order_release);
 					CpPar::NoteLaneStat(stream,
 					                    CpPar::GivingForRequest() ? CpPar::LaneStat::KeptBounces
