@@ -255,8 +255,7 @@ void Report(uint64_t window_ns) {
 	// The queue stage split: frame fence holds (the CP was free) versus the CP busy with earlier work.
 	std::printf("Kyty chemin image 10 s (suite) : barriere de trame %.2f/%.1f ms [n=%" PRIu64
 	            "] | CP occupe (traduction cumulee) %.0f ms/s | boucle etiquette GPU eboot 0x114b2f0 "
-	            "%.0f ms/s (%.0f appels/s, tous fils) | etiquettes : 1 sur %u mesuree
-",
+	            "%.0f ms/s (%.0f appels/s, tous fils) | etiquettes : 1 sur %u mesuree\n",
 	            fence.mean_ms, fence.p95_ms, fence.count,
 	            translate.mean_ms * static_cast<double>(translate.count) / seconds,
 	            static_cast<double>(poll_ns) / 1e6 / seconds, static_cast<double>(polls) / seconds,
