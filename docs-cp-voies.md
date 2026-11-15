@@ -23,7 +23,7 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `a2c83dea` | (c) | services et flips renvoyés à Thread_Gpu sous le verrou des voies, Thread_Gpu détenteur délégué | BUILD_OK |
 | `f2e94af8` | (b) | occlusion : état de lot par flux (pool, requêtes, fenêtre, lot) ; émission et emplacements communs | BUILD_OK |
 | `492ed57b` | (a) | `RenderMutex` sans propriétaire en 2b ; position des opérations exécutées du séquenceur par voie | BUILD_OK |
-| (ce commit) | (d) | surcouche d'état d'image par voie (segments plus jeunes), fusion à la fin du plus ancien | BUILD_OK |
+| `c00a785c` | (d) | surcouche d'état d'image par voie (segments plus jeunes), fusion à la fin du plus ancien | BUILD_OK |
 | `ba1b4058` | 4–5 | registre des plages liées/écrites par segment ouvert, attente de dépendance, violations d'ordre (`KYTY_CP_PAR_VERIFY=1`), ligne « CpPar 10s: 2b » complète | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
@@ -280,7 +280,7 @@ Comparer image, i/s (3 tours), stabilité (5 min) à 2a.
 ### Suite
 
 **Après les morceaux (a)–(d) (15/11 soir), ce qui reste avant de lever le jeton** (ordre conseillé) :
-1. Essai en jeu, à tour de rôle, des commits `a2c83dea`…(d) : mêmes attendus que plus haut, plus les nouveaux
+1. Essai en jeu, à tour de rôle, des commits `a2c83dea`…`c00a785c` : mêmes attendus que plus haut, plus les nouveaux
    compteurs à 0. Si « delegated takes » reste à 0 alors que « bounces under it » > 0, ou si le chien de garde
    nomme « cp-par-2b-lane-lock », la délégation (c) est à revoir.
 2. Fin de segment à son tour : un segment plus jeune doit attendre d'être le plus ancien avant sa passation
