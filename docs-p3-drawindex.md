@@ -1,0 +1,174 @@
+# P3 étape 2 : ce que le commit d'un DrawIndex préparé touche d'état partagé entre voies
+
+Relevé du 15/11/2026 (lecture seule du code au commit `1b3a93e7`, trois lectures parallèles : préparation,
+descripteurs/flux, caches). Rien n'a été essayé en jeu. Chemins relatifs à `src\graphics\`.
+
+## Verdict
+
+Aujourd'hui, aucun DrawIndex n'est en lecture seule, même tout préparé et même quand il continue le précédent
+(draw run). Le cas courant écrit encore, sans protection, dans quatre structures communes aux voies : l'anneau
+de flux, le tas de descripteurs, les drapeaux de liaison des images et l'état de layout des images. Trois autres
+obstacles :
+
+- **Deuxième verrou global.** `RenderExecutor::DrawIndex` prend aussi `RenderLockGuard`
+  (`renderDraw.cpp:6202`). En 2b, `RenderMutex` est un mutex ordinaire pour tous les fils
+  (`renderContext.h:52-53`) : il sérialise lui aussi tout le dessin.
+- **`IsGpuThread()` n'est vrai que sous le verrou des voies** (`graphicsRun.cpp:9008`). Hors verrou : les
+  `EXIT_IF(!IsGpuThread())` de `Engine::CommitPublished` (`drawPrep.cpp:1478`) arrêtent le programme ;
+  `DrawPrep::Validate` refuse le certificat (`IsGpuCleanForRead`, `kernel\memory.cpp:1669`) ; le cache de
+  tampons abandonne ses chemins sans verrou (`bufferCache.cpp:3584`, `3613`, `3694`).
+- **Le cache de tampons n'a aucun mutex général.** Tout repose sur l'hypothèse d'un seul fil GPU
+  (`memoryTracker.h:44-49`).
+
+Il faut donc d'abord privatiser par voie quelques structures (§2, C1 à C4) ; ensuite seulement un chemin rapide
+est possible pour le sous-ensemble défini en §3 (a).
+
+## 1. Zone tenue sous le verrou
+
+**Bornes** : de `CpPar::LaneLockAcquire()` (`guest_gpu\graphicsRun.cpp:8857`) à `concurrent_op.Release()`
+(`:8957`) ; prise ré-entrante en `:8934` avec la surcouche d'image.
+
+**Chaîne** : `ExecuteOp` (`:5891`) → `ExecDrawIndex` (`:3787`) → `Engine::CommitPublished`
+(`drawPrep.cpp:1477`) → `CommitHead` → `ReadyHead` (`:1536`) → `Engine::Commit` (`:1850`) →
+`RenderExecutor::DrawIndex` (`renderDraw.cpp:6156`) → `PrepareDrawRenderState` → `ExecutePreparedDraw` →
+`ResetBindings` ; puis `m_after_commit` (`MaybeFlushIdleGpu`), `Retire`, `MaybeYieldSlice`.
+
+**Un seul exemplaire** dans `RenderContext` (`renderContext.h:213-231`) : `CommandScheduler`, `DescriptorHeap`,
+`PipelineCache`, `SamplerCache`, `PageManager`, `BufferCache`, `TextureCache`, `OcclusionCounter`, `LodStats`,
+`RenderMutex`.
+
+**Déjà par voie** (indice `CommandRecorder::ThreadStream()`) : l'exécuteur et ses mémos
+(`renderContext.h:143`) ; l'enveloppe `CommandBuffer` via `Cmd()`/`LaneCmd` (`commandScheduler.h:273-282`) ;
+`DynamicState` (`:146`), encodeur, anneau du rejoueur, pool de tampons de commande ; moteur DrawPrep, fenêtre,
+ouvriers (`LanePrep`, `commandProcessor.h:590`) ; `LaneCp()`, anneau d'instantanés ; lots d'occlusion en 2b
+(`occlusion.cpp:140-145`) ; compteurs Profiler (bloc par fil, `common\profiler.h:1443`).
+
+## 2. Relevé
+
+Légende — **L/É** lecture/écriture ; **C** cas courant, **R** création/téléversement/synchronisation/repli ;
+**Besoin** : **Voie** copie par voie, **Lect.** verrou partagé, **Atom.** atomique, **Global** retomber au
+verrou global.
+
+### 2.1 Bloquants du cas courant
+
+| # | Élément (fichier:ligne) | L/É | Cas | Protection | Besoin |
+|---|---|---|---|---|---|
+| C1 | Anneau de flux `BufferCache::m_stream_buffer` (`bufferCache.h:956`) via `UploadShaderData`→`NativeUpload` (`descriptors.cpp:1372-1380`), petites lectures sales CPU (`bufferCache.cpp:4422-4511`), index 8 bits (`renderDraw.cpp:6334`, `:3445`) ; `m_offset`, `m_mapped_size`, veilles au tick (`streamBuffer.cpp:358-455`) | É | C | rien | **Voie**. Un mutex ne suffit pas : au débordement, `Wait` sur le tick d'une autre voie → `EXIT_IF(tick > CurrentTick())` (`commandScheduler.cpp:306`) ou blocage |
+| C2 | `DescriptorHeap::Commit` (`descriptorHeap.cpp:57-94`, appel `descriptors.cpp:3153`) : `m_sets` (lot de 32), `m_current_pool`, `m_current_pool_tick`, `m_pending_pools` ; allocation Vulkan tous les 32 jeux, pool créé/remis à zéro quand plein | É | C / R | rien (seul le retrait au tick max, `:61-64`, connaît les voies) | **Voie** (pool par voie) |
+| C3 | `Image::binding` (`image.h:58-66`) : posé par `BindImage`/`BindRenderTarget` (`descriptors.cpp:1501-1522`), `DrawRunMarkBindings` (`renderDraw.cpp:2721-2750`) ; effacé par `ResetBindings` (`descriptors.cpp:1524-1531`, appel `renderDraw.cpp:6361`) ; lu par `CommitBindings` (`:2848-2874`) | L/É | C | rien | **Voie** (table ImageId → drapeaux dans l'exécuteur) |
+| C4 | `Image::backing.state` / `subresource_states` : `Transit`/`AdoptState` dans `CommitBindings` (`descriptors.cpp:2835-2884`) et `AcquireRenderTargets` (`renderDraw.cpp:929`, `1078`, `1084`) ; la surcouche `CpParTouch` échange en place (`image\image.cpp:1203-1207`, `1226-1229`) | L/É | C (sauf continuation à images gardées ; une transition sans effet passe aussi par `CpParTouch`) | rien | **Global** dès qu'une transition réelle ; le chemin rapide n'accepte que `TransitIsNoOp` (`image.h:107-113`) sous **Lect.**, ou un état par voie réconcilié à la fusion |
+| C5 | `RenderMutex` (`renderDraw.cpp:6202`) | É | C | lui-même | **Lect.** pour les dessins, exclusif pour la présentation (`swapchain.cpp:1319`, `1347`, `1461`, `1603`) et `graphicsRun.cpp:4422`, `5283`, `5390` |
+| C6 | Identité fil GPU (`graphicsRun.cpp:9008`), ~35 sites dans `host_gpu` dont des changements de chemin : `bufferCache.cpp:3584`, `3613`, `3694`, `3741`, `2816`, `3101` ; `textureCache.cpp:4330`, `5661` ; `kernel\memory.cpp:1247`, `1632`, `1669` | L | C | — | Identité `t_fast_lane` vraie seulement aux sites de lecture sûrs |
+| C7 | `PopReadyOperations` en tête de `DrawIndex` (`renderDraw.cpp:6188` ; `commandScheduler.cpp:358-410`) : rappels différés (destructions, recyclage, `ProcessFaultBuffer`) ; `m_last_pending_refresh_ns` simple (`:375`) | É | C | file seule (`m_operation_mutex`) | **Global** : sauté dans le chemin rapide |
+
+### 2.2 Écritures du cas courant à rendre par voie ou atomiques
+
+| # | Élément | L/É | Cas | Protection | Besoin |
+|---|---|---|---|---|---|
+| W1 | `TouchImage` via `GetImage` : `frame_accessed_last`, `lru_tick`, `m_lru_cache.Touch` (`textureCache.cpp:1221-1254`) | É | C | rien | **Atom.** + LRU différé par voie |
+| W2 | `TouchBuffer` (`bufferCache.cpp:1228-1239`) | É | C | rien | idem |
+| W3 | Mémo de liaison `m_binding_memo`/`m_binding_hot_memo` (`bufferCache.cpp:3967-4127`) | L/É | C | rien ; réservé à `IsGpuThread` (`:3694`) | **Voie** |
+| W4 | Totaux `m_binding_memo_totals`, `m_relaxed_totals`, `m_range_memo_totals`, `m_written_sync_totals` (`bufferCache.h:822-871`) | É | C | non atomiques | **Voie**/**Atom.** |
+| W5 | `m_upload_batch_depth` + `FlushBarriers` sur `Current()` (`bufferCache.cpp:1628-1651`), à chaque dessin (`descriptors.cpp:2198`, `2530`) | É | C | rien | **Voie** |
+| W6 | `image.usage.texture`, `NoteExactRangeStaleUse` (`descriptors.cpp:2303-2305`, `2356-2359`, `2421-2423`) | É | C | rien | **Atom.** |
+| W7 | `feedback_*` de profondeur (`renderDraw.cpp:1119-1135`) | É | C (profondeur) | rien | **Voie**/**Global** |
+| W8 | `g_dynamic_state_emitted` (`renderDraw.cpp:420`, `441`, `5694`, `5713`) | É | C | `static` simple | `thread_local` |
+| W9 | Résumés 10 s appelés par `Engine::Commit` (`drawPrep.cpp:1909-1912`) : `PrintDrawPrepSummary`, `DrawRun::PrintSummary` (`drawRun.cpp:467`), `TexelImageLookup::PrintSummary` (`textureCache.cpp:4462`), `XFrameReuse::PrintSummary` (`xframeReuse.cpp:64`) ; statiques `last_ns`, `last[]`, `calls` | L/É | C | rien | une seule voie, ou `last_ns` atomique |
+| W10 | `OwnedCounters::Add` (`ownedCounters.h:33-49`) | É | C | atomique en mode 0 | imposer le mode 0 |
+| W11 | `g_activity_misses` (`drawRun.cpp:128`, `425-431`), `static logged` (`renderDraw.cpp:2653`, `:667`), `last_ns` (`pipelineCache.cpp:7462`) | É | diagnostic | rien | **Atom.** |
+| W12 | `BufferCache::m_eager_flush` et budget (`bufferCache.cpp:2964-2980`), lus par `MaybeFlushIdleGpu` (`graphicsRun.cpp:1812-1864`, crochet `:6177`) | L/É | C | rien | **Atom.**/**Voie** ; `BufferFlush` sous **Global** |
+| W13 | `CommandScheduler::Active()` lit `m_command.m_registers` de la voie 0 (`commandScheduler.h:136`) que la voie 0 réécrit à chaque dessin (`:118-131`) ; appelé par `ExecuteOp` (`graphicsRun.cpp:5931`), `Image::Transit`, `CheckActive` | L | C | rien (course) | lire `Cmd().m_registers` |
+| W14 | `LaneSegmentOldest` prend `m_operation_mutex` à chaque opération (`commandScheduler.cpp:912-918`, appel `graphicsRun.cpp:8938`) ; `HasRunnableComputeWork` prend `m_queue_mutex` tous les 128 dessins (`:1237`) | L | C | mutex | atomique |
+
+### 2.3 Lectures du cas courant
+
+| # | Élément | Protection | Besoin |
+|---|---|---|---|
+| R1 | `m_slot_images.try_get` (`textureCache.h:561`, `slotVector.h:51-123`) ; `insert`/`erase` hors `m_lock` (`textureCache.cpp:1175`) | rien | **Lect.** + exclusif pour insert/erase |
+| R2 | `image.views` lu sans verrou (`renderDraw.cpp:984`, `descriptors.cpp:2856`) ; `FindView` peut réallouer | rien | **Lect.** |
+| R3 | `needs_rebind`/`registered` (`descriptors.cpp:2321-2325`, `2512-2514` ; `renderDraw.cpp:913-916`, `945-947`) | rien | **Lect.** |
+| R4 | Sous `m_lock` (spinlock exclusif, `textureCache.h:548`) : `TextureBindingMemo::Try*`, `TryRepeatLookup` (`textureCache.cpp:4365-4417`), `DrawRunImagesChange` (`renderDraw.cpp:2610`), `IsRegionGpuModified` (`textureCache.cpp:6316-6354`) ; écrivent aussi (`tick_accessed_last`, LRU, `info.metadata`, `m_surface_metas`, `m_clean_image_pages` `:6351`) | `m_lock` | scinder lecture / écriture différée |
+| R5 | `HasGpuDirtyBytes` : `m_gpu_modified_ranges`, `m_early_released` (`bufferCache.cpp:4945-4951`) | rien | **Lect.** ou seqlock |
+| R6 | `FindBuffer` : `m_page_table`, `m_slot_buffers` (`bufferCache.cpp:2982-2997`) | rien | **Lect.** |
+| R7 | `RangeSignature`, `SyncEpoch::Current()`, `m_bda_structure_epoch` (`bufferCache.cpp:3996-4048`), `QueryDirtyRelaxed` | atomiques | rien si seul le chemin verrouillé change les bits sale |
+| R8 | `m_rebind_epoch = UnregisterEpoch()` (`descriptors.cpp:2532`) | non atomique | **Atom.** |
+| R9 | Certificat DrawPrep : `ShaderMapGeneration`, `Coherence::g_log`, `HasPendingBackingPublication` | atomiques/seqlock | rien (voir risque « validation périmée ») |
+| R10 | Pipeline prévu : `PlannedPipeline` (`bindingPlan.cpp:650-669`), `NotePlannedPipeline` (`pipelineCache.cpp:7262`) | atomiques/TLS | rien |
+| R11 | `DrawRun::g_activity` (`drawRun.cpp:132-163`), `ImageStateEpoch` (`image.h:54`) | atomiques globaux | époque par voie (sinon les continuations s'effondrent) |
+| R12 | Occlusion `GateOpen()` : `m_pairs`, `m_gate_broken` (`occlusion.h:138-140`) | rien | **Lect.**/atomique |
+| R13 | `LodStats::CanaryReady()` (`lodStats.h:68`), `CounterBuffer()` paresseux (`lodStats.cpp:85-97`) | rien | **Atom.**, création à l'init |
+| R14 | `MasterSemaphore` : `IsFree`, `Refresh`, `CurrentTick` (`masterSemaphore.cpp:115-119`) | atomiques | rien ; vérifier que `t_tick_lane` et `ThreadStream` désignent la même voie |
+| R15 | `SyncEpoch::Advance` (`graphicsRun.cpp:8874`), `HangWatchdog::NotePacket` | atomiques | rien |
+
+### 2.4 Création, téléversement, synchronisation, repli : verrou global
+
+- Tampons : `CreateBuffer`/`ResolveOverlaps`/`JoinOverlap`/`DeleteBuffer` (`bufferCache.cpp:3059-3085`,
+  `1241-1257`) ; `SynchronizeBuffer` après la sortie précoce (`:3087`), staging (`:3172`) ; toute liaison
+  **écrite** (`:4524-4538`, `:4566-4578`) ; `PrepareBda` (`renderContext.cpp:391-399`).
+- Textures : `FindImage` (`textureCache.cpp:4118-4282`) ; `FindRenderTarget`/`FindDepthTarget`
+  (`:4631-4726`, **tout dessin dont les cibles ne viennent pas d'une continuation ou d'une réutilisation**) ;
+  `FindTexture`/`FindView` sur mémo raté.
+- Opérations de cible : `DepthStencilCopy` (`depthRenderTarget.cpp:457-497`), `ResolveColorTargets` mode 3
+  (`renderDraw.cpp:6826-6848`), `ConsumeMetadataColorOperation`.
+- `GetGraphicsPrograms` (repli DrawPrep), `GetGraphicsPipelineImpl` (`pipelineCache.cpp:7361-7531`).
+- Occlusion : `Initialize`, `FlushPending`/`FlushBatch` (`occlusion.cpp:164-218`) ; `Drain` du rejoueur
+  (`commandRecorder.cpp:924-973`, `m_drain_serial` partagé).
+- `NoteDepthFeedback`, second passage MRT, `NativeS1`/`n3b`, `BufferFlush`, redémarrage de primitive Scan.
+- DrawPrep : `ReadyHead` qui prépare lui-même (`drawPrep.cpp:1545-1548`) ou vole (`AwaitHead`) ; garde-fou
+  2 ms → `ProcessCommands` (`:1588-1590`) qui prend le verrou des voies (interblocage si un verrou lecteur est
+  tenu).
+
+Listes de retrait : `DeferRetire` (`commandScheduler.cpp:1016-1044`, tick de la voie la plus jeune ouverte en
+concurrent) ; `DescriptorHeap::m_pending_pools` (sans verrou) ; veilles de l'anneau (sans verrou) ;
+`m_pending_operations`/`m_held` (`m_operation_mutex`) ; pipelines remplacés détruits après 60 s d'horloge
+(`pipelineCache.cpp:4114`, `4417-4423`).
+
+## 3. Conclusions
+
+### (a) Condition du chemin rapide sûr
+
+Prérequis : C1, C2, C3, C5, C6, W5 faits ; reste de §2.2 atomique ou par voie ; verrous lecteurs de §2.3.
+Ensuite, un DrawIndex est rapide si et seulement si, sous les verrous lecteurs tenus jusqu'à la fin de
+l'enregistrement :
+
+1. Dessin publié : `DrawFlagPublished`, sans `DrawFlagInheritInstances` avec `m_pending_num_instances` non
+   vide, sans instantané de registres (`graphicsRun.cpp:3796-3807`).
+2. Emplacement prêt : `window.HeadDone()` avant la prise (ni `TryClaimHead`, ni vol, ni attente).
+3. Préparation acceptée : `prepared.ok`, `DrawPrep::Validate` vrai (`renderDraw.cpp:2029-2030`) ; plan valide
+   et `hw_checks_quiet` (`:806-807`) ; `PlannedPipeline != nullptr`.
+4. Aucune opération de cible (`MayRunTargetOperation(hw) == false`, `renderDraw.cpp:1287-1297`) ; pas
+   d'index 8 bits ; pas de redémarrage Scan ; `m_mrt_split_slots == 0`.
+5. Cibles d'une continuation (`m_run_active`) ou d'une réutilisation (`DrawRunAcquireCandidate == On`,
+   `:3180-3229`).
+6. Textures : succès de mémo (`HitImage`, `textureBindingMemo.cpp:244-253`), `!entry.dcc`, `RefreshIsNoOp`
+   (`:165-179`) ; transitions `TransitIsNoOp`.
+7. Tampons en lecture seule et propres (mémo `bufferCache.cpp:4012-4066` ou `RelaxedNothingToUpload`) ; aucun
+   hors flux ; aucune liaison écrite ; `UnregisterEpoch()` inchangée.
+8. Aucun mémo d'échantillonneur raté, pas de réduction d'occlusion due, pas de `Handle()`/`Drain`.
+9. Rien de mondial : `PopReadyOperations` sauté ; pas de `BufferFlush` dû ; pas de fin de tranche.
+
+Échec avant tout enregistrement → lâcher les verrous lecteurs, prendre le verrou global, chemin normal. Les
+décisions 5 à 7 doivent précéder toute commande enregistrée.
+
+### (b) Part des 8 µs qui resterait sous verrou
+
+Non mesurable dans la build MC (`KYTY_CP_COMMIT_STATS` exige `KYTY_CP_DIAGNOSTICS=ON`). Estimation : pour un
+dessin qui passe (a), rien sous le verrou exclusif des voies ; 0,5 à 1 µs restent sérialisés si `m_lock` reste
+un spinlock exclusif (2 à 4 prises par dessin), ~0 avec un verrou lecteur. Pour l'ensemble, tout dépend de la
+part qui passe (a) : à mesurer avec le compteur « aurait été rapide » (`KYTY_CP_PAR_FASTCHECK=1`). L'objectif
+« temps tenu divisé par 3 » demande qu'environ 70 % des DrawIndex passent.
+
+### (c) Risques de perte du GPU et détection par `KYTY_CP_PAR_VERIFY`
+
+| Risque | Mécanisme | Détection |
+|---|---|---|
+| Plage de flux réécrite en vol (C1) | deux voies dans `Map`/`Commit` ; plage datée d'un tick d'une autre voie | registre des plages (voie, tick, début, fin) : chevauchements vivants, recyclages avant `IsFree` |
+| Jeu de descripteurs donné deux fois (C2) | `--batch.size` concurrent ; pool remis à zéro trop tôt | table jeu → (voie, tick) ; au retrait d'un pool, tick ≥ max des ticks de ses jeux |
+| Mauvais `oldLayout` / liaison effacée (C3, C4) | `ResetBindings` d'une autre voie ; ordre d'enregistrement ≠ ordre de soumission | journal par voie (image, layout d'entrée, de sortie) comparé à la fusion ; étendre `NoteLaneBuffer` (`commandScheduler.cpp:778`) aux images et cibles |
+| Objet libéré encore référencé | `DeleteBuffer`/`FreeImage`/`DeferOperation` ; `erase` de `m_slot_images` hors verrou | tick de dernière liaison par objet ; compter les retraits plus tôt, ou pendant un verrou lecteur |
+| Écriture GPU non vue entre voies | barrières dans le seul tampon de la voie qui écrit | registre étendu aux images ; « dependency hazards » / « order violations » à 0 |
+| Validation périmée | certificat et mémos lus, puis transition d'une autre voie | revalidation brève sous verrou après un dessin rapide (générations, époques, signatures) : compteur « fast draw stale » |
+| Seul écrivain des bits sale rompu (`memoryTracker.h:44-49`) | deux voies effacent/posent des bits | comme `KYTY_CP_OWNED_COUNTERS=verify` : compter les écritures depuis un fil en chemin rapide |
+
+Non vérifié : durée de vie des programmes de `state.programs` face à une éviction ; atteignabilité en 2b des
+chemins qui ne posent que `SetThreadStream` ; contenu exact des rappels différés ; mode dense de `SlotVector`.
