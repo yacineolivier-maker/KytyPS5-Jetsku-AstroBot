@@ -236,6 +236,14 @@ public:
 	// segment is the oldest (always in turn); the lane whose open segment follows lane `lane`'s
 	// (its order + 1), or UINT32_MAX.
 	[[nodiscard]] bool     LaneSegmentOldest(uint32_t lane);
+	// Astro Bot PC (KYTY_CP_PAR=2b, suite 1): the calling thread's lane waits until its open
+	// segment is the oldest (never in turn; counted as a submit turn wait). Never with the lanes'
+	// lock held (the older segment needs it to end).
+	void WaitSegmentTurn() {
+		if (m_lanes_2b) {
+			WaitLaneTurn(LaneIndex());
+		}
+	}
 	[[nodiscard]] uint32_t LaneSuccessor(uint32_t lane);
 	[[nodiscard]] bool Lanes() const noexcept { return m_lanes; }
 	[[nodiscard]] uint32_t LaneCount() const noexcept { return m_lane_count; }

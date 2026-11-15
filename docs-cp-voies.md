@@ -215,6 +215,24 @@ crochet de passation qui suit une requête (sinon ce crochet, qui prend le verro
 tient : interblocage). Hors opérations, les services et flips d'un segment plus jeune toucheraient l'état global
 (à faire attendre leur tour en 3b-3).
 
+**Essai en jeu (session principale, 15/11 17 h 17, (a)–(d)).** Aerial Garden, préréglage U59 : N=2 20,8 i/s,
+N=3 22,3, vérification 22,4 ; aucune perte du GPU ni blocage ; order violations, occlusion early batches, seq
+position below et surcouche à 0 partout. « delegated takes » 0 : **normal si « bounces under it » est aussi à 0**
+(une prise déléguée n'a lieu que dans le crochet de passation qui suit un renvoi fait sous le verrou ; une prise
+non déléguée à cet endroit aurait bloqué Thread_Gpu sur le verrou tenu par la voie : l'absence de blocage montre
+que, s'il y a eu des renvois, la délégation a joué). Les voies B/C n'ont vraisemblablement ni flip ni service.
+
+**Suite 1 et 2 (même commit).** (1) `CommandScheduler::WaitSegmentTurn()` (public, attend que le segment de la
+voie du fil soit le plus ancien ; compté comme « submit turn waits ») : avant la passation (crochet `give`, hors
+verrou ; sous verrou, c'est-à-dire pendant un renvoi, l'attente a été faite avant de le prendre) et avant tout
+flip ou service renvoyé par une voie à Thread_Gpu (avant la prise du verrou : attendre en le tenant bloquerait le
+segment plus ancien). (2) `GuestGpu::ProcessCommands` prend le verrou des voies lui-même (`CpPar::LaneLockScope`,
+ré-entrant, délégué) : tous les appelants (boucle principale de Thread_Gpu, attentes DrawPrep, frontières
+d'opérations) ; le vidage d'occlusion de l'exécuteur (`counter.Dump`, aussi atteint hors opération en mode direct)
+prend le verrou avant le `RenderMutex` (même ordre qu'une opération). À tour de rôle : aucune attente (le segment
+qui tourne est toujours le plus ancien), « dumps outside the lock » doit tomber à 0.
+
+
 
 
 

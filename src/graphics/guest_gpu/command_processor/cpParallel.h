@@ -566,6 +566,26 @@ void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
 void               LaneLockAcquire();
 void               LaneLockRelease();
 [[nodiscard]] bool LaneLockHeld() noexcept;
+// Astro Bot PC (KYTY_CP_PAR=2b, suite 2): the lanes' lock for a scope, in 2b with the lock on
+// (re-entrant; delegated on Thread_Gpu serving the holder); nothing otherwise.
+class LaneLockScope {
+public:
+	LaneLockScope(): m_on(Lanes2b() && LaneLockEnabled()) {
+		if (m_on) {
+			LaneLockAcquire();
+		}
+	}
+	~LaneLockScope() {
+		if (m_on) {
+			LaneLockRelease();
+		}
+	}
+	LaneLockScope(const LaneLockScope&)            = delete;
+	LaneLockScope& operator=(const LaneLockScope&) = delete;
+
+private:
+	bool m_on;
+};
 
 enum class Fallback : uint32_t {
 	NoSequencer, // KYTY_CP_SEQ is not 1 (or the sequencer is off): no op ring to split

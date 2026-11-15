@@ -856,6 +856,12 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					const uint32_t stream = CpPar::ThreadLane(); // Astro Bot PC (2a: N lanes)
 					CommandRecorder::SetThreadStream(stream);
 					if (CpPar::Lanes2b()) {
+						// Astro Bot PC (KYTY_CP_PAR=2b, suite 1): a younger segment hands off only
+						// as the oldest (overlay rule, morceau (d)); with the lanes' lock held (a
+						// bounce) the wait was made before taking it.
+						if (!CpPar::LaneLockHeld()) {
+							gpu->m_renderer.GetCommandScheduler().WaitSegmentTurn();
+						}
 						// Astro Bot PC (KYTY_CP_PAR=2b, morceau (d)): overlay merge point.
 						CpParLaneOverlayAtEnd(gpu->m_renderer.GetCommandScheduler(), stream);
 					}
@@ -934,6 +940,12 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	if (m_pending_commands.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	// Astro Bot PC (KYTY_CP_PAR=2b, suite 2): every caller (Thread_Gpu's main loop, draw-prep
+	// waits, op boundaries) runs the services under the lanes' lock (re-entrant, delegated).
+	const CpPar::LaneLockScope lane_lock;
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -5102,6 +5114,9 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 				bool sync = false;
 				bool kept = false;
 				{
+					// Astro Bot PC (KYTY_CP_PAR=2b, suite 2): the counter's common state under the
+					// lanes' lock also outside an op (direct mode); before the renderer lock.
+					const CpPar::LaneLockScope lane_lock;
 					RenderLockGuard lock(m_renderer.GetMutex());
 					auto&             counter = m_renderer.GetOcclusionCounter();
 					sync = counter.Dump(event_address);
@@ -7852,6 +7867,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			// Astro Bot PC (KYTY_CP_PAR=2b, morceau (c)): under the lanes' global lock, like an op;
 			// bounced to Thread_Gpu, which runs them as the lock's delegated holder.
 			const bool lane_lock = CpPar::Lanes2b() && CpPar::LaneLockEnabled();
+			if (lane_lock && CpPar::OnResolver2()) {
+				// Astro Bot PC (KYTY_CP_PAR=2b, suite 1): the bounce ends the segment and the
+				// services touch global states: only as the oldest segment.
+				GetScheduler().WaitSegmentTurn();
+			}
 			if (lane_lock) {
 				CpPar::LaneLockAcquire();
 			}
@@ -8054,6 +8074,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			// meanwhile; Thread_Gpu runs the flip as its delegated holder (LaneLockHeld).
 			const bool lane_lock = CpPar::Lanes2b() && CpPar::LaneLockEnabled();
 			if (lane_lock) {
+				GetScheduler().WaitSegmentTurn(); // Astro Bot PC (2b, suite 1): flips in turn
 				CpPar::LaneLockAcquire();
 			}
 			RunOnGpuThreadScoped(body);
