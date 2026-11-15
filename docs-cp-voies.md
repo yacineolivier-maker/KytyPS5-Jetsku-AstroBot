@@ -4,7 +4,7 @@ Branche `cp-voies` (partie de `mt-liaisons`). Conception : `docs\CONCEPTION-MULT
 étapes P1 et P2). Les essais en jeu sont faits par la session principale ; rien de ce qui suit n'a encore été
 essayé en jeu.
 
-## P2 « voies simultanées » (`KYTY_CP_PAR=2b`) — état au 15/11/2026 soir (morceaux (a)–(d) et obstacles 1–3 faits, à tour de rôle)
+## P2 « voies simultanées » (`KYTY_CP_PAR=2b`) — état au 15/11/2026 soir (morceaux (a)–(d) et obstacles 1–3 faits, à tour de rôle ; obstacles 4–5 faits derrière `KYTY_CP_PAR_CONCURRENT=1`, non essayés en jeu)
 
 **Ce qui est fait : les étapes 1, 2, 4 et 5. Ce qui n'est pas fait : l'étape 3 (les voies traduisent encore à
 tour de rôle, par le jeton de 2a ; il n'y a pas encore de verrou global des caches).** 2b ne peut donc pas encore
@@ -28,6 +28,9 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `9e7f0ce0` | obstacle 2 | ordre réservé par Thread_Gpu à la remise de la liste ; segment de A fermé à la fin de chaque liste A (`KYTY_CP_PAR_RESERVE=0` coupe) | BUILD_OK |
 | `25a85844` | obstacle 3 | une voie garde son segment jusqu'à la fin de sa liste ; Thread_Gpu enregistre entre-temps dans ce segment (`KYTY_CP_PAR_KEEP=0` coupe) | BUILD_OK |
 | `ba1b4058` | 4–5 | registre des plages liées/écrites par segment ouvert, attente de dépendance, violations d'ordre (`KYTY_CP_PAR_VERIFY=1`), ligne « CpPar 10s: 2b » complète | BUILD_OK |
+| `69c35cc1` | obstacle 4 | `KYTY_CP_PAR_CONCURRENT=1` : listes confiées sans attendre, recueillies dans l'ordre | BUILD_OK |
+| `c89637e1` | obstacle 5 | attente du tour avant toute opération visible ; retraits partagés tenus ; `Finish` par voie | BUILD_OK |
+| `68d86418` | compteurs | ligne « CpPar 10s: 2b concurrent », contrôles d'ordre | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
 
@@ -239,6 +242,126 @@ qui tourne est toujours le plus ancien), « dumps outside the lock » doit tombe
 
 
 
+### `KYTY_CP_PAR_CONCURRENT=1` : obstacles 4 et 5 — faits le 15/11 au soir (non essayés en jeu)
+
+Trois commits compilés (BUILD_OK chacun, aucun nouvel avertissement hors « profile data may be out of
+date » des fonctions modifiées, inhérent au PGO). **Défaut 0 : rien ne change** (tout est derrière
+`CpPar::LaneConcurrent()`, faux sans la variable). Le mode ne s'active qu'en 2b avec verrou des voies,
+surcouche, réservation et segments gardés actifs (sinon message « need … ; lanes stay in turn ») ;
+les commits `69c35cc1` et `c89637e1` ne doivent pas être essayés séparément (le premier seul exécuterait
+des opérations visibles hors tour).
+
+**Ce que fait le mode (obstacle 4, `69c35cc1`).**
+- Répartition : les listes graphiques de la file 0 vont **aux voies B.. seulement** (rang r → voie
+  1 + (r − 1) mod (N − 1)). Avec N = 2 tout va à B : aucun recouvrement possible (le mode tourne mais ne
+  sert qu'à vérifier la mécanique). **Il faut N = 3 (B et C alternent) ou N = 4** pour que deux listes
+  se recouvrent. Restent sur Thread_Gpu : listes à moteur de constantes (repli A), préparations de flip.
+- Thread_Gpu ne prend plus le jeton : `CpParConcurrentStep` (début de chaque tour de sa boucle)
+  1) interroge chaque voie dehors (`PollSlice` : sert sa requête flip/services en détenteur délégué du
+  verrou, comme `RunSlice`), 2) recueille les tranches finies **dans l'ordre des listes** (retrait de la
+  file, `m_in_flight`, comptes ; ramasse-miettes différé à un moment sans liste dehors), 3) confie la tête
+  de la file 0 à sa voie si elle est libre (`RunSliceAsync`), l'ordre de segment réservé à la remise
+  (`ReserveLaneOrder`, ou crochet `give` qui ferme d'abord le segment de A). **Rien n'est confié
+  au-delà d'une liste inachevée** (segment gardé) : seule cette liste repart. Variante non faite :
+  segments A intercalés à ordre réservé.
+- Travail propre de Thread_Gpu (autres files, services de sa boucle, listes A, préparations de flip) :
+  seulement quand aucune liste n'est dehors (il ouvre alors son segment A, plus jeune que tout), ou
+  quand la tête est une liste inachevée revenue (il adopte son segment gardé, le plus ancien) — et
+  alors **sous le verrou des voies** tant que des listes plus jeunes sont dehors. Sinon il attend
+  (`WaitDispatchEvent`, réveil par les voies et `Enqueue`, 1 ms au plus).
+- Une voie ne termine sa liste, et ne garde un segment inachevé, qu'à son tour (attente hors verrou),
+  puis toute la fin (fusion de surcouche, soumission de passation, avance du tour) sous le verrou :
+  aucune opération plus jeune ne s'intercale entre la fusion et la fin du segment. Crochets `take`
+  sous le verrou aussi. Les voies n'empruntent plus `g_gpu_thread` (`IsGpuThread` = détenteur du
+  verrou). Le contrôle de `Submit` « une seule voie a un tampon ouvert » est levé dans ce mode (les
+  plages de ticks et la porte d'ordre du rejeu gardent l'ordre de la file).
+
+**Obstacle 5 (`c89637e1`).** Dans `ResolveSubmission`, chaque opération est classée
+(`CpParTurnReason`, repris de 1b3–1b5, prudent) : **attendent le tour** (hors verrou) les étiquettes
+et fins de canal (EndOfPipe, ReleaseMem, EventWrite), écritures (WriteData, DmaData, horloges,
+LodStats, DumpConstRam), attentes (WaitRegMem, prédication, COND_EXEC, branches, lectures pas à pas,
+ReadCheck), tirages indirects, tirages qui héritent du nombre d'instances ou sans registres, flips ;
+puis **toute l'opération** (liaison des registres, vidange de fin de canal par nombre de paquets
+comprises) se fait sous le verrou. **Hors tour** : tirages et dispatchs directs portant leurs registres
+(instantané ou emplacement préparé) — le travail Vulkan pur ; pour un segment plus jeune ils tournent
+sur la surcouche d'image de sa voie. En plus, une voie plus jeune : ne fait aucune soumission
+facultative (vidange « GPU au repos », lot de fins de canal, relecture anticipée), ne cède pas sa
+tranche aux files de calcul, ne lance aucun service (ni en tête de boucle, ni dans une attente
+DrawPrep : `ProcessCommands` les laisse à la plus ancienne), attend ses opérations du séquenceur sur
+place au lieu de rendre sa tranche. Sûreté sous simultanéité :
+- soumission forcée dans une opération hors tour (verrou tenu) : elle **part hors tour** au lieu
+  d'attendre (attendre bloquerait les segments plus anciens) ; son tick est dans la plage du segment et
+  la porte d'ordre du rejeu ne remet le tampon qu'après tous les ordres plus anciens ;
+- `Finish` (attente GPU des prédications d'occlusion, vidages proxy, services de démappage) n'attend
+  que le dernier tick de la voie appelante et des segments terminés (pas une soumission hors tour plus
+  jeune, que le GPU ne verra qu'après la fin du segment appelant) ;
+- **retraits partagés** (`DeferRetire`) : destruction d'un tampon ou d'une image du cache, et du LDS de
+  calcul commun, tenue avec le segment ouvert le plus jeune et mise en file à son tick quand il devient
+  le plus ancien (sinon la voie plus ancienne libérerait au plus tôt un objet déjà utilisé par une plus
+  jeune : perte du GPU) ;
+- registre de dépendances (`KYTY_CP_PAR_VERIFY=1`) : une liaison se fait dans une opération, verrou
+  tenu ; elle n'attend plus le segment plus ancien écrivain (interblocage), l'aléa est compté.
+- Partagés restants : `m_synthetic_occlusion_counter` (EventWrite) et `m_num_instances` /
+  `m_pending_num_instances` (écrits par les tirages indirects, lus par les tirages qui héritent) ne sont
+  touchés que par des opérations du tour, donc par le segment le plus ancien, dans l'ordre des listes,
+  sous le verrou : comme à tour de rôle. Le contrôle « retries pending at list start » ne lit plus que
+  le champ de la voie elle-même dans ce mode.
+
+**Ligne « CpPar 10s: 2b concurrent (N) »** (`68d86418`) : « overlap 2+ lanes x ms, 3+ lanes y ms »
+(temps où au moins 2 / 3 voies traduisent : dans une tranche, hors attente du tour, du verrou et du
+séquenceur — c'est le recouvrement réel) ; « most lists out » ; « Thread_Gpu own work under the lanes'
+lock » ; « garbage collections deferred » ; par voie : « active » (temps de traduction), « slices handed
+out (back unfinished) », « turn waits: » par type (submit, label, write, wait, indirect, draw, flip,
+service, slice, list-end, other : nombre et ms), « out-of-turn submits », « visible ops not oldest »,
+« out of order », « dependency hazards », « services left to the oldest », « retires held for younger ».
+Au démarrage : « 2b lanes run their lists at the same time: requested (KYTY_CP_PAR_CONCURRENT) » puis
+« 2b concurrent lanes: on (lists on lanes B.. only, k lane(s) translating …) ».
+
+**À vérifier en jeu** (session principale ; mêmes variables que plus bas, plus
+`KYTY_CP_PAR_CONCURRENT=1`, **`KYTY_CP_PAR_LANES=3`** puis 4) :
+1. Pas de perte du GPU, pas de blocage (chien de garde : noms « cp-par-2b-submit-turn »,
+   « cp-par-2b-lane-lock », « cp-all-queues-suspended »), image correcte (contrôle visuel obligatoire).
+2. **0 attendu** : visible ops not oldest, out of order (journal « Kyty CpPar 2b concurrent: … » si non
+   nul), order violations, early retires avoided, seq position below, impossible, left, open at list
+   end, resumed not oldest, unreserved begins ; turn waits « slice » ≈ 0 (une voie plus jeune ne revient
+   inachevée que si elle est devenue la plus ancienne).
+3. **Non nuls attendus** : overlap 2+ lanes > 0 (sinon aucun gain possible ; avec N = 2 il reste à 0),
+   turn waits label/write/wait/list-end sur B et C, overlay ops/images/fix-ups > 0 (les segments plus
+   jeunes sont maintenant exercés : la surcouche et ses correctifs servent pour de bon ; « not no-ops »
+   de la ligne 1b2 peut devenir non nul, ce sont ces correctifs), held operations > 0, submit turn waits
+   > 0, retires held > 0 possible.
+4. À relever : out-of-turn submits (combien de soumissions forcées dans des tirages), dependency hazards
+   (avec `KYTY_CP_PAR_VERIFY=1` ; chacun est une lecture possible d'une plage avant l'écriture d'un
+   segment plus ancien : à traiter par l'obstacle 6), i/s comparés à 2b à tour de rôle (N = 3).
+   Aucun gain n'est garanti : les opérations restent sérialisées par le verrou des voies ; seul le
+   travail entre opérations (séquenceur, DrawPrep, rejeu) se recouvre. Le gain de traduction viendra de
+   P3 (sortir du verrou).
+5. En cas de problème : revenir à `KYTY_CP_PAR_CONCURRENT=0` (comportement d'avant, à tour de rôle) ;
+   il n'y a pas d'interrupteur par morceau à l'intérieur du mode (4 sans 5 n'est pas sûr) ; les
+   interrupteurs `KYTY_CP_PAR_LOCK/OVERLAY/RESERVE/KEEP=0` coupent le mode entier (prérequis).
+
+**Risques restants (concurrent).**
+- **Blocage** (pas une perte) si, dans un tirage hors tour, une voie plus jeune attend le GPU sur son
+  propre tick (relecture CPU forcée après une soumission hors tour) ou attend de la place (anneau du
+  rejeu plein, 16 Mo, derrière une soumission hors tour en attente de la porte d'ordre ; pool de
+  descripteurs ou flux épuisé attendant un tick plus ancien non soumis) : le verrou tenu empêche la
+  plus ancienne de finir. Non observé (non essayé) ; « out-of-turn submits » en donne la fréquence.
+- **Données d'ordre** (image fausse, pas de perte attendue) : un tirage plus jeune lit une plage
+  (tampon, image, cible) qu'une liste plus ancienne écrit ensuite au CPU ou dont l'état de barrière du
+  cache est mis à jour dans un ordre différent — c'est l'obstacle 6 (registre permanent avec images et
+  cibles). Les états d'image passent par la surcouche ; les tampons non.
+- **Perte du GPU encore possible** si un objet partagé est libéré « au tick de l'appelant » par une
+  voie plus ancienne ailleurs que dans les trois retraits convertis (`DeferRetire`) : vues et autres
+  objets détruits hors `DeferOperation`, recyclage interne d'un cache (`TrimRetiredImages` réutilise
+  les images natives retirées : couvert puisque l'image n'est retirée qu'à l'effacement de son
+  emplacement, tenu). Les temporaires par opération (tampons de mise en place, tuilage) restent au
+  tick de l'appelant (utilisés par lui seul).
+- Un service exécuté par la voie la plus ancienne (démappage) pendant qu'une voie plus jeune a déjà
+  enregistré un accès à la plage démappée : `Finish` ne couvre pas cet enregistrement non soumis
+  (le jeu ne démappe normalement que ce qu'aucune liste en attente n'utilise).
+- Statistiques globales (CommitStats, PrepPhases, DrawPrep) mélangées entre voies ; le décompte
+  DrawPrep par voie de la ligne 2a n'est plus fait pour les listes confiées.
+
 ### Obstacles 1, 2 et 3 de la passation ci-dessous — faits le 15/11 (toujours à tour de rôle, non essayés en jeu)
 
 Trois commits compilés (BUILD_OK chacun), sans 2b rien ne change (tout est derrière `Lanes2b()`).
@@ -315,6 +438,10 @@ vide de plus est possible quand une liste A se termine sans rien avoir enregistr
 ### Passation (15/11 soir, après `b758f3d3`) : `KYTY_CP_PAR_CONCURRENT=1` non commencé
 
 **Mise à jour (après `25a85844`) : les obstacles 1, 2 et 3 sont levés (section précédente). Restent 4 à 7.**
+**Mise à jour (après `68d86418`) : 4 et 5 sont faits derrière `KYTY_CP_PAR_CONCURRENT=1` (section
+« obstacles 4 et 5 » plus haut). Restent 6 (registre de dépendances permanent avec images et cibles de
+rendu, au lieu des aléas seulement comptés) et 7 pour la partie temps sous verrou déjà présente ; puis
+P3 (lectures sans verrou).**
 Pour 4 (boucle des files sans attente de la tranche), noter ce que 2 et 3 imposent : en simultané, la voie A ne
 pourra pas « adopter » le segment d'une autre voie en attente sans s'arrêter (règle de 3, faite pour le tour de
 rôle) ; il faudra soit que Thread_Gpu ne confie pas de liste au-delà d'une tête suspendue (et n'enregistre rien en
