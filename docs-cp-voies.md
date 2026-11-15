@@ -236,6 +236,50 @@ qui tourne est toujours le plus ancien), « dumps outside the lock » doit tombe
 
 
 
+### Passation (15/11 soir, après `b758f3d3`) : `KYTY_CP_PAR_CONCURRENT=1` non commencé
+
+Demandé : lever le jeton (désactivé par défaut, sur 2b). **Pas écrit**, faute de place, et parce que l'examen du
+code a montré des obstacles qu'il faut traiter avant, sous peine d'un mode qui bloque ou perd le GPU dès le premier
+essai. Relevé (vérifié dans le code, `graphicsRun.cpp`) :
+1. **Champs du `CommandProcessor` encore communs**, modifiés entre les opérations, hors verrou : `m_retry_op`,
+   `m_resolver_packets`, `m_executing`, `m_verifier`, `m_resolve_lane` (1b1), instantanés et fenêtre de
+   `ResolveSubmission` (1b3 les sauvait/restaurait autour de chaque opération de la course en avant : l. ~7590,
+   `saved_packets`, `saved_retry`). À mettre dans `LaneCpState` (indice = contexte de l'anneau) avant tout.
+2. **Ordre des segments = ordre des listes.** Les plages de ticks sont réservées à `BeginContextSegment`, dans
+   l'ordre où les segments commencent. En simultané, Thread_Gpu doit fermer son segment de voie A à la fin de
+   *chaque* liste A (aujourd'hui il reste ouvert jusqu'au passage du jeton), et une voie ne doit commencer le
+   segment de la liste n+1 qu'après la réservation de celui de la liste n. Le plus simple : Thread_Gpu réserve
+   l'ordre au moment où il confie la liste (nouvelle fonction `MasterSemaphore::BeginRangeFor(lane)` appelée
+   par Thread_Gpu, consommée par la voie à son `BeginContextSegment`).
+3. **Tranches qui cèdent ou se suspendent** (`Pm4ProcessResult::Blocked`, attente `WAIT_REG_MEM` non passée,
+   `m_yield`) : aujourd'hui la tranche se termine (passation = fin de segment) et la liste reprend plus tard dans
+   un nouveau segment. En simultané, un segment plus jeune aurait alors déjà réservé un ordre plus petit que la
+   reprise : remise hors ordre, **perte du GPU**. Règle à écrire : en mode simultané, une voie garde son segment
+   ouvert jusqu'à la fin de sa liste (elle attend sur place, sans passation), ou bien Thread_Gpu ne regarde
+   au-delà de la tête que si la tête n'est pas suspendue.
+4. **Boucle des files** (`ProcessGraphicsSequenced` → `CpPar::RunSlice`, l. ~2703) : remplacer l'appel
+   bloquant par `RunSliceAsync(lane)` + constat de fin (état `SliceDone` déjà présent dans `Resolver2`) ; le
+   retrait de la tête de file 0, `NoteCompleted`, `RunGarbageCollector`, `NoteStarted` du séquenceur et la
+   barrière de trame doivent rester dans l'ordre des listes (seulement quand la tête est finie). Les hooks
+   `take`/`give` du jeton (début/fin de segment, `g_gpu_thread`) deviennent début/fin de tranche sur le fil de
+   la voie, sans jeton.
+5. **Opérations visibles par le jeu** (à faire attendre le tour, `WaitSegmentTurn`, hors verrou) : `EndOfPipe`,
+   `ReleaseMem`, `WriteData` hors étiquettes internes, `WaitRegMem` sur une valeur d'une autre liste, toute
+   opération qui lève une interruption, lectures GPU par le CPU (renvois de service). Classement à reprendre de
+   1b4/1b5 (`CpParOpRaisesInterrupt`, `CpWriteRange`). Flips et services : faits (suite 1).
+6. **Registre des dépendances** permanent : `NoteLaneBuffer` n'enregistre que les tampons de stockage ; images et
+   cibles absentes ; une écriture d'un segment plus ancien sur une plage déjà liée par un plus jeune reste une
+   violation non réparable (P4).
+7. Compteurs demandés (temps de traduction superposé, temps sous verrou, attentes) : le temps sous verrou et
+   les attentes (verrou, tour, dépendances) existent déjà dans la ligne 2b ; le temps superposé reste à ajouter
+   (somme des intervalles où ≥ 2 voies sont dans `ResolveSubmission`).
+
+Points où, une fois écrit, une **perte du GPU** serait possible : 2, 3 (ordres), 1 (champs communs : paquets ou
+reprises mélangés entre voies), barrières d'image si une opération plus jeune échappe à la surcouche (services,
+chemins hors `ExecuteOp`), retraits au tick du fil appelant non relevés. **Blocages** possibles : attente du tour
+en tenant le verrou des voies, crochet `give` de Thread_Gpu hors service pendant qu'une voie tient le verrou,
+séquenceur attendant une opération d'une liste suspendue (`Executed()` par voie le rend plus prudent).
+
 ### Variables pour l'essai en jeu
 
 Base (comme P1) : `KYTY_CP_SEQ=1`, `KYTY_CP_RECORDER=1` (sans `KYTY_CP_RECORDER_VERIFY`),
