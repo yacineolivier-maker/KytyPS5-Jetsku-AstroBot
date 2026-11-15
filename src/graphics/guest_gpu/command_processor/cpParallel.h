@@ -230,6 +230,16 @@
 // RenderExecutor. Still in turn: Thread_Gpu hands the token to one lane at a time (RunSlice(lane));
 // the giver's Switch packet names the taker (HandoffTarget), so the one recorder thread follows
 // the rings in list order.
+//
+// Astro Bot PC (KYTY_CP_PAR=2b, 15/11/2026, docs\CONCEPTION-MULTICOEUR.md step P2 "simultaneous
+// lanes", built in steps; docs-cp-voies.md has the exact state): 2a, and
+//  - per-lane replay (step 1): each lane's recorder stream has its own replay thread ("CP recorder
+//    B".., CommandRecorder::EnableLaneReplay); the recorder thread replays stream 0 only and the
+//    Switch packets no longer chain the rings. The native buffers are still handed to the queue in
+//    list order: a replay thread hands a buffer over only after every earlier one (gate in the
+//    native executor's Submit). Needs no KYTY_GPU_TIMING, GPU op profiler or KYTY_EOP_TIMESTAMPS=gpu
+//    (otherwise 2b runs as 2a). A "CpPar 10s: 2b" line reports each lane's replay (busy time, waits
+//    for its turn).
 
 #include <cstdint>
 
@@ -244,6 +254,7 @@ enum class Mode : uint8_t {
 	Concurrent1b4,
 	Concurrent1b5, // Astro Bot PC (KYTY_CP_PAR=1b5)
 	Lanes2a,       // Astro Bot PC (KYTY_CP_PAR=2a, P1: decoupled lanes, in turn)
+	Lanes2b,       // Astro Bot PC (KYTY_CP_PAR=2b, P2: 2a plus per-lane replay and tick ranges)
 };
 
 // KYTY_CP_PAR, read once.
@@ -251,13 +262,17 @@ enum class Mode : uint8_t {
 [[nodiscard]] inline bool Enabled() {
 	return GetMode() != Mode::Off;
 }
+// Astro Bot PC (KYTY_CP_PAR=2a or 2b): the lane modes (2b is 2a plus its own additions, see above).
+[[nodiscard]] inline bool LanesMode() {
+	return GetMode() == Mode::Lanes2a || GetMode() == Mode::Lanes2b;
+}
 // KYTY_CP_PAR=1b1 (and 1b2, 1b3): context B has its own snapshot ring and draw-prep engine (see
 // above).
 [[nodiscard]] inline bool SeparateWindows() {
 	return GetMode() == Mode::Serial1b1 || GetMode() == Mode::Serial1b2 ||
 	       GetMode() == Mode::Concurrent1b3 || GetMode() == Mode::Concurrent1b4 ||
 	       GetMode() == Mode::Concurrent1b5 || // Astro Bot PC (KYTY_CP_PAR=1b4, 1b5)
-	       GetMode() == Mode::Lanes2a;         // Astro Bot PC (KYTY_CP_PAR=2a)
+	       LanesMode();                        // Astro Bot PC (KYTY_CP_PAR=2a, 2b)
 }
 // KYTY_CP_PAR=1b2 (and 1b3) requested: context B records into its own target (see above).
 // Whether it is active (recorder requirements met) is StreamsActive().
@@ -265,7 +280,7 @@ enum class Mode : uint8_t {
 	return GetMode() == Mode::Serial1b2 || GetMode() == Mode::Concurrent1b3 ||
 	       GetMode() == Mode::Concurrent1b4 ||
 	       GetMode() == Mode::Concurrent1b5 || // Astro Bot PC (KYTY_CP_PAR=1b4, 1b5)
-	       GetMode() == Mode::Lanes2a;         // Astro Bot PC (KYTY_CP_PAR=2a)
+	       LanesMode();                        // Astro Bot PC (KYTY_CP_PAR=2a, 2b)
 }
 
 // Astro Bot PC (KYTY_CP_PAR=1b2): set once at start-up, before resolver #2 runs, when the two
@@ -302,6 +317,12 @@ inline bool g_deferred = false;
 inline bool g_lanes = false;
 [[nodiscard]] inline bool Lanes() noexcept {
 	return g_lanes;
+}
+// Astro Bot PC (KYTY_CP_PAR=2b, P2): set once at start-up, with g_lanes, when the 2b additions are
+// active (see the 2b section above). Read on the recording paths without a call.
+inline bool g_lanes_2b = false;
+[[nodiscard]] inline bool Lanes2b() noexcept {
+	return g_lanes_2b;
 }
 // Astro Bot PC (KYTY_CP_PAR=2a, N lanes): at most MaxLanes resolver contexts (A = Thread_Gpu,
 // B, C, D = CP resolver #2, #3, #4). KYTY_CP_PAR_LANES=2|3|4 (2a only, default 2), read once:
@@ -466,6 +487,15 @@ void EndSegment(uint32_t context, uint64_t packets, uint64_t submits, bool new_c
 // command buffer handed to the queue, in list order); `empty`: nothing was recorded in it;
 // `skipped` (lazy begin): nothing was encoded, the buffer went back to its pool unsubmitted.
 void NoteLaneHandoff(uint32_t context, bool empty, bool skipped);
+// Astro Bot PC (KYTY_CP_PAR=2b) per-lane statistics (any thread; relaxed), reported every 10 s in
+// the "CpPar 10s: 2b" line. Times in nanoseconds.
+enum class LaneStat : uint32_t {
+	ReplayBusyNs,    // the lane's replay thread replaying its ring
+	ReplayTurnWaits, // the lane's replay thread waited for its turn to hand a buffer to the queue
+	ReplayTurnNs,
+	Count,
+};
+void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
 
 enum class Fallback : uint32_t {
 	NoSequencer, // KYTY_CP_SEQ is not 1 (or the sequencer is off): no op ring to split

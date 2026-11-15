@@ -753,7 +753,7 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					            "and recorder ring (%s)\n",
 					            CpPar::g_concurrent ? "segments per submission, replayed in admission order"
 					                                : "segments at every token hand-off");
-					if (CpPar::GetMode() == CpPar::Mode::Lanes2a) {
+					if (CpPar::LanesMode()) { // Astro Bot PC (KYTY_CP_PAR=2a, 2b)
 						// Astro Bot PC (KYTY_CP_PAR=2a, cpParallel.h): each lane's own native command
 						// buffers (pool) and RenderExecutor, submitted at every hand-off.
 						// N lanes (KYTY_CP_PAR_LANES): lane k = ranks k + 1, k + 1 + N, ... of a frame.
@@ -769,6 +769,20 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 							            "submitted at every hand-off (list order) unless nothing was "
 							            "encoded in it (lazy begin)\n",
 							            lanes);
+							if (CpPar::GetMode() == CpPar::Mode::Lanes2b) {
+								// Astro Bot PC (KYTY_CP_PAR=2b, cpParallel.h): each lane's own replay
+								// thread; buffers handed to the queue in list order.
+								if (m_renderer.GetCommandScheduler().EnableLanes2b()) {
+									CpPar::g_lanes_2b = true;
+									std::printf("Kyty CpPar: 2b: each lane has its own replay thread; "
+									            "native buffers are handed to the queue in list "
+									            "order\n");
+								} else {
+									std::printf("Kyty CpPar: 2b unavailable (KYTY_GPU_TIMING, GPU op "
+									            "profiler or KYTY_EOP_TIMESTAMPS=gpu on); running as "
+									            "2a\n");
+								}
+							}
 						} else {
 							std::printf("Kyty CpPar: 2a lanes unavailable; running as 1b2\n");
 						}
@@ -780,6 +794,7 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 					            : CpPar::GetMode() == CpPar::Mode::Concurrent1b4 ? "1b4" // Astro Bot PC
 					            : CpPar::GetMode() == CpPar::Mode::Concurrent1b5 ? "1b5"
 					            : CpPar::GetMode() == CpPar::Mode::Lanes2a       ? "2a" // Astro Bot PC
+					            : CpPar::GetMode() == CpPar::Mode::Lanes2b       ? "2b"
 					                                                             : "1b2");
 				}
 			}

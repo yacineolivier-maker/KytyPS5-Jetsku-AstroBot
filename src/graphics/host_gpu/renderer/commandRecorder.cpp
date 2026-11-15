@@ -271,6 +271,8 @@ struct CommandRecorder::NativeExecutor {
 
 	CommandRecorder&  owner;
 	vk::CommandBuffer command = nullptr;
+	// Astro Bot PC (KYTY_CP_PAR=2b): the stream this executor replays (0: the recorder thread).
+	uint32_t stream = 0;
 	// GpuOpProfiler attribution adopted from the producer (EnterSite/LeaveSite).
 	GpuOpProfiler::Site* previous[2] = {};
 	bool                 owners[2]   = {};
@@ -301,6 +303,10 @@ struct CommandRecorder::NativeExecutor {
 
 	void Submit(const CommandStream::SubmitPacket& p) {
 		EXIT_IF(command == nullptr);
+		if (owner.m_lane_replay) {
+			// Astro Bot PC (KYTY_CP_PAR=2b): every earlier tick reaches the queue first.
+			owner.WaitSubmitTurn(p.tick, stream);
+		}
 		uint64_t* dispatch_ns = nullptr;
 		if (owner.m_timing != nullptr) {
 			owner.m_timing->EndCommand(command);
@@ -384,7 +390,9 @@ struct CommandRecorder::NativeExecutor {
 		if (owner.m_recorded_waiters.load(std::memory_order_seq_cst) != 0) {
 			owner.m_recorded_tick.notify_all();
 		}
-		owner.PublishConsumerCounters();
+		if (stream == 0) { // Astro Bot PC (KYTY_CP_PAR=2b): the recorder thread's counters only
+			owner.PublishConsumerCounters();
+		}
 	}
 
 	void DrainMarker(uint64_t /*serial*/) {}
@@ -597,6 +605,16 @@ struct CommandRecorder::NativeExecutor {
 	}
 };
 
+// Astro Bot PC (KYTY_CP_PAR=2b, commandRecorder.h): the replay thread of one lane's stream.
+struct CommandRecorder::LaneReplayer {
+	uint32_t                        stream = 0;
+	CommandStream::Ring*            ring   = nullptr;
+	std::unique_ptr<NativeExecutor> exec;
+	CommandStream::ReplayState      replay;
+	CommandStream::WaitStats        stats;
+	std::jthread                    thread; // last: started after the members above
+};
+
 // ------------------------------------------------------------------------------------------------
 
 namespace {
@@ -691,6 +709,106 @@ bool CommandRecorder::EnableStreams(uint32_t count) {
 	return true;
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2b, commandRecorder.h).
+bool CommandRecorder::EnableLaneReplay() {
+	if (m_lane_replay) {
+		return true;
+	}
+	if (m_mode != Mode::Thread || m_stream_count < 2 || m_timing != nullptr || m_gpu_ops ||
+	    VerifyEnabled()) {
+		return false;
+	}
+	for (uint32_t stream = 1; stream < m_stream_count; stream++) {
+		auto lane          = std::make_unique<LaneReplayer>();
+		lane->stream       = stream;
+		lane->ring         = m_rings_x[stream].get();
+		lane->exec         = std::make_unique<NativeExecutor>(*this);
+		lane->exec->stream = stream;
+		m_lane_replayers[stream] = std::move(lane);
+	}
+	// Before any Switch packet: the recorder thread reads it only when it meets one (published
+	// after this, seq_cst).
+	m_lane_replay = true;
+	for (uint32_t stream = 1; stream < m_stream_count; stream++) {
+		auto* lane   = m_lane_replayers[stream].get();
+		lane->thread = std::jthread([this, lane](std::stop_token stop) { RunLane(*lane, stop); });
+	}
+	return true;
+}
+
+void CommandRecorder::WaitSubmitTurn(uint64_t tick, uint32_t stream) {
+	// Ticks are allocated in list order and every one has a Submit packet in some ring: the
+	// previous tick reaches the queue first.
+	if (tick <= 1 || m_recorded_tick.load(std::memory_order_acquire) + 1u >= tick) {
+		return;
+	}
+	const auto          start = NowNs();
+	HangWatchdog::Scope wait("recorder-lane-turn", reinterpret_cast<uint64_t>(this), tick, stream);
+	bool                ready = false;
+	while (NowNs() - start < m_idle_policy.spin_ns) {
+		if (m_recorded_tick.load(std::memory_order_acquire) + 1u >= tick) {
+			ready = true;
+			break;
+		}
+		for (uint32_t i = 0; i < 64; i++) {
+#if defined(_M_X64) || defined(__x86_64__)
+			_mm_pause();
+#endif
+		}
+	}
+	if (!ready) {
+		m_recorded_waiters.fetch_add(1, std::memory_order_seq_cst);
+		for (;;) {
+			const auto value = m_recorded_tick.load(std::memory_order_seq_cst);
+			if (value + 1u >= tick || m_stop.load(std::memory_order_acquire)) {
+				break;
+			}
+			m_recorded_tick.wait(value, std::memory_order_acquire);
+		}
+		m_recorded_waiters.fetch_sub(1, std::memory_order_seq_cst);
+	}
+	CpPar::NoteLaneStat(stream, CpPar::LaneStat::ReplayTurnWaits, 1);
+	CpPar::NoteLaneStat(stream, CpPar::LaneStat::ReplayTurnNs, NowNs() - start);
+}
+
+void CommandRecorder::RunLane(LaneReplayer& lane, std::stop_token stop) {
+	switch (lane.stream) {
+		case 1: KYTY_PROFILER_THREAD("CP recorder B"); break;
+		case 2: KYTY_PROFILER_THREAD("CP recorder C"); break;
+		default: KYTY_PROFILER_THREAD("CP recorder D"); break;
+	}
+	Common::RaiseCurrentThreadPriority();
+	t_replaying = true;
+	while (!stop.stop_requested() && !m_stop.load(std::memory_order_acquire)) {
+		if (!lane.ring->WaitPublished(m_stop, m_idle_policy, lane.stats)) {
+			continue;
+		}
+		const auto start = NowNs();
+		ConsumeLane(lane);
+		CpPar::NoteLaneStat(lane.stream, CpPar::LaneStat::ReplayBusyNs, NowNs() - start);
+	}
+	ConsumeLane(lane);
+}
+
+void CommandRecorder::ConsumeLane(LaneReplayer& lane) {
+	constexpr uint64_t ReleaseEvery = 64u << 10u;
+	uint64_t           since        = 0;
+	auto&              ring         = *lane.ring;
+	while (const auto* header = ring.Peek()) {
+		// The Switch packets only ordered the single replay of 2a: skipped.
+		if (header->op != Op::Wrap && header->op != Op::Switch) {
+			CommandStream::Replay(*header, *lane.exec, lane.replay, &OnMismatch, this);
+		}
+		ring.Advance(header->size);
+		since += header->size;
+		if (since >= ReleaseEvery) {
+			ring.Release(lane.stats);
+			since = 0;
+		}
+	}
+	ring.Release(lane.stats);
+}
+
 namespace {
 // Astro Bot PC (KYTY_CP_PAR=2a): a Switch packet's serial carries its target ring in its top byte
 // (target + 1; 0: the other ring of two, as in 1b2 / 1b3).
@@ -753,7 +871,9 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	// Astro Bot PC (KYTY_CP_PAR=1b2): the calling thread's ring; idle only when both rings are
 	// (the replay reaches this ring's marker after the other ring's earlier segments).
 	auto&      ring = ProducerRing();
-	const bool idle = ring.Consumed() == ring.WritePosition() && (m_stream_count == 1 || StreamsIdle());
+	// Astro Bot PC (KYTY_CP_PAR=2b): with per-lane replay, the calling stream's ring only.
+	const bool idle = ring.Consumed() == ring.WritePosition() &&
+	                  (m_stream_count == 1 || m_lane_replay || StreamsIdle());
 	if (idle) {
 		m_idle_drains++;
 	} else {
@@ -839,6 +959,13 @@ void CommandRecorder::Stop() {
 		if (m_thread.joinable()) {
 			m_thread.join();
 		}
+		for (auto& lane: m_lane_replayers) {
+			// Astro Bot PC (KYTY_CP_PAR=2b): the lanes' replay threads (rings consumed above).
+			if (lane != nullptr && lane->thread.joinable()) {
+				lane->thread.request_stop();
+				lane->thread.join();
+			}
+		}
 	}
 	PublishCounters();
 	if (m_encoder.Packets() != 0) {
@@ -883,7 +1010,11 @@ void CommandRecorder::Run(std::stop_token stop) {
 		}
 		const auto start = NowNs();
 		ConsumeAvailable();
-		m_busy_ns.fetch_add(NowNs() - start, std::memory_order_release);
+		const auto busy = NowNs() - start;
+		m_busy_ns.fetch_add(busy, std::memory_order_release);
+		if (m_lane_replay) {
+			CpPar::NoteLaneStat(0, CpPar::LaneStat::ReplayBusyNs, busy); // Astro Bot PC (2b)
+		}
 	}
 	ConsumeAvailable();
 }
@@ -903,6 +1034,12 @@ void CommandRecorder::ConsumeAvailable() {
 	// Switch packet releases this ring and continues in the other one.
 	while (const auto* header = m_consume_ring->Peek()) {
 		auto& ring = *m_consume_ring;
+		if (header->op == Op::Switch && m_stream_count > 1 && m_lane_replay) {
+			// Astro Bot PC (KYTY_CP_PAR=2b): stream 0 only; the other rings have their own replay.
+			ring.Advance(header->size);
+			since += header->size;
+			continue;
+		}
 		if (header->op == Op::Switch && m_stream_count > 1) {
 			// Astro Bot PC (KYTY_CP_PAR=2a): the target ring named by the serial's top byte.
 			const CommandStream::SiteBlock*   site   = nullptr;

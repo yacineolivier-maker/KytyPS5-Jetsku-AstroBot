@@ -77,6 +77,16 @@ public:
 	[[nodiscard]] CommandStream::Encoder& StreamEncoder(uint32_t stream) noexcept {
 		return stream != 0 ? *m_encoders_x[stream] : m_encoder;
 	}
+	// Astro Bot PC (KYTY_CP_PAR=2b, cpParallel.h): per-lane replay, after EnableStreams. Each stream
+	// 1.. gets its own replay thread ("CP recorder B".., its own native executor and replay state)
+	// and the recorder thread replays stream 0 only; Switch packets are skipped (each ring holds
+	// only its lane's native buffers). A Submit packet is handed to the queue (or the broker) only
+	// after every earlier tick was (list order: ticks are allocated in list order), so the queue
+	// order and RecordedTick() stay monotonic. A drain waits for the calling stream's ring only.
+	// Thread mode, without the timing ring and the GPU op profiler (single-producer state of the
+	// replay); start-up only, before any packet of the streams. Returns whether it is on.
+	bool               EnableLaneReplay();
+	[[nodiscard]] bool LaneReplay() const noexcept { return m_lane_replay; }
 	static void                   SetThreadStream(uint32_t stream) noexcept;
 	[[nodiscard]] static uint32_t ThreadStream() noexcept;
 	// The calling thread's stream: ends its segment (the replay continues in the other ring).
@@ -208,6 +218,14 @@ private:
 	}
 	// Every packet of both streams executed (both rings consumed up to what was published).
 	[[nodiscard]] bool StreamsIdle() const noexcept;
+	// Astro Bot PC (KYTY_CP_PAR=2b): the replay thread of one stream (index = stream, [0] unused:
+	// stream 0 is the recorder thread), and the list-order gate of the Submit packets.
+	struct LaneReplayer;
+	void RunLane(LaneReplayer& lane, std::stop_token stop);
+	void ConsumeLane(LaneReplayer& lane);
+	void WaitSubmitTurn(uint64_t tick, uint32_t stream);
+	std::array<std::unique_ptr<LaneReplayer>, MaxStreams> m_lane_replayers;
+	bool                                                  m_lane_replay = false;
 
 	// Verify-hook registry slot (MaxRecorders when not registered).
 	size_t m_registry_slot = SIZE_MAX;

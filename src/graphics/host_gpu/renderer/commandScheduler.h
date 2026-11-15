@@ -195,6 +195,12 @@ public:
 	// wrapper, DynamicState, command pool and recorder stream (CommandRecorder::EnableStreams).
 	static constexpr uint32_t MaxLanes = 4;
 	bool               EnableLanes(uint32_t count = 2);
+	// Astro Bot PC (KYTY_CP_PAR=2b, cpParallel.h): after EnableLanes, start-up only. Each lane's
+	// stream gets its own replay thread (CommandRecorder::EnableLaneReplay). Refused (2a goes on)
+	// with KYTY_GPU_TIMING, the GPU op profiler or KYTY_EOP_TIMESTAMPS=gpu (single-producer
+	// rings of the replay or of the recording side).
+	bool               EnableLanes2b();
+	[[nodiscard]] bool Lanes2b() const noexcept { return m_lanes_2b; }
 	[[nodiscard]] bool Lanes() const noexcept { return m_lanes; }
 	[[nodiscard]] uint32_t LaneCount() const noexcept { return m_lane_count; }
 	// The calling thread's context (0 unless it records into stream 1).
@@ -279,6 +285,7 @@ private:
 	// Astro Bot PC (KYTY_CP_PAR=2a): lane B's command pool (null unless EnableLanes), lanes on.
 	std::unique_ptr<CommandPool> m_command_pool_b;
 	bool                         m_lanes = false;
+	bool                         m_lanes_2b = false; // Astro Bot PC (KYTY_CP_PAR=2b)
 	// Astro Bot PC (KYTY_CP_PAR=2a, N lanes): lanes 2.. (index = lane): wrappers, dynamic states
 	// and command pools (null below index 2 and unless EnableLanes(3+)); the lanes in use.
 	std::array<std::unique_ptr<CommandBuffer>, MaxLanes> m_command_x;

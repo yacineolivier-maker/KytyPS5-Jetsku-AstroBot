@@ -121,7 +121,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_occlusion_counter(*this), m_lod_stats(*this) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	if (CpPar::GetMode() == CpPar::Mode::Lanes2a &&
+	if (CpPar::LanesMode() && // Astro Bot PC (KYTY_CP_PAR=2a, 2b)
 	    CommandRecorder::ConfiguredMode() == CommandRecorder::Mode::Thread &&
 	    !CommandRecorder::VerifyEnabled()) {
 		// Astro Bot PC (KYTY_CP_PAR=2a, cpParallel.h): lane B's own RenderExecutor, created before

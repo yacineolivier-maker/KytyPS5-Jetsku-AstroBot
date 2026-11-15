@@ -59,6 +59,8 @@ struct Stats {
 	std::array<std::atomic<uint64_t>, MaxLanes> lane_submits {};
 	std::array<std::atomic<uint64_t>, MaxLanes> lane_empty {};
 	std::array<std::atomic<uint64_t>, MaxLanes> lane_skipped {}; // lazy begin: no submit at the hand-off
+	// Astro Bot PC (KYTY_CP_PAR=2b): per lane, the LaneStat counters.
+	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(LaneStat::Count)>, MaxLanes> lane_stats {};
 	std::atomic<uint64_t>                fixups_needed_total {0};
 	// KYTY_CP_PAR=1b3: run-ahead starts and ops, promotions by reason, merges and insertions with
 	// their fix-ups, op lock waits per thread, time both threads were busy (overlap).
@@ -517,8 +519,14 @@ Mode GetMode() {
 			            "every hand-off, executed in turn)\n");
 			return Mode::Lanes2a;
 		}
-		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2, 1b3, 1b4, 1b5, 2a); "
-		            "off\n",
+		if (std::strcmp(value, "2b") == 0) {
+			// Astro Bot PC (KYTY_CP_PAR=2b, cpParallel.h).
+			std::printf("Kyty CpPar: KYTY_CP_PAR=2b (as 2a, and each lane has its own replay thread; the "
+			            "lanes' native buffers are handed to the queue in list order)\n");
+			return Mode::Lanes2b;
+		}
+		std::printf("Kyty CpPar: KYTY_CP_PAR=%s is not supported (only 1a, 1b1, 1b2, 1b3, 1b4, 1b5, 2a, "
+		            "2b); off\n",
 		            value);
 		return Mode::Off;
 	}();
@@ -885,7 +893,7 @@ uint64_t NowNs() {
 
 uint32_t RequestedLanes() {
 	static const uint32_t lanes = [] {
-		if (GetMode() != Mode::Lanes2a) {
+		if (!LanesMode()) { // Astro Bot PC (KYTY_CP_PAR=2a, 2b)
 			return 2u;
 		}
 		const auto* value = std::getenv("KYTY_CP_PAR_LANES");
@@ -1054,6 +1062,14 @@ void NoteLaneHandoff(uint32_t context, bool empty, bool skipped) {
 	stats.lane_submits[index].fetch_add(1, std::memory_order_relaxed);
 	if (empty) {
 		stats.lane_empty[index].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+// Astro Bot PC (KYTY_CP_PAR=2b, cpParallel.h).
+void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value) {
+	const auto index = static_cast<size_t>(stat);
+	if (index < static_cast<size_t>(LaneStat::Count)) {
+		GetStats().lane_stats[LaneIndex(lane)][index].fetch_add(value, std::memory_order_relaxed);
 	}
 }
 
@@ -1295,6 +1311,28 @@ void MaybeReport() {
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2a lanes (%u): %s\n", g_lane_count, lanes.c_str());
+	}
+	if (Lanes2b()) {
+		// Astro Bot PC (KYTY_CP_PAR=2b): per lane, its replay thread (busy time, waits for its turn
+		// to hand a buffer to the queue).
+		std::string lanes;
+		for (uint32_t lane = 0; lane < g_lane_count && lane < MaxLanes; lane++) {
+			uint64_t v[static_cast<size_t>(LaneStat::Count)] = {};
+			for (size_t i = 0; i < std::size(v); i++) {
+				v[i] = take(stats.lane_stats[lane][i]);
+			}
+			const auto ms = [&v](LaneStat stat) {
+				return static_cast<double>(v[static_cast<size_t>(stat)]) / 1e6;
+			};
+			const auto n = [&v](LaneStat stat) { return v[static_cast<size_t>(stat)]; };
+			char item[512];
+			std::snprintf(item, sizeof(item),
+			              "%s%c: replay %.1f ms busy, turn waits %" PRIu64 " (%.1f ms)",
+			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
+			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs));
+			lanes += item;
+		}
+		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());
 	}
 	std::fflush(stdout);
 }

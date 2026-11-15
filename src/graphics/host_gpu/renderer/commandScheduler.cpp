@@ -722,6 +722,19 @@ bool CommandScheduler::EnableLanes(uint32_t count) {
 	return true;
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2b, commandScheduler.h).
+bool CommandScheduler::EnableLanes2b() {
+	if (m_lanes_2b) {
+		return true;
+	}
+	if (!m_lanes || m_recorder == nullptr || m_gpu_timing != nullptr || m_gpu_ops ||
+	    m_eop_timestamps != nullptr || !m_recorder->EnableLaneReplay()) {
+		return false;
+	}
+	m_lanes_2b = true;
+	return true;
+}
+
 CommandBuffer& CommandScheduler::BeginLaneCommand() {
 	EXIT_IF(!m_lanes || m_recorder == nullptr);
 	auto& command = Cmd();
