@@ -863,6 +863,9 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 									if (LaneShare::g_stream) {
 										m_renderer.GetBufferCache().EnableLaneStreams(); // C1
 									}
+									if (LaneShare::g_descriptors) {
+										m_renderer.GetDescriptorHeap().EnableLaneHeaps(); // C2
+									}
 									std::printf("Kyty CpPar: 2b: each lane has its own replay thread; "
 									            "native buffers are handed to the queue in list "
 									            "order\n");
