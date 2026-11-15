@@ -245,6 +245,13 @@ public:
 		}
 	}
 	[[nodiscard]] uint32_t LaneSuccessor(uint32_t lane);
+	// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2): Thread_Gpu reserves the order (and tick range) of
+	// lane `lane`'s next segment when it hands it a list, in list order (CpPar::LaneReserveEnabled);
+	// the lane's BeginContextSegment consumes it (counted; a lane other than A beginning without a
+	// reservation is counted too). The lane must have no open or reserved segment.
+	void               ReserveLaneOrder(uint32_t lane);
+	// The lane has an open (or reserved) segment order.
+	[[nodiscard]] bool LaneOrderOpen(uint32_t lane);
 	[[nodiscard]] bool Lanes() const noexcept { return m_lanes; }
 	[[nodiscard]] uint32_t LaneCount() const noexcept { return m_lane_count; }
 	// The calling thread's context (0 unless it records into stream 1).
@@ -339,6 +346,9 @@ private:
 		std::vector<PendingOperation> priority;
 	};
 	std::array<uint64_t, MaxLanes>           m_lane_order {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+	// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2): m_lane_order[lane] was reserved by Thread_Gpu
+	// (ReserveLaneOrder) and its segment has not begun yet.
+	std::array<bool, MaxLanes>               m_lane_reserved {};
 	uint64_t                                 m_turn = 0;
 	std::set<uint64_t>                       m_ended_early;
 	std::map<uint64_t, HeldOperations>       m_held;

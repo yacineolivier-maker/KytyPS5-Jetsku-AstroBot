@@ -142,7 +142,9 @@ public:
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
-	void            BufferFlush();
+	// Astro Bot PC (2b, obstacle 2): `submit` false: everything but the submit (the caller ends the
+	// segment, whose hand-off submit takes the work along).
+	void            BufferFlush(bool submit = true);
 	void            BufferFlushAndWait();
 	static uint32_t EopFlushPacketLimit();
 	void            BufferWait();

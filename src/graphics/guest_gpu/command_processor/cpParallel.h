@@ -554,6 +554,9 @@ enum class LaneStat : uint32_t {
 	OverlayImpossible,  //       fix-ups no barrier can express, or with no buffer to record into
 	OverlayLeft,        //       a segment ended with its overlay unmerged (its older one still open)
 	ForeignRetries,     // obstacle 1: suspended ops pending (any lane) when a lane starts a list
+	ReservedOrders,     // obstacle 2: segment orders Thread_Gpu reserved for the lane at the hand-out
+	UnreservedBegins,   //       a lane (not A) began a segment without a reserved order (0 expected)
+	ListEndClosures,    //       lane A's segment closed (and reopened) at the end of an A list
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
@@ -564,6 +567,12 @@ void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
 // KYTY_CP_PAR_LOCK=0. Re-entrant on the holding thread. LaneLockHeld: the calling thread holds it
 // (GuestGpu::IsGpuThread also answers true for it in 2b).
 [[nodiscard]] bool LaneLockEnabled();
+// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2): the order (tick range) of a lane's segment is
+// reserved by Thread_Gpu when it hands the lane a list (right after its own segment ended; the
+// lane's BeginContextSegment consumes it), and lane A's segment is closed at the end of every A
+// list: segment orders follow list order whatever thread begins first. On in 2b unless
+// KYTY_CP_PAR_RESERVE=0.
+[[nodiscard]] bool LaneReserveEnabled();
 void               LaneLockAcquire();
 void               LaneLockRelease();
 [[nodiscard]] bool LaneLockHeld() noexcept;

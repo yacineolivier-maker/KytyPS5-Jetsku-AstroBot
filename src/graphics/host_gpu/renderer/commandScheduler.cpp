@@ -912,6 +912,33 @@ uint32_t CommandScheduler::LaneSuccessor(uint32_t lane) {
 	return UINT32_MAX;
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2, commandScheduler.h).
+void CommandScheduler::ReserveLaneOrder(uint32_t lane) {
+	if (!m_lanes_2b || lane == 0 || lane >= MaxLanes || lane >= m_lane_count) {
+		return;
+	}
+	std::lock_guard lock(m_operation_mutex);
+	EXIT_IF(m_lane_order[lane] != UINT64_MAX || m_lane_reserved[lane]);
+	// The lane's thread is idle (it takes the token after this): its range entries are written
+	// here, before the hand-off orders them for it.
+	const auto order = m_master.BeginRange(lane);
+	EXIT_IF(order < m_turn);
+	m_lane_order[lane]    = order;
+	m_lane_reserved[lane] = true;
+	if (order == m_turn) {
+		m_master.SetOldestLane(lane); // threads without a lane read its ticks from now on
+	}
+	CpPar::NoteLaneStat(lane, CpPar::LaneStat::ReservedOrders, 1);
+}
+
+bool CommandScheduler::LaneOrderOpen(uint32_t lane) {
+	if (!m_lanes_2b || lane >= MaxLanes) {
+		return false;
+	}
+	std::lock_guard lock(m_operation_mutex);
+	return m_lane_order[lane] != UINT64_MAX;
+}
+
 void CommandScheduler::WaitLaneTurn(uint32_t lane) {
 	std::unique_lock lock(m_operation_mutex);
 	if (lane >= MaxLanes || m_lane_order[lane] == UINT64_MAX || m_lane_order[lane] == m_turn) {
@@ -959,11 +986,20 @@ void CommandScheduler::BeginContextSegment() {
 		if (m_lanes_2b) {
 			// Astro Bot PC (KYTY_CP_PAR=2b): the segment's tick range, in list order.
 			std::lock_guard lock(m_operation_mutex);
-			const auto      order = m_master.BeginRange(context);
-			EXIT_IF(m_lane_order[context] != UINT64_MAX || order < m_turn);
-			m_lane_order[context] = order;
-			if (order == m_turn) {
-				m_master.SetOldestLane(context);
+			if (m_lane_reserved[context]) {
+				// Obstacle 2: reserved by Thread_Gpu when it handed the list (ReserveLaneOrder).
+				m_lane_reserved[context] = false;
+				EXIT_IF(m_lane_order[context] == UINT64_MAX || m_lane_order[context] < m_turn);
+			} else {
+				const auto order = m_master.BeginRange(context);
+				EXIT_IF(m_lane_order[context] != UINT64_MAX || order < m_turn);
+				m_lane_order[context] = order;
+				if (order == m_turn) {
+					m_master.SetOldestLane(context);
+				}
+				if (context != 0 && CpPar::LaneReserveEnabled()) {
+					CpPar::NoteLaneStat(context, CpPar::LaneStat::UnreservedBegins, 1);
+				}
 			}
 		}
 		BeginLaneCommand();

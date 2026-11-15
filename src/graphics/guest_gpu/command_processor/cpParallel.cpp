@@ -1135,6 +1135,22 @@ bool LaneLockEnabled() {
 	return enabled;
 }
 
+bool LaneReserveEnabled() {
+	// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2, cpParallel.h).
+	static const bool enabled = [] {
+		if (GetMode() != Mode::Lanes2b) {
+			return false;
+		}
+		const auto* value = std::getenv("KYTY_CP_PAR_RESERVE");
+		const bool  on    = value == nullptr || std::strcmp(value, "0") != 0;
+		std::printf("Kyty CpPar: 2b segment orders reserved at the hand-out, lane A closed at each "
+		            "list end: %s (KYTY_CP_PAR_RESERVE)\n",
+		            on ? "on" : "off");
+		return on;
+	}();
+	return enabled;
+}
+
 void LaneLockAcquire() {
 	if (t_lane_lock_depth++ != 0) {
 		return;
@@ -1455,7 +1471,8 @@ void MaybeReport() {
 			              PRIu64 ", dumps outside the lock %" PRIu64 "; seq position below %" PRIu64
 			              "; overlay ops %" PRIu64 ", images %" PRIu64 ", fix-ups %" PRIu64
 			              ", impossible %" PRIu64 ", left %" PRIu64 "; retries pending at list start %"
-			              PRIu64,
+			              PRIu64 "; orders reserved at hand-out %" PRIu64 ", unreserved begins %" PRIu64
+			              ", list-end closures %" PRIu64,
 			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
 			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs),
 			              n(LaneStat::SubmitTurnWaits), ms(LaneStat::SubmitTurnNs),
@@ -1468,7 +1485,8 @@ void MaybeReport() {
 			              n(LaneStat::SeqPositionBelow), n(LaneStat::OverlayOps),
 			              n(LaneStat::OverlayImages), n(LaneStat::OverlayFixups),
 			              n(LaneStat::OverlayImpossible), n(LaneStat::OverlayLeft),
-			              n(LaneStat::ForeignRetries));
+			              n(LaneStat::ForeignRetries), n(LaneStat::ReservedOrders),
+			              n(LaneStat::UnreservedBegins), n(LaneStat::ListEndClosures));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());

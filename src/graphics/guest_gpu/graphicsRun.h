@@ -157,6 +157,9 @@ private:
 	void        CpParMerge();
 	void        CpParInsert(uint32_t trigger);
 	static void CpParRunAheadTask(void* argument);
+	// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2): Thread_Gpu, at the end of an A list: lane A's
+	// segment ends (hand-off submit, Switch with its order) and a new one begins.
+	void        CpParCloseLaneA();
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_submission_mutex;

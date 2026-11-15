@@ -873,6 +873,13 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 						// to its pool (lazy begin: nothing encoded).
 						CpPar::NoteLaneHandoff(stream, counts.lane_empty, counts.lane_skipped);
 					}
+					if (CpPar::Lanes2b() && stream == 0 && CpPar::HandoffTarget() != 0 &&
+					    CpPar::LaneReserveEnabled()) {
+						// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2): Thread_Gpu hands lane k a list:
+						// k's segment order is reserved now, right after lane A's segment ended (so
+						// that A could still give its unused range back), before k begins.
+						gpu->m_renderer.GetCommandScheduler().ReserveLaneOrder(CpPar::HandoffTarget());
+					}
 				}
 				gpu->m_renderer.GetMutex().ResignOwner();
 				if (CpPar::OnResolver2()) {
@@ -1540,7 +1547,7 @@ static bool OptionalSubmitAllowed() {
 	return false;
 }
 
-void CommandProcessor::BufferFlush() {
+void CommandProcessor::BufferFlush(bool submit) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	LaneCp().deferred_eop_flushes     = 0;
 	LaneCp().packets_since_eop_request = 0;
@@ -1550,7 +1557,9 @@ void CommandProcessor::BufferFlush() {
 	// Between packets: append eager readback copies of read-hot pages to this recording
 	// (KYTY_READBACK_EAGER), published when it completes.
 	m_renderer.GetBufferCache().IssueEagerReadbacks();
-	GetScheduler().Flush();
+	if (submit) {
+		GetScheduler().Flush();
+	}
 }
 
 // KYTY_EOP_FLUSH_PACKETS: packets processed after the first deferred interrupt before the command
@@ -2766,13 +2775,20 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		return complete;
 	}
 	submission.slice_progress = progressed;
+	// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2): an A list ends its segment (the hand-off submit
+	// takes the slice's work instead of the flush), so that the next list's order follows it.
+	const bool close_a = complete && submission.cp_par_context == 0 && CpPar::Lanes2b() &&
+	                     CpPar::LaneReserveEnabled() && CpPar::Started() && CpPar::StreamsActive();
 	if (progressed) {
 		if (complete) {
 			m_renderer.RunGarbageCollector();
 		}
-		cp.BufferFlush();
+		cp.BufferFlush(!close_a);
 	} else if (complete) {
 		m_renderer.RunGarbageCollector();
+	}
+	if (close_a) {
+		CpParCloseLaneA();
 	}
 	return complete;
 }
@@ -6950,6 +6966,26 @@ static void CpParLaneOverlayAtEnd(CommandScheduler& scheduler, uint32_t lane) {
 		CpPar::NoteLaneStat(next, CpPar::LaneStat::OverlayImpossible, impossible);
 	}
 	CpPar::LaneLockRelease();
+}
+
+// Astro Bot PC (KYTY_CP_PAR=2b, obstacle 2, graphicsRun.h): the stream part of the give hook, then
+// of the take hook, on Thread_Gpu for its own lane A (no token passes).
+void GuestGpu::CpParCloseLaneA() {
+	auto& scheduler = m_renderer.GetCommandScheduler();
+	EXIT_IF(CpPar::OnResolver2() || CommandRecorder::ThreadStream() != 0);
+	if (!CpPar::LaneLockHeld()) {
+		scheduler.WaitSegmentTurn(); // never waits in turn (A is the only open segment)
+	}
+	CpParLaneOverlayAtEnd(scheduler, 0);
+	const auto counts = scheduler.EndContextSegment();
+	CpPar::EndSegment(0, counts.packets, counts.submits, counts.new_command_buffer);
+	if (counts.lane_submitted || counts.lane_skipped) {
+		CpPar::NoteLaneHandoff(0, counts.lane_empty, counts.lane_skipped);
+	}
+	scheduler.BeginContextSegment();
+	m_renderer.GetRenderExecutor().CpParForgetCommandShadows();
+	CpPar::BeginSegment(0);
+	CpPar::NoteLaneStat(0, CpPar::LaneStat::ListEndClosures, 1);
 }
 
 // Astro Bot PC (KYTY_CP_PAR=1b5, cpParallel.h): Thread_Gpu, op lock held, right after the oldest
