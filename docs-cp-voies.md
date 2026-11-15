@@ -35,6 +35,7 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `1ff2bee9` | chien de garde | état de chaque voie après 20 s sans image | BUILD_OK |
 | `63f97b56` | blocage 19 h 23 | liste reprise placée avant les listes plus jeunes dehors | BUILD_OK |
 | `390956fe` | arrêt 19 h 30 | une voie commence son segment à côté d'un segment gardé ; messages d'arrêt détaillés | BUILD_OK |
+| `2ff9b678` | mesure | temps du verrou des voies par type d'opération ; contrôle « out-of-order ends » sans course bénigne | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
 
@@ -245,6 +246,53 @@ qui tourne est toujours le plus ancien), « dumps outside the lock » doit tombe
 
 
 
+
+### Stable mais sans gain (4e série, 15/11 19 h 45–19 h 53) : où va le verrou des voies
+
+**Constat** (session principale) : 3 lancements propres, aucun blocage ni perte du GPU, contrôles à 0 ;
+Aerial Garden 3 voies 15,1 i/s, 4 voies 19,7, 3 voies + VERIFY 19,1 (à tour de rôle : N2 21,7, N3 17,8) ;
+recouvrement 1,3–1,6 ms par 10 s ; ligne 2b : verrou des voies B 708 436 prises, 5,2 s tenu, C 522 126
+prises, 3,5 s tenu par 10 s. **Le verrou, pris pour chaque opération, sérialise tout** : c'est le
+fonctionnement prévu de 3b-2 (« opération entière sous le verrou, sûr, sans gain ») ; le gain ne peut
+venir que de P3 (sortir des opérations du verrou).
+
+**Mesure ajoutée** (`2ff9b678`) : ligne « CpPar 10s: 2b lock by op (N) » : par voie, chaque type
+d'opération (DrawIndex, DispatchDirect, EventWrite, …) avec le nombre de prises et le temps tenu, « out
+of turn » (part des opérations hors tour) et « rest of the lock » (temps tenu hors opérations :
+crochets, services et flips servis, vidages d'occlusion, travail propre de Thread_Gpu). Sans réglage
+(une lecture d'horloge par opération, déjà payée par le verrou). Pour détailler l'intérieur d'un dessin
+(cache de tampons, de textures, descripteurs, flux, enregistrement), les outils existants restent :
+`KYTY_CP_GAP_STATS` (temps du fil par cause) et `KYTY_CP_COMMIT_STATS` (étapes du dessin).
+
+**« list … ended unfinished behind list … still out »** (une fois, 4 voies, 19 h 45) : **normal**. Une
+voie ne passe « finie » (`SliceDone`) qu'après le retour de son crochet `give` ; entre la fin de son
+segment (le tour avance) et ce moment, la voie plus jeune peut prendre le tour, garder son segment et
+finir : pendant un instant la plus jeune est finie derrière la plus ancienne pas encore marquée. Les
+deux sont recueillies au pas suivant. Le contrôle ne compte plus que si la même liste reste bloquée
+derrière plus de 1 s (alors : vrai désordre).
+
+**P3 (sortir du verrou) : non fait dans ce commit, faute de pouvoir le faire sans risque de perte du
+GPU avant de savoir quelles opérations pèsent.** Ce que demande chaque site, à décider sur la ligne
+« lock by op » du prochain essai :
+- dessins et dispatchs directs (attendus en tête) : l'enregistrement va dans le flux de la voie (déjà
+  propre à elle), mais l'exécution touche des états communs : suivi d'état et téléversements du cache
+  de tampons (plages « sales » GPU/CPU), recherches et créations du cache de textures (et l'état
+  d'image : surcouche par voie déjà faite), tas de descripteurs (pools par voie à faire), pages du flux
+  (sous-anneaux par voie), mémos de liaison (par exécuteur, déjà par voie), cache de pipelines (déjà
+  lu par les ouvriers DrawPrep : probablement sûr en lecture). Étape sûre envisagée : un verrou par
+  cache (lecteurs multiples, écrivain unique) à la place du verrou global pour le chemin « emplacement
+  préparé, rien à créer », la voie retombant sous le verrou global dès qu'il faut créer, téléverser
+  ou synchroniser ;
+- « rest of the lock » s'il pèse : crochets de segment (début/fin) et services ;
+- opérations du tour (étiquettes, attentes) : elles attendent déjà leur tour ; les garder sous le
+  verrou.
+Objectif mesurable fixé par la session principale : temps tenu par voie divisé au moins par 3,
+recouvrement de plusieurs secondes par 10 s.
+
+**À relever en jeu** (`KYTY_CP_PAR_LANES=3` et 4, `KYTY_CP_PAR_CONCURRENT=1`) : la ligne « 2b lock by
+op » (les trois ou quatre types qui pèsent le plus, « out of turn », « rest of the lock »), la ligne 2b
+(lane lock takes / held), « overlap » ; et une fois avec `KYTY_CP_GAP_STATS=1` pour la répartition
+dans le fil d'une voie. « out-of-order ends » doit rester à 0.
 
 ### Arrêt au démarrage (essai du 15/11, 19 h 30) : segment gardé pris pour le sien
 
