@@ -4,6 +4,7 @@
 #include "common/hangWatchdog.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (concurrent watchdog)
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
@@ -127,6 +128,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the stall watchdog (tick, GPU tick known).
+	const CpPar::WaitScope stall("GPU tick (tick, known GPU tick)", tick, KnownGpuTick());
 	// KYTY_CP_GAP_STATS (GPU thread only): readback drains, occlusion publication, the rest.
 	const auto      reason = Profiler::CurrentGpuWaitReason();
 	const CpGaps::Scope gap(reason == Profiler::FrameWait::GpuWaitDrain ? CpGaps::Cat::GpuWaitDrain

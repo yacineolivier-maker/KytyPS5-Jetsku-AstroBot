@@ -697,6 +697,32 @@ void HookTake();
 // holder, as in RunSlice) and returns true once the slice has ended (the lane is idle again).
 void               RunSliceAsync(uint32_t lane, void (*task)(void*), void* argument);
 [[nodiscard]] bool PollSlice(uint32_t lane);
+// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the stall watchdog. Each thread that takes part (slot 0
+// Thread_Gpu, 1..3 lanes B..D, 4 the sequencer: SetWaitSlot) publishes what it waits for and since
+// when (WaitScope, lock-free; nothing on other threads or outside the mode). NoteFrameOut counts
+// the frames (flips). StartStallWatchdog starts a thread that, when no frame came out for 20 s,
+// prints once (until frames come again) every slot's wait, the lanes' lock and turn state, then
+// calls `dump(context)` (GuestGpu: lists out, queue heads, scheduler orders; must not block).
+inline constexpr int WaitSlots = 5;
+void SetWaitSlot(int slot) noexcept;
+class WaitScope {
+public:
+	explicit WaitScope(const char* what, uint64_t a = 0, uint64_t b = 0);
+	~WaitScope();
+	WaitScope(const WaitScope&)            = delete;
+	WaitScope& operator=(const WaitScope&) = delete;
+
+private:
+	int         m_slot     = -1;
+	const char* m_previous = nullptr;
+	uint64_t    m_since    = 0;
+	uint64_t    m_a        = 0;
+	uint64_t    m_b        = 0;
+};
+[[nodiscard]] const char* TurnReasonName(TurnReason reason) noexcept;
+void                      NoteFrameOut() noexcept;
+void                      StartStallWatchdog(void (*dump)(void*), void* context);
+void                      StopStallWatchdog();
 // The lanes (slice end, request) and Enqueue wake Thread_Gpu waiting in WaitDispatchEvent.
 void WakeDispatcher();
 void WaitDispatchEvent(uint64_t timeout_ns);

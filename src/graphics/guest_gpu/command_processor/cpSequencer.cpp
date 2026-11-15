@@ -7,6 +7,7 @@
 #include "common/spinGate.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (concurrent watchdog)
 
 #include <chrono>
 #include <cstdlib>
@@ -222,6 +223,7 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 		if (!ready() && !Stopping()) {
 			HangWatchdog::Scope wait("sequencer-progress", reinterpret_cast<uint64_t>(this),
 			                         wake_at, observed, 0, rewake_at);
+			const CpPar::WaitScope stall("parked (wake at op, progress word)", wake_at, observed);
 			m_progress.wait(observed, std::memory_order_seq_cst);
 		}
 		m_parked.fetch_sub(1, std::memory_order_seq_cst);
@@ -249,6 +251,7 @@ uint64_t Sequencer::AwaitAnswer(uint64_t op_sequence) {
 
 void Sequencer::Run() {
 	KYTY_PROFILER_THREAD("CpSequencer");
+	CpPar::SetWaitSlot(4); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1: the stall watchdog)
 	// The resolver waits for it at every ordering point, like a CP waits for its fetcher.
 	Common::RaiseCurrentThreadPriority();
 #if defined(_WIN32)

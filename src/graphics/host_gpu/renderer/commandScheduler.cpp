@@ -622,6 +622,8 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	}
 	HangWatchdog::Scope wait("priority-completion", reinterpret_cast<uint64_t>(this), tick,
 	                         m_priority_active_tick, 0, m_priority_operations.size());
+	const CpPar::WaitScope stall("priority operations (tick, running tick)", tick,
+	                             m_priority_active_tick); // Astro Bot PC (concurrent watchdog)
 	if (const auto spin_ns = PriorityWaitSpinNs(); spin_ns != 0) {
 		// Spin on the runner's progress counter and take the lock only when it moves: the
 		// runner needs the lock to finish each operation.
@@ -951,6 +953,21 @@ void CommandScheduler::ReserveLaneOrder(uint32_t lane) {
 	CpPar::NoteLaneStat(lane, CpPar::LaneStat::ReservedOrders, 1);
 }
 
+bool CommandScheduler::DebugLaneOrders(std::array<uint64_t, MaxLanes>& orders,
+                                       std::array<bool, MaxLanes>& reserved, uint64_t& turn,
+                                       uint64_t& held_orders, uint64_t& last_submit) {
+	std::unique_lock lock(m_operation_mutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		return false;
+	}
+	orders      = m_lane_order;
+	reserved    = m_lane_reserved;
+	turn        = m_turn;
+	held_orders = m_held.size();
+	last_submit = m_last_submit_tick.load(std::memory_order_relaxed);
+	return true;
+}
+
 bool CommandScheduler::LaneOrderOpen(uint32_t lane) {
 	if (!m_lanes_2b || lane >= MaxLanes) {
 		return false;
@@ -981,6 +998,8 @@ void CommandScheduler::WaitLaneTurn(uint32_t lane) {
 		return;
 	}
 	const CpPar::LaneIdleScope idle; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1: overlap accounting)
+	const CpPar::WaitScope     stall(CpPar::TurnReasonName(CpPar::CurrentTurnReason()), m_lane_order[lane],
+	                                 m_turn); // the stall watchdog: (own order, turn)
 	const auto          start = CpPar::NowNs();
 	HangWatchdog::Scope wait("cp-par-2b-submit-turn", reinterpret_cast<uint64_t>(this), lane,
 	                         m_lane_order[lane], m_turn);

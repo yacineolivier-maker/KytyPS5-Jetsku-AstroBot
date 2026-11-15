@@ -292,6 +292,7 @@ public:
 		const auto request          = m_request;
 		auto*      request_argument = m_request_argument;
 		lock.unlock();
+		const WaitScope stall("serving a lane's request", m_lane);
 		t_serving_lane = m_lane;
 		Take();
 		request(request_argument);
@@ -319,6 +320,8 @@ public:
 			if (g_lane_concurrent) {
 				WakeDispatcherImpl(); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): Thread_Gpu polls
 			}
+			const WaitScope stall("request to Thread_Gpu (flip / services)",
+			                      reinterpret_cast<uint64_t>(task));
 			m_wake_b.wait(lock, [this] { return m_state == State::Slice; });
 		}
 		Take();
@@ -341,6 +344,7 @@ private:
 	void Run() {
 		t_lane     = m_lane;
 		t_resolver = this;
+		SetWaitSlot(static_cast<int>(m_lane)); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1: watchdog)
 		switch (m_lane) {
 			case 1: KYTY_PROFILER_THREAD("CP resolver #2"); break;
 			case 2: KYTY_PROFILER_THREAD("CP resolver #3"); break;
@@ -350,7 +354,10 @@ private:
 		Common::RaiseCurrentThreadPriority();
 		std::unique_lock lock(m_mutex);
 		for (;;) {
-			m_wake_b.wait(lock, [this] { return m_state == State::Slice || m_state == State::Stop; });
+			{
+				const WaitScope idle("idle (no slice)");
+				m_wake_b.wait(lock, [this] { return m_state == State::Slice || m_state == State::Stop; });
+			}
 			if (m_state == State::Stop) {
 				return;
 			}
@@ -1192,6 +1199,7 @@ void WaitDispatchEvent(uint64_t timeout_ns) {
 	static uint64_t  seen = 0; // Thread_Gpu only
 	std::unique_lock lock(g_dispatch_mutex);
 	if (g_dispatch_events == seen) {
+		const WaitScope stall("waiting for a lane (lists out, no own work allowed)");
 		g_dispatch_wake.wait_for(lock, std::chrono::nanoseconds(timeout_ns),
 		                         [] { return g_dispatch_events != seen; });
 	}
@@ -1437,6 +1445,8 @@ void LaneLockAcquire() {
 	const auto       ticket = state.next++;
 	if (state.serving != ticket) {
 		const LaneIdleScope idle; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): not translating meanwhile
+		const WaitScope     stall("lanes' lock", g_lane_lock_holder.load(std::memory_order_relaxed),
+		                          ticket);
 		HangWatchdog::Scope wait("cp-par-2b-lane-lock", reinterpret_cast<uint64_t>(&state), t_lane);
 		state.wake.wait(lock, [&state, ticket] { return state.serving == ticket; });
 	}
@@ -1476,6 +1486,164 @@ void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value) {
 	if (index < static_cast<size_t>(LaneStat::Count)) {
 		GetStats().lane_stats[LaneIndex(lane)][index].fetch_add(value, std::memory_order_relaxed);
 	}
+}
+
+// ---- Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, cpParallel.h): the stall watchdog ----
+
+namespace {
+struct WaitSlotState {
+	std::atomic<const char*> what {nullptr};
+	std::atomic<uint64_t>    since {0};
+	std::atomic<uint64_t>    a {0};
+	std::atomic<uint64_t>    b {0};
+};
+std::array<WaitSlotState, WaitSlots> g_wait_slots;
+thread_local int                     t_wait_slot = -1;
+std::atomic<uint64_t>                g_frames_out {0};
+struct StallWatchdog {
+	std::mutex              mutex;
+	std::condition_variable wake;
+	bool                    quit = false;
+	std::thread             thread;
+};
+std::unique_ptr<StallWatchdog> g_stall_watchdog;
+} // namespace
+
+void SetWaitSlot(int slot) noexcept {
+	t_wait_slot = slot >= 0 && slot < WaitSlots ? slot : -1;
+}
+
+WaitScope::WaitScope(const char* what, uint64_t a, uint64_t b) {
+	if (!g_lane_concurrent || t_wait_slot < 0) {
+		return;
+	}
+	m_slot     = t_wait_slot;
+	auto& slot = g_wait_slots[static_cast<size_t>(m_slot)];
+	m_previous = slot.what.load(std::memory_order_relaxed);
+	m_since    = slot.since.load(std::memory_order_relaxed);
+	m_a        = slot.a.load(std::memory_order_relaxed);
+	m_b        = slot.b.load(std::memory_order_relaxed);
+	slot.a.store(a, std::memory_order_relaxed);
+	slot.b.store(b, std::memory_order_relaxed);
+	slot.since.store(NowNs(), std::memory_order_relaxed);
+	slot.what.store(what, std::memory_order_release);
+}
+
+WaitScope::~WaitScope() {
+	if (m_slot < 0) {
+		return;
+	}
+	auto& slot = g_wait_slots[static_cast<size_t>(m_slot)];
+	slot.a.store(m_a, std::memory_order_relaxed);
+	slot.b.store(m_b, std::memory_order_relaxed);
+	slot.since.store(m_since, std::memory_order_relaxed);
+	slot.what.store(m_previous, std::memory_order_release);
+}
+
+const char* TurnReasonName(TurnReason reason) noexcept {
+	static constexpr const char* names[] = {
+	    "turn wait (submit)",   "turn wait (label op)", "turn wait (write op)", "turn wait (wait op)",
+	    "turn wait (indirect)", "turn wait (draw op)",  "turn wait (flip op)",  "turn wait (service)",
+	    "turn wait (unfinished slice end)", "turn wait (list end)", "turn wait (other op)"};
+	static_assert(std::size(names) == static_cast<size_t>(TurnReason::Count));
+	const auto index = static_cast<size_t>(reason);
+	return index < std::size(names) ? names[index] : "turn wait";
+}
+
+void NoteFrameOut() noexcept {
+	g_frames_out.fetch_add(1, std::memory_order_relaxed);
+}
+
+void StartStallWatchdog(void (*dump)(void*), void* context) {
+	if (g_stall_watchdog != nullptr) {
+		return;
+	}
+	g_stall_watchdog         = std::make_unique<StallWatchdog>();
+	g_stall_watchdog->thread = std::thread([dump, context] {
+		auto&      watchdog    = *g_stall_watchdog;
+		uint64_t   last_frames = g_frames_out.load(std::memory_order_relaxed);
+		uint64_t   last_change = NowNs();
+		bool       dumped      = false;
+		const auto names = [](int slot) {
+			static constexpr const char* slots[] = {"Thread_Gpu", "lane B (CP resolver #2)",
+			                                        "lane C (CP resolver #3)", "lane D (CP resolver #4)",
+			                                        "CP sequencer"};
+			return slots[slot];
+		};
+		std::unique_lock lock(watchdog.mutex);
+		while (!watchdog.quit) {
+			watchdog.wake.wait_for(lock, std::chrono::seconds(1));
+			if (watchdog.quit) {
+				break;
+			}
+			const auto frames = g_frames_out.load(std::memory_order_relaxed);
+			const auto now    = NowNs();
+			if (frames != last_frames) {
+				last_frames = frames;
+				last_change = now;
+				dumped      = false;
+				continue;
+			}
+			if (dumped || now - last_change < 20'000'000'000ull) {
+				continue;
+			}
+			dumped = true;
+			std::printf("Kyty CpPar 2b concurrent: STALL: no frame for %.1f s (%" PRIu64
+			            " frames so far); state:\n",
+			            static_cast<double>(now - last_change) / 1e9, frames);
+			for (int slot = 0; slot < WaitSlots; slot++) {
+				const auto& s     = g_wait_slots[static_cast<size_t>(slot)];
+				const char* what  = s.what.load(std::memory_order_acquire);
+				const auto  since = s.since.load(std::memory_order_relaxed);
+				std::printf("Kyty CpPar 2b concurrent:   %s: %s", names(slot),
+				            what != nullptr ? what : "running (no wait noted)");
+				if (what != nullptr) {
+					std::printf(" for %.3f s (0x%" PRIx64 ", 0x%" PRIx64 ")",
+					            since != 0 ? static_cast<double>(now - since) / 1e9 : 0.0,
+					            s.a.load(std::memory_order_relaxed), s.b.load(std::memory_order_relaxed));
+				}
+				std::printf("\n");
+			}
+			const auto holder = g_lane_lock_holder.load(std::memory_order_acquire);
+			uint64_t   next = 0, serving = 0;
+			bool       read = false;
+			{
+				auto&            state = GetLaneLock();
+				std::unique_lock lane_lock(state.mutex, std::try_to_lock);
+				if (lane_lock.owns_lock()) {
+					next    = state.next;
+					serving = state.serving;
+					read    = true;
+				}
+			}
+			std::printf("Kyty CpPar 2b concurrent:   lanes' lock: holder %c%s, tickets %s %" PRIu64
+			            " taken / %" PRIu64 " served\n",
+			            holder == UINT32_MAX ? '-' : LaneLetter(holder), holder == UINT32_MAX ? " (free)" : "",
+			            read ? "" : "(busy, not read)", next, serving);
+			std::fflush(stdout);
+			lock.unlock();
+			dump(context);
+			std::fflush(stdout);
+			lock.lock();
+		}
+	});
+	std::printf("Kyty CpPar: 2b concurrent stall watchdog on (state printed once after 20 s without a "
+	            "frame)\n");
+}
+
+void StopStallWatchdog() {
+	if (g_stall_watchdog == nullptr) {
+		return;
+	}
+	{
+		std::lock_guard lock(g_stall_watchdog->mutex);
+		g_stall_watchdog->quit = true;
+	}
+	g_stall_watchdog->wake.notify_all();
+	if (g_stall_watchdog->thread.joinable()) {
+		g_stall_watchdog->thread.join();
+	}
+	g_stall_watchdog.reset();
 }
 
 void MaybeReport() {

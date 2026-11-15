@@ -259,6 +259,11 @@ public:
 	void               ReserveLaneOrder(uint32_t lane);
 	// The lane has an open (or reserved) segment order.
 	[[nodiscard]] bool LaneOrderOpen(uint32_t lane);
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, stall watchdog): the lanes' orders (UINT64_MAX: none),
+	// reserved flags, the turn and the segment orders with held operations; false when the
+	// operation lock is busy (never waits: the watchdog runs while threads may be stuck).
+	bool DebugLaneOrders(std::array<uint64_t, MaxLanes>& orders, std::array<bool, MaxLanes>& reserved,
+	                     uint64_t& turn, uint64_t& held_orders, uint64_t& last_submit);
 	[[nodiscard]] bool Lanes() const noexcept { return m_lanes; }
 	[[nodiscard]] uint32_t LaneCount() const noexcept { return m_lane_count; }
 	// The calling thread's context (0 unless it records into stream 1).

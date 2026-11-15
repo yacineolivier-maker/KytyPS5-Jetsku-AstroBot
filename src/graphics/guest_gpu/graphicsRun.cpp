@@ -107,6 +107,33 @@ static thread_local GuestGpu*         g_gpu_state         = nullptr;
 // 0 being FIFO), and, on Thread_Gpu, the lane whose kept segment it records into.
 static std::atomic<uint32_t>          g_cp_par_kept_lane {UINT32_MAX};
 static thread_local uint32_t          t_cp_par_adopted = UINT32_MAX;
+// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, stall watchdog): Thread_Gpu's state, published every 50 ms
+// by CpParConcurrentStep for the watchdog thread (which never takes a lock a stuck thread may hold).
+namespace {
+struct CpParPublished {
+	std::atomic<uint64_t>                updated_ns {0};
+	std::atomic<uint32_t>                flights {0};
+	std::array<std::atomic<uint64_t>, 4> flight_seq {};
+	std::array<std::atomic<uint32_t>, 4> flight_lane {};
+	std::array<std::atomic<uint32_t>, 4> flight_done {};
+	std::atomic<uint32_t>                home {0};
+	std::atomic<uint32_t>                adopted {UINT32_MAX};
+	std::atomic<uint32_t>                step {0}; // the last CpParStep (0 run, 1 progress, 2 wait)
+	std::atomic<uint32_t>                queue0 {0};
+	std::atomic<uint64_t>                front_seq {0};
+	std::atomic<uint32_t>                front_context {0};
+	std::atomic<uint32_t>                front_flags {0}; // 1 blocked, 2 started, 4 graphics, 8 fence passed
+	std::atomic<uint64_t>                front_fence {0};
+	std::atomic<uint64_t>                front_hold_ns {0};
+	std::atomic<uint32_t>                other_queued {0};
+	std::atomic<uint32_t>                submission_count {0};
+	std::atomic<uint32_t>                commands {0};
+	std::atomic<uint64_t>                in_flight_first {0};
+	std::atomic<uint64_t>                in_flight_size {0};
+	std::atomic<uint32_t>                processing {0};
+};
+CpParPublished g_cp_par_pub;
+} // namespace
 // KYTY_CP_SEQ=1: the sequencer thread (the graphics front); only it emits thread-mode ops.
 static thread_local bool g_sequencer_thread = false;
 
@@ -1019,6 +1046,7 @@ void GuestGpu::Shutdown() {
 		m_thread.join();
 	}
 	// Astro Bot PC (KYTY_CP_PAR): Thread_Gpu returned, resolver #2 is idle.
+	CpPar::StopStallWatchdog(); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1)
 	CpPar::Stop();
 	if (m_sequencer != nullptr) {
 		// The GPU thread executed every admitted submission's ops; the sequencer is idle.
@@ -2421,6 +2449,12 @@ void GuestGpu::ThreadRun(void* data) {
 		// its interleave points and while it waits for the run-ahead.
 		(void)CpPar::OpLockAcquire(0);
 	}
+	if (CpPar::LaneConcurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the stall watchdog (cpParallel.h).
+		CpPar::SetWaitSlot(0);
+		CpPar::StartStallWatchdog([](void* context) { static_cast<GuestGpu*>(context)->CpParStallDump(); },
+		                          gpu);
+	}
 
 	const bool wakeups       = CpWakeupsEnabled();
 	uint64_t   spin_deadline = 0; // 0: not spinning on blocked queues
@@ -2447,6 +2481,7 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				HangWatchdog::Scope idle("cp-no-work", reinterpret_cast<uint64_t>(gpu));
+				const CpPar::WaitScope stall_idle("no work (no command, no submission)");
 				const CpGaps::Scope gap(CpGaps::Cat::Idle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
@@ -2501,6 +2536,8 @@ void GuestGpu::ThreadRun(void* data) {
 					HangWatchdog::Scope suspended("cp-all-queues-suspended",
 					                              reinterpret_cast<uint64_t>(gpu),
 					                              gpu->m_submission_count);
+					const CpPar::WaitScope stall_blocked("every queue suspended or held (submissions)",
+					                                     gpu->m_submission_count);
 					gpu->m_processing = false;
 					const CpGaps::Scope gap(CpGaps::Cat::Blocked);
 					if (!wakeups) {
@@ -2573,6 +2610,10 @@ void GuestGpu::ThreadRun(void* data) {
 		// out) or in the unfinished head's kept segment, then under the lanes' lock while younger
 		// lists are out (CpParConcurrentStep allowed it: CpParCanGoHome).
 		std::optional<CpPar::LaneLockScope> own_work_lock;
+		const CpPar::WaitScope stall_own(command ? "own work: a service command"
+		                                         : "own work: a submission (queue, sequence)",
+		                                 has_submission ? submission.queue_id : 0,
+		                                 has_submission ? submission.sequence : 0);
 		if (CpPar::LaneConcurrent()) {
 			gpu->CpParGoHome();
 			if (!gpu->m_cp_par_flights.empty()) {
@@ -5531,7 +5572,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			Sync::WriteAtEndOfPipeOnlyFlip(LaneCp().submit_id, command, flip.handle, flip.index,
 			                               flip.flip_mode, flip.flip_arg, request);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); // the frame boundary: live switches (KYTY_LIVE_FILE)
+			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); CpPar::NoteFrameOut(); // the frame boundary: live switches (KYTY_LIVE_FILE)
 			return;
 		}
 		case CpSeq::FlipVariant::Label: {
@@ -5558,7 +5599,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			                                 flip.handle, flip.index, flip.flip_mode,
 			                                 flip.flip_arg, request);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
+			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); CpPar::NoteFrameOut();
 			return;
 		}
 		case CpSeq::FlipVariant::LabelInterrupt: {
@@ -5590,7 +5631,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 				                                 flip.handle, flip.index, flip.flip_mode,
 				                                 flip.flip_arg, request);
 				GetScheduler().Flush();
-				Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
+				Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); CpPar::NoteFrameOut();
 				return;
 			}
 			StreamCopyDefer::NoteGuestWrite(op.dst, sizeof(value));
@@ -5602,7 +5643,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			    LaneCp().submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, flip.handle,
 			    flip.index, flip.flip_mode, flip.flip_arg, request, m_interrupt_event_id);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
+			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); CpPar::NoteFrameOut();
 			return;
 		}
 	}
@@ -5624,7 +5665,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
-	Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); // a CPU-submitted flip's frame boundary (KYTY_LIVE_FILE)
+	Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); CpPar::NoteFrameOut(); // a CPU-submitted flip's frame boundary (KYTY_LIVE_FILE)
 }
 
 void CommandProcessor::SynchronizeGpu() {
@@ -7407,10 +7448,107 @@ GuestGpu::CpParStep GuestGpu::CpParConcurrentStep() {
 	while (CpParTryDispatch()) {
 		progress = true;
 	}
-	if (progress) {
-		return CpParStep::Progress;
+	const auto step = progress ? CpParStep::Progress : (CpParCanGoHome() ? CpParStep::Run : CpParStep::Wait);
+	CpParPublish(step);
+	return step;
+}
+
+// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, stall watchdog): Thread_Gpu's state for the watchdog thread.
+void GuestGpu::CpParPublish(CpParStep step) {
+	const auto now = CpPar::NowNs();
+	auto&      pub = g_cp_par_pub;
+	if (now - pub.updated_ns.load(std::memory_order_relaxed) < 50'000'000ull) {
+		pub.step.store(static_cast<uint32_t>(step), std::memory_order_relaxed);
+		return;
 	}
-	return CpParCanGoHome() ? CpParStep::Run : CpParStep::Wait;
+	pub.flights.store(static_cast<uint32_t>(m_cp_par_flights.size()), std::memory_order_relaxed);
+	for (size_t i = 0; i < pub.flight_seq.size(); i++) {
+		const bool valid = i < m_cp_par_flights.size();
+		pub.flight_seq[i].store(valid ? m_cp_par_flights[i]->submission.sequence : 0, std::memory_order_relaxed);
+		pub.flight_lane[i].store(valid ? m_cp_par_flights[i]->lane : 0, std::memory_order_relaxed);
+		pub.flight_done[i].store(valid && m_cp_par_flights[i]->done ? 1u : 0u, std::memory_order_relaxed);
+	}
+	pub.home.store(m_cp_par_home ? 1u : 0u, std::memory_order_relaxed);
+	pub.adopted.store(t_cp_par_adopted, std::memory_order_relaxed);
+	pub.step.store(static_cast<uint32_t>(step), std::memory_order_relaxed);
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		const auto&       queue = m_queues[0];
+		pub.queue0.store(static_cast<uint32_t>(queue.size()), std::memory_order_relaxed);
+		if (!queue.empty()) {
+			const auto& front = queue.front();
+			pub.front_seq.store(front.sequence, std::memory_order_relaxed);
+			pub.front_context.store(front.cp_par_context, std::memory_order_relaxed);
+			pub.front_flags.store((front.blocked ? 1u : 0u) | (front.started ? 2u : 0u) |
+			                          (front.type == SubmissionType::Graphics ? 4u : 0u) |
+			                          (FrameFencePassed(front) ? 8u : 0u),
+			                      std::memory_order_relaxed);
+			pub.front_fence.store(front.frame_fence, std::memory_order_relaxed);
+			pub.front_hold_ns.store(front.fence_hold_ns, std::memory_order_relaxed);
+		}
+		uint32_t other = 0;
+		for (uint32_t id = 1; id < QueueCount; id++) {
+			other += static_cast<uint32_t>(m_queues[id].size());
+		}
+		pub.other_queued.store(other, std::memory_order_relaxed);
+		pub.submission_count.store(m_submission_count, std::memory_order_relaxed);
+		pub.commands.store(static_cast<uint32_t>(m_commands.size()), std::memory_order_relaxed);
+		pub.in_flight_first.store(m_in_flight.empty() ? 0 : *m_in_flight.begin(), std::memory_order_relaxed);
+		pub.in_flight_size.store(m_in_flight.size(), std::memory_order_relaxed);
+		pub.processing.store(m_processing ? 1u : 0u, std::memory_order_relaxed);
+	}
+	pub.updated_ns.store(now, std::memory_order_relaxed);
+}
+
+// The watchdog thread (no lock it may wait for): the published state, the kept segment, the
+// scheduler's orders and turn (try-lock).
+void GuestGpu::CpParStallDump() {
+	const auto& pub = g_cp_par_pub;
+	const auto  now = CpPar::NowNs();
+	static constexpr const char* steps[] = {"run (own work allowed)", "progress", "wait (lists out)"};
+	std::printf("Kyty CpPar 2b concurrent:   Thread_Gpu (published %.3f s ago): last step %s, %s, adopted "
+	            "segment %c; lists out %u:",
+	            static_cast<double>(now - pub.updated_ns.load()) / 1e9, steps[std::min(pub.step.load(), 2u)],
+	            pub.home.load() != 0 ? "home (its own or the head's kept segment)" : "away",
+	            pub.adopted.load() == UINT32_MAX ? '-' : CpPar::LaneLetter(pub.adopted.load()),
+	            pub.flights.load());
+	for (uint32_t i = 0; i < std::min<uint32_t>(pub.flights.load(), 4u); i++) {
+		std::printf(" [list %" PRIu64 " lane %c%s]", pub.flight_seq[i].load(),
+		            CpPar::LaneLetter(pub.flight_lane[i].load()), pub.flight_done[i].load() != 0 ? " ended" : "");
+	}
+	const auto flags = pub.front_flags.load();
+	std::printf("\nKyty CpPar 2b concurrent:   queue 0: %u lists; head list %" PRIu64 " lane %c%s%s%s, %s "
+	            "(fence %" PRIu64 ", held for %.3f s); other queues %u; submissions counted %u, service "
+	            "commands %u, in flight %" PRIu64 " (first %" PRIu64 "), processing %u\n",
+	            pub.queue0.load(), pub.front_seq.load(), CpPar::LaneLetter(pub.front_context.load()),
+	            (flags & 4u) != 0 ? "" : " (not graphics)", (flags & 1u) != 0 ? ", blocked" : "",
+	            (flags & 2u) != 0 ? ", started" : "", (flags & 8u) != 0 ? "fence passed" : "FENCE HELD",
+	            pub.front_fence.load(),
+	            pub.front_hold_ns.load() != 0 ? static_cast<double>(CpNowNs() - pub.front_hold_ns.load()) / 1e9
+	                                          : 0.0,
+	            pub.other_queued.load(), pub.submission_count.load(), pub.commands.load(),
+	            pub.in_flight_size.load(), pub.in_flight_first.load(), pub.processing.load());
+	const auto kept = g_cp_par_kept_lane.load(std::memory_order_acquire);
+	std::array<uint64_t, CommandScheduler::MaxLanes> orders {};
+	std::array<bool, CommandScheduler::MaxLanes>     reserved {};
+	uint64_t turn = 0, held = 0, last_submit = 0;
+	if (m_renderer.GetCommandScheduler().DebugLaneOrders(orders, reserved, turn, held, last_submit)) {
+		std::printf("Kyty CpPar 2b concurrent:   kept segment: lane %c; turn %" PRIu64 "; orders:",
+		            kept == UINT32_MAX ? '-' : CpPar::LaneLetter(kept), turn);
+		for (uint32_t lane = 0; lane < CpPar::ContextCount(); lane++) {
+			if (orders[lane] == UINT64_MAX) {
+				std::printf(" %c none;", CpPar::LaneLetter(lane));
+			} else {
+				std::printf(" %c %" PRIu64 "%s%s;", CpPar::LaneLetter(lane), orders[lane],
+				            reserved[lane] ? " (reserved, not begun)" : "", orders[lane] == turn ? " (oldest)" : "");
+			}
+		}
+		std::printf(" segments with held operations %" PRIu64 "; last submitted tick %" PRIu64 "\n", held,
+		            last_submit);
+	} else {
+		std::printf("Kyty CpPar 2b concurrent:   kept segment: lane %c; scheduler busy (orders not read)\n",
+		            kept == UINT32_MAX ? '-' : CpPar::LaneLetter(kept));
+	}
 }
 
 // Astro Bot PC (KYTY_CP_PAR=1b5, cpParallel.h): Thread_Gpu, op lock held, right after the oldest
@@ -8419,6 +8557,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			Profiler::ScopedFrameWait starved(Profiler::FrameWait::CpSeqResolverStarved);
 			const CpGaps::Scope       starved_gap(CpGaps::Cat::Starved);
 			const CpPar::LaneIdleScope starved_idle; // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1: overlap)
+			const CpPar::WaitScope     starved_stall("starved: the sequencer's next op (list)", submission);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqResolverStarved);
 			const auto start    = CpNowNs();
 			bool       produced = false;

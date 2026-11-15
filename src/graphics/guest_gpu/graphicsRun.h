@@ -178,6 +178,10 @@ private:
 	// ended ones in list order, hands out the next lists. Run: Thread_Gpu may do its own work now
 	// (after CpParGoHome); Wait: lists are out and it may not.
 	CpParStep   CpParConcurrentStep();
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, stall watchdog): Thread_Gpu publishes its state; the
+	// watchdog thread prints it (cpParallel.h StartStallWatchdog).
+	void        CpParPublish(CpParStep step);
+	void        CpParStallDump();
 	bool        CpParTryDispatch();
 	void        CpParCollect(CpParFlight& flight);
 	[[nodiscard]] bool CpParCanGoHome() const;
