@@ -8557,6 +8557,10 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			}
 			CpPar::LaneLockAcquire();
 			concurrent_op.held = true;
+			if (reason != CpPar::TurnReason::Count) {
+				// Controls (0 expected): a visible op runs as the oldest segment, in op order.
+				CpPar::NoteVisibleOp(context, sequence, GetScheduler().LaneSegmentOldest(context));
+			}
 		}
 		// Placement samples (common/cpuPlacement.h), every 256th op: this thread executes the
 		// graphics queue's packets, and ProcessPacket samples only where packets execute.

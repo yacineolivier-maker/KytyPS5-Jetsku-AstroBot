@@ -1717,6 +1717,9 @@ void MaybeReport() {
 		}
 		std::printf("CpPar 10s: 2a lanes (%u): %s\n", g_lane_count, lanes.c_str());
 	}
+	// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the LaneStat values taken for the 2b line, kept for
+	// the concurrent line below.
+	uint64_t taken[MaxLanes][static_cast<size_t>(LaneStat::Count)] = {};
 	if (Lanes2b()) {
 		// Astro Bot PC (KYTY_CP_PAR=2b): per lane, its replay thread (busy time, waits for its turn
 		// to hand a buffer to the queue).
@@ -1725,6 +1728,7 @@ void MaybeReport() {
 			uint64_t v[static_cast<size_t>(LaneStat::Count)] = {};
 			for (size_t i = 0; i < std::size(v); i++) {
 				v[i] = take(stats.lane_stats[lane][i]);
+				taken[lane][i] = v[i];
 			}
 			const auto ms = [&v](LaneStat stat) {
 				return static_cast<double>(v[static_cast<size_t>(stat)]) / 1e6;
@@ -1765,6 +1769,50 @@ void MaybeReport() {
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());
+	}
+	if (LaneConcurrent()) {
+		// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): the overlap (time with 2+ / 3+ lanes translating:
+		// in a slice, not waiting for their turn, the lanes' lock or the sequencer), Thread_Gpu's
+		// hand-outs, and per lane the turn waits by reason and the controls (0 expected: visible ops
+		// not oldest / out of order).
+		static constexpr const char* reasons[] = {"submit",   "label", "write",   "wait",
+		                                          "indirect", "draw",  "flip",    "service",
+		                                          "slice",    "list-end", "other"};
+		static_assert(std::size(reasons) == static_cast<size_t>(TurnReason::Count));
+		std::string lanes;
+		for (uint32_t lane = 0; lane < g_lane_count && lane < MaxLanes; lane++) {
+			const auto n = [&taken, lane](LaneStat stat) { return taken[lane][static_cast<size_t>(stat)]; };
+			std::string waits;
+			for (size_t r = 0; r < std::size(reasons); r++) {
+				const auto count = take(stats.turn_waits[lane][r]);
+				const auto ns    = take(stats.turn_ns[lane][r]);
+				if (count != 0) {
+					char item[96];
+					std::snprintf(item, sizeof(item), " %s %" PRIu64 " (%.1f ms)", reasons[r], count,
+					              static_cast<double>(ns) / 1e6);
+					waits += item;
+				}
+			}
+			char item[1024];
+			std::snprintf(item, sizeof(item),
+			              "%s%c: active %.1f ms, slices handed out %" PRIu64 " (back unfinished %" PRIu64
+			              "); turn waits:%s; out-of-turn submits %" PRIu64 ", visible ops not oldest %" PRIu64
+			              ", out of order %" PRIu64 ", dependency hazards %" PRIu64
+			              ", services left to the oldest %" PRIu64 ", retires held for younger %" PRIu64,
+			              lane == 0 ? "" : "; ", LaneLetter(lane),
+			              static_cast<double>(n(LaneStat::ActiveNs)) / 1e6, n(LaneStat::Dispatched),
+			              n(LaneStat::CollectedUnfinished), waits.empty() ? " none" : waits.c_str(),
+			              n(LaneStat::OutOfTurnSubmits), n(LaneStat::VisibleNotOldest),
+			              n(LaneStat::VisibleOutOfOrder), n(LaneStat::DependencyHazards),
+			              n(LaneStat::YoungerServices), n(LaneStat::RetiresHeld));
+			lanes += item;
+		}
+		std::printf("CpPar 10s: 2b concurrent (%u): overlap 2+ lanes %.1f ms, 3+ lanes %.1f ms; most "
+		            "lists out %" PRIu64 "; Thread_Gpu own work under the lanes' lock %" PRIu64
+		            ", garbage collections deferred %" PRIu64 "; %s\n",
+		            g_lane_count, static_cast<double>(take(stats.overlap2_ns)) / 1e6,
+		            static_cast<double>(take(stats.overlap3_ns)) / 1e6, take(stats.flights_max),
+		            take(stats.own_work_locked), take(stats.gc_deferred), lanes.c_str());
 	}
 	std::fflush(stdout);
 }
