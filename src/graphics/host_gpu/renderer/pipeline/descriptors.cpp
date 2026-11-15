@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/cbRanges.h"
+#include "graphics/guest_gpu/command_processor/cpParallel.h" // Astro Bot PC (KYTY_CP_PAR=2b)
 #include "graphics/host_gpu/renderer/listCensus.h" // Astro Bot PC (KYTY_CP_PAR_CENSUS2)
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/nativeLearn.h" // Astro Bot PC (KYTY_NATIVE_MODE=s0)
@@ -225,6 +226,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	ListCensus::NoteBuffer(address, size, resource.written); // Astro Bot PC (KYTY_CP_PAR_CENSUS2)
+	if (CpPar::Lanes2b()) {
+		// Astro Bot PC (KYTY_CP_PAR=2b, steps 4-5): dependencies between lanes.
+		context.GetCommandScheduler().NoteLaneBuffer(address, size, resource.written);
+	}
 	const auto& graphics  = context.GetGraphics();
 	// A buffer bound as a uniform buffer (KYTY_UNIFORM_BUFFERS) meets both offset alignments, so
 	// the one base adjustment in shader data serves either view.

@@ -759,9 +759,79 @@ bool CommandScheduler::EnableLanes2b() {
 		m_lane_order.fill(UINT64_MAX);
 		m_lane_order[0] = 0;
 		m_turn          = 0;
+		// Steps 4-5 (commandScheduler.h): the registry runs with KYTY_CP_PAR_VERIFY=1.
+		m_deps_active = CpPar::VerifyEnabled();
 	}
 	m_lanes_2b = true;
 	return true;
+}
+
+// Astro Bot PC (KYTY_CP_PAR=2b, steps 4-5, commandScheduler.h).
+void CommandScheduler::NoteLaneBuffer(uint64_t address, uint64_t size, bool written) {
+	if (!m_deps_active || size == 0) {
+		return;
+	}
+	const auto lane = MasterSemaphore::ThreadTickLane();
+	if (lane >= MaxLanes) {
+		return;
+	}
+	const auto order = m_lane_order[lane]; // written by this thread only
+	if (order == UINT64_MAX) {
+		return;
+	}
+	const LaneRange range {address, address + size};
+	const auto      overlaps = [&range](const std::vector<LaneRange>& ranges) {
+		for (const auto& r: ranges) {
+			if (r.begin < range.end && range.begin < r.end) {
+				return true;
+			}
+		}
+		return false;
+	};
+	std::unique_lock lock(m_operation_mutex);
+	CpPar::NoteLaneStat(lane, CpPar::LaneStat::DependencyChecks, 1);
+	// Step 4: the youngest older open segment that wrote the range ends first (then the next one).
+	for (;;) {
+		uint64_t writer = UINT64_MAX;
+		for (const auto& [other, ranges]: m_segment_ranges) {
+			if (other >= order) {
+				break;
+			}
+			if (overlaps(ranges.written)) {
+				writer = other;
+			}
+		}
+		if (writer == UINT64_MAX) {
+			break;
+		}
+		const auto          start = CpPar::NowNs();
+		HangWatchdog::Scope wait("cp-par-2b-dependency", reinterpret_cast<uint64_t>(this), lane, order,
+		                         writer, address);
+		m_turn_changed.wait(lock, [this, writer] { return OrderEndedLocked(writer); });
+		CpPar::NoteLaneStat(lane, CpPar::LaneStat::DependencyWaits, 1);
+		CpPar::NoteLaneStat(lane, CpPar::LaneStat::DependencyWaitNs, CpPar::NowNs() - start);
+	}
+	// Step 5: a younger open segment bound the range before this write.
+	if (written) {
+		for (auto it = m_segment_ranges.upper_bound(order); it != m_segment_ranges.end(); ++it) {
+			if (overlaps(it->second.bound)) {
+				CpPar::NoteLaneStat(lane, CpPar::LaneStat::OrderViolations, 1);
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+					std::printf("Kyty CpPar 2b: order violation: segment %" PRIu64 " (lane %c) writes "
+					            "0x%016" PRIx64 "+0x%" PRIx64 " that younger segment %" PRIu64
+					            " already bound\n",
+					            order, static_cast<char>('A' + lane), address, size, it->first);
+				}
+				break;
+			}
+		}
+	}
+	auto& mine = m_segment_ranges[order];
+	mine.bound.push_back(range);
+	if (written) {
+		mine.written.push_back(range);
+	}
 }
 
 // Astro Bot PC (KYTY_CP_PAR=2b, commandScheduler.h): the producer-side turn.
@@ -797,6 +867,7 @@ void CommandScheduler::AdvanceTurnLocked() {
 }
 
 void CommandScheduler::EndOrderLocked(uint64_t order) {
+	m_segment_ranges.erase(order); // steps 4-5: fully recorded
 	if (order == m_turn) {
 		AdvanceTurnLocked();
 		while (m_ended_early.erase(m_turn) != 0) {

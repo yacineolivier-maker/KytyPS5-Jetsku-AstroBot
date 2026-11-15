@@ -216,6 +216,20 @@ public:
 	// held.
 	// The thread's lane for the tick ranges (MasterSemaphore::SetThreadTickLane).
 	static void SetThreadTickLane(uint32_t lane) noexcept { MasterSemaphore::SetThreadTickLane(lane); }
+	// Astro Bot PC (KYTY_CP_PAR=2b, P2 steps 4-5): dependencies between lanes. One storage-buffer
+	// binding by the calling lane thread's segment (`written`: the shader may write the range;
+	// pipeline/descriptors.cpp NativeStorageBuffer, the GPU-thread binding site). A registry keeps,
+	// per open segment order, the ranges it bound and the ones it wrote (dropped when the segment
+	// ends: it is fully recorded then). Step 4: a binding of a range that an OLDER open segment
+	// wrote waits until that segment has ended, so that it sees that segment's last write as serial
+	// order would (counted with the time waited). Step 5: a write to a range that a YOUNGER open
+	// segment already bound is an order violation (the younger one bound it before this write;
+	// serial order is the other way round; only a re-execution, P4, could repair it): counted, the
+	// first 16 logged. Active with KYTY_CP_PAR_VERIFY=1 (also when the lanes run in turn, as a
+	// self-test of the bookkeeping: no other segment is then ever open, so nothing may wait or be
+	// violated); without it the registry costs nothing (lanes in turn need none). Images and render
+	// targets are not registered yet.
+	void NoteLaneBuffer(uint64_t address, uint64_t size, bool written);
 	[[nodiscard]] bool Lanes() const noexcept { return m_lanes; }
 	[[nodiscard]] uint32_t LaneCount() const noexcept { return m_lane_count; }
 	// The calling thread's context (0 unless it records into stream 1).
@@ -316,6 +330,21 @@ private:
 	std::condition_variable                  m_turn_changed;
 
 	std::atomic<uint64_t>                    m_last_submit_tick {0};
+	// Astro Bot PC (KYTY_CP_PAR=2b, steps 4-5; m_operation_mutex): the ranges each open segment
+	// (by order) bound and wrote; whether the registry runs.
+	struct LaneRange {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+	struct SegmentRanges {
+		std::vector<LaneRange> bound;
+		std::vector<LaneRange> written;
+	};
+	std::map<uint64_t, SegmentRanges>        m_segment_ranges;
+	bool                                     m_deps_active = false;
+	[[nodiscard]] bool OrderEndedLocked(uint64_t order) const noexcept {
+		return order < m_turn || m_ended_early.count(order) != 0;
+	}
 	// m_operation_mutex held: segment `order` ended (the turn moves on; held operations of the new
 	// oldest segment are queued).
 	void EndOrderLocked(uint64_t order);

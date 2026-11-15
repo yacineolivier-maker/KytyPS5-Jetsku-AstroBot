@@ -250,6 +250,12 @@
 //    that is not its hand-off waits for its turn, and the operations it defers are held until its
 //    turn (queues stay in tick order). Executed in turn, nothing waits and nothing is held (the
 //    2b line counts both).
+//  - dependencies between lanes (steps 4-5, CommandScheduler::NoteLaneBuffer, storage buffers):
+//    with KYTY_CP_PAR_VERIFY=1, a registry of the ranges each open segment bound and wrote; a
+//    binding of a range an older open segment wrote waits for that segment's end, a write to a
+//    range a younger open segment already bound is an order violation (counted, first 16 logged).
+//    In turn no other segment is open: both stay 0 (self-test).
+// Not done yet (step 3): the lanes still run in turn (the token); no global cache lock.
 
 #include <cstdint>
 
@@ -506,6 +512,10 @@ enum class LaneStat : uint32_t {
 	SubmitTurnWaits, // tick ranges: a younger segment's submit (not its hand-off) waited for its turn
 	SubmitTurnNs,
 	HeldOperations,  // tick ranges: operations deferred by a younger segment, held until its turn
+	DependencyChecks, // KYTY_CP_PAR_VERIFY=1: storage-buffer bindings checked against the registry
+	DependencyWaits,  // a binding waited for an older open segment that wrote the range to end
+	DependencyWaitNs,
+	OrderViolations,  // a write to a range a younger open segment already bound
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
