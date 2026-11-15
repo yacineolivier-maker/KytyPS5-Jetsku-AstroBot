@@ -31,6 +31,8 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `69c35cc1` | obstacle 4 | `KYTY_CP_PAR_CONCURRENT=1` : listes confiées sans attendre, recueillies dans l'ordre | BUILD_OK |
 | `c89637e1` | obstacle 5 | attente du tour avant toute opération visible ; retraits partagés tenus ; `Finish` par voie | BUILD_OK |
 | `68d86418` | compteurs | ligne « CpPar 10s: 2b concurrent », contrôles d'ordre | BUILD_OK |
+| `9e05e27b` | blocage 15/11 | délai de sécurité de la barrière de trame rétabli ; tranche inachevée soumise | BUILD_OK |
+| `1ff2bee9` | chien de garde | état de chaque voie après 20 s sans image | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
 
@@ -242,7 +244,67 @@ qui tourne est toujours le plus ancien), « dumps outside the lock » doit tombe
 
 
 
-### `KYTY_CP_PAR_CONCURRENT=1` : obstacles 4 et 5 — faits le 15/11 au soir (non essayés en jeu)
+### Blocage à l'écran-titre (essai du 15/11, 19 h 01) et chien de garde
+
+**Constat** (journal `Jeu\KytyPS5_U59\journaux\console-20261115-190156.txt`, `KYTY_CP_PAR_LANES=3`) :
+après ~10 s normales (B 8319 tranches dont 7826 inachevées — les attentes de flip —, C 329, contrôles à
+0), plus rien : 0 tranche confiée, 0 liste, « most lists out 0 », alors que Thread_Gpu tourne encore
+(la ligne « CpPar 10s » est écrite par lui toutes les 10 s) ; processeur à 2 %. Donc Thread_Gpu ne
+confiait plus aucune liste et n'avait pas de travail propre possible.
+
+**Cause la plus probable, trouvée dans le code (non prouvée faute d'état au moment du blocage).** En mode
+simultané la sélection de la boucle principale ne regarde plus la file 0 (`CpParQueue0Held`, testé
+*avant* le test de barrière de trame) et `CpParTryDispatch` rendait faux quand la tête ne passait pas
+`FrameFencePassed`, sans noter `fence_hold_ns`. Or le délai de sécurité de la barrière (2 s,
+`FrameFenceTimeoutNs`) se compte depuis `fence_hold_ns`, que seule la sélection posait. Une tête retenue
+par une barrière que rien d'autre ne lève (à tour de rôle : passée au bout de 2 s, « CP frame fence: …
+running it anyway ») restait donc retenue pour toujours : exactement l'état observé (rien dehors, file 0
+non vide, aucune activité). Corrigé (`9e05e27b`) : `fence_hold_ns` noté à chaque refus ; compteurs
+« fence holds (timeouts) » ; message « frame fence: list … handed out anyway » au premier délai dépassé.
+
+**Écart corrigé au passage** (cycle possible, non observé) : à tour de rôle, après une tranche inachevée,
+Thread_Gpu soumet (`BufferFlush`) ce que la voie a enregistré dans son segment gardé. Le mode simultané
+ne le faisait pas : étiquettes, interruptions ou demandes de flip enregistrées avant l'attente restaient
+dans le tampon ouvert, alors que l'attente (ou une file de calcul, ou le jeu) peut dépendre de ce
+travail. Désormais la voie soumet elle-même à la fin d'une tranche inachevée qui a avancé (à son tour,
+sous le verrou) ; compteur « unfinished-slice flushes ».
+
+**Autres cycles examinés (pas de cycle trouvé)** : attente du tour d'une opération visible contre tête
+suspendue (la tête gardée est la plus ancienne ; Thread_Gpu la reconfie après l'attente des files
+suspendues, ≤ 1 s) ; Thread_Gpu qui ne confie rien au-delà d'une liste inachevée (seule la tête attend,
+les plus jeunes déjà dehors finissent ou attendent leur tour sans rien tenir) ; WaitRegMem d'une voie
+plus jeune sur une étiquette d'une autre liste (opération du tour : exécutée seulement quand toutes les
+listes plus anciennes sont finies, comme en série ; une attente sur une liste plus jeune bloquerait aussi
+en série) ; flips et services renvoyés (seulement par la plus ancienne ; Thread_Gpu les sert dans chaque
+pas, en détenteur délégué du verrou). Le séquenceur s'arrête à toute attente pas à pas non répondue de la
+tête : les voies plus jeunes attendent alors leurs opérations en tournant (`yield`), sans rien tenir.
+Non fait : « rendre son segment » pour une voie plus jeune (il faudrait plusieurs segments gardés à la
+fois ; l'ordre de segment est fixé à la remise).
+
+**Chien de garde** (`1ff2bee9`, actif avec `KYTY_CP_PAR_CONCURRENT=1`, message au démarrage « stall
+watchdog on »). Si aucun flip ne sort pendant 20 s, une fois (réarmé quand les images reprennent), des
+lignes « Kyty CpPar 2b concurrent: STALL: no frame for … » puis :
+- pour Thread_Gpu, chaque voie et le séquenceur : ce qu'il attend et depuis combien de temps, avec deux
+  valeurs (attente du tour par type : propre ordre, tour ; verrou des voies : titulaire, ticket ; requête
+  à Thread_Gpu ; inactif ; famine : liste ; tick GPU : tick attendu, tick connu ; opérations
+  prioritaires ; séquenceur garé : opération de réveil ; Thread_Gpu : « waiting for a lane », « every
+  queue suspended or held », « no work », « own work ») — « running (no wait noted) » sinon ;
+- verrou des voies : titulaire et tickets pris/servis ;
+- Thread_Gpu publié (toutes les 50 ms) : dernier pas (run / progress / wait), chez lui ou non, segment
+  adopté, listes dehors (liste, voie, finie) ;
+- file 0 : nombre, tête (liste, voie, bloquée, commencée, barrière passée ou **FENCE HELD** et depuis
+  quand), autres files, soumissions comptées, services en attente, `m_in_flight` (taille, premier) ;
+- segment gardé, tour, ordre de chaque voie (réservé, plus ancien), segments à opérations retenues,
+  dernier tick soumis (lecture de l'ordonnanceur sans attendre ; « scheduler busy » sinon).
+Au démarrage, si les shaders prennent plus de 20 s avant la première image, un rapport « STALL » peut
+sortir une fois sans blocage réel.
+
+**À vérifier en jeu** : même essai (`KYTY_CP_PAR_LANES=3`, `KYTY_CP_PAR_CONCURRENT=1`). Si le jeu passe
+l'écran-titre : relever « fence holds (timeouts) » (des délais dépassés confirmeraient la cause ; ils
+existent aussi à tour de rôle, à comparer) et « unfinished-slice flushes », puis les attendus de la
+section précédente. S'il bloque encore : envoyer les lignes « STALL » (elles nomment le cycle).
+
+### `KYTY_CP_PAR_CONCURRENT=1` : obstacles 4 et 5 — faits le 15/11 au soir
 
 Trois commits compilés (BUILD_OK chacun, aucun nouvel avertissement hors « profile data may be out of
 date » des fonctions modifiées, inhérent au PGO). **Défaut 0 : rien ne change** (tout est derrière
