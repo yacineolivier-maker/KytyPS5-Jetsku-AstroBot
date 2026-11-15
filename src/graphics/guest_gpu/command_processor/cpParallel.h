@@ -255,7 +255,13 @@
 //    binding of a range an older open segment wrote waits for that segment's end, a write to a
 //    range a younger open segment already bound is an order violation (counted, first 16 logged).
 //    In turn no other segment is open: both stay 0 (self-test).
-// Not done yet (step 3): the lanes still run in turn (the token); no global cache lock.
+//  - step 3b-1: shared objects retired by another user than the last one (descriptor pools) retire
+//    at the largest tick of their users; UploadDma's submit dependency is per lane. "early retires
+//    avoided" counts the cases where the caller's tick would have been too early (0 in turn).
+//  - step 3b-2: the lanes' global lock (LaneLockAcquire) around each op of a lane; IsGpuThread is
+//    also true for its holder. Still in turn (the token): never contended.
+// Not done yet (step 3b-3): simultaneous execution; the CP fields kept across ops, RenderMutex
+// ownership and the sequencer's executed-op counter are still those of the token holder.
 
 #include <cstdint>
 
@@ -517,9 +523,22 @@ enum class LaneStat : uint32_t {
 	DependencyWaitNs,
 	OrderViolations,  // a write to a range a younger open segment already bound
 	EarlyRetires,     // 3b-1: a retire / submit dependency at the caller's tick would have been too early
+	LockTakes,        // 3b-2: the lanes' global lock taken around one op
+	LockWaitNs,       //       time waiting for it
+	LockHoldNs,       //       time holding it
 	Count,
 };
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value);
+// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): the lanes' global lock (FIFO, N lanes), taken by a
+// lane thread around each op it executes (ResolveSubmission), so that once lanes run
+// simultaneously (3b-3) every op touching the caches, image states, stream buffer, descriptor heap
+// and renderer is serialized. In turn it is never contended (statistics only). On in 2b unless
+// KYTY_CP_PAR_LOCK=0. Re-entrant on the holding thread. LaneLockHeld: the calling thread holds it
+// (GuestGpu::IsGpuThread also answers true for it in 2b).
+[[nodiscard]] bool LaneLockEnabled();
+void               LaneLockAcquire();
+void               LaneLockRelease();
+[[nodiscard]] bool LaneLockHeld() noexcept;
 
 enum class Fallback : uint32_t {
 	NoSequencer, // KYTY_CP_SEQ is not 1 (or the sequencer is off): no op ring to split

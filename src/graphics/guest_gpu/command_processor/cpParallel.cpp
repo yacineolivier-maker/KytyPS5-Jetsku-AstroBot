@@ -1070,6 +1070,72 @@ void NoteLaneHandoff(uint32_t context, bool empty, bool skipped) {
 	}
 }
 
+// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2, cpParallel.h): the lanes' global lock.
+namespace {
+struct LaneLockState {
+	std::mutex              mutex;
+	std::condition_variable wake;
+	uint64_t                next    = 0;
+	uint64_t                serving = 0;
+};
+LaneLockState& GetLaneLock() {
+	static LaneLockState state;
+	return state;
+}
+thread_local uint32_t t_lane_lock_depth = 0;
+thread_local uint64_t t_lane_lock_since = 0;
+} // namespace
+
+bool LaneLockEnabled() {
+	static const bool enabled = [] {
+		if (GetMode() != Mode::Lanes2b) {
+			return false;
+		}
+		const auto* value = std::getenv("KYTY_CP_PAR_LOCK");
+		const bool  on    = value == nullptr || std::strcmp(value, "0") != 0;
+		std::printf("Kyty CpPar: 2b global lane lock around each op: %s (KYTY_CP_PAR_LOCK)\n",
+		            on ? "on" : "off");
+		return on;
+	}();
+	return enabled;
+}
+
+void LaneLockAcquire() {
+	if (t_lane_lock_depth++ != 0) {
+		return;
+	}
+	auto&            state = GetLaneLock();
+	const auto       start = NowNs();
+	std::unique_lock lock(state.mutex);
+	const auto       ticket = state.next++;
+	if (state.serving != ticket) {
+		HangWatchdog::Scope wait("cp-par-2b-lane-lock", reinterpret_cast<uint64_t>(&state), t_lane);
+		state.wake.wait(lock, [&state, ticket] { return state.serving == ticket; });
+	}
+	lock.unlock();
+	t_lane_lock_since = NowNs();
+	NoteLaneStat(t_lane, LaneStat::LockTakes, 1);
+	NoteLaneStat(t_lane, LaneStat::LockWaitNs, t_lane_lock_since - start);
+}
+
+void LaneLockRelease() {
+	EXIT_IF(t_lane_lock_depth == 0);
+	if (--t_lane_lock_depth != 0) {
+		return;
+	}
+	NoteLaneStat(t_lane, LaneStat::LockHoldNs, NowNs() - t_lane_lock_since);
+	auto& state = GetLaneLock();
+	{
+		std::lock_guard lock(state.mutex);
+		state.serving++;
+	}
+	state.wake.notify_all();
+}
+
+bool LaneLockHeld() noexcept {
+	return t_lane_lock_depth != 0;
+}
+
 // Astro Bot PC (KYTY_CP_PAR=2b, cpParallel.h).
 void NoteLaneStat(uint32_t lane, LaneStat stat, uint64_t value) {
 	const auto index = static_cast<size_t>(stat);
@@ -1335,13 +1401,15 @@ void MaybeReport() {
 			              "%s%c: replay %.1f ms busy, turn waits %" PRIu64 " (%.1f ms); submit turn "
 			              "waits %" PRIu64 " (%.1f ms), held operations %" PRIu64
 			              "; dependencies checked %" PRIu64 ", waits %" PRIu64 " (%.1f ms), order "
-			              "violations %" PRIu64 ", early retires avoided %" PRIu64,
+			              "violations %" PRIu64 ", early retires avoided %" PRIu64
+			              "; lane lock %" PRIu64 " takes, %.1f ms waiting, %.1f ms held",
 			              lane == 0 ? "" : "; ", LaneLetter(lane), ms(LaneStat::ReplayBusyNs),
 			              n(LaneStat::ReplayTurnWaits), ms(LaneStat::ReplayTurnNs),
 			              n(LaneStat::SubmitTurnWaits), ms(LaneStat::SubmitTurnNs),
 			              n(LaneStat::HeldOperations), n(LaneStat::DependencyChecks),
 			              n(LaneStat::DependencyWaits), ms(LaneStat::DependencyWaitNs),
-			              n(LaneStat::OrderViolations), n(LaneStat::EarlyRetires));
+			              n(LaneStat::OrderViolations), n(LaneStat::EarlyRetires),
+			              n(LaneStat::LockTakes), ms(LaneStat::LockWaitNs), ms(LaneStat::LockHoldNs));
 			lanes += item;
 		}
 		std::printf("CpPar 10s: 2b (%u): %s\n", g_lane_count, lanes.c_str());

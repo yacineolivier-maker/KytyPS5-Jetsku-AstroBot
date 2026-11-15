@@ -774,6 +774,7 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 								// thread; buffers handed to the queue in list order.
 								if (m_renderer.GetCommandScheduler().EnableLanes2b()) {
 									CpPar::g_lanes_2b = true;
+									(void)CpPar::LaneLockEnabled(); // step 3b-2: read once, printed
 									std::printf("Kyty CpPar: 2b: each lane has its own replay thread; "
 									            "native buffers are handed to the queue in list "
 									            "order\n");
@@ -7986,6 +7987,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			auto body = [&] { result = ExecuteOp(kind, view.payload, view.data); };
 			RunOnGpuThreadScoped(body);
 			CpPar::NoteBounce(true);
+		} else if (CpPar::Lanes2b() && CpPar::LaneLockEnabled()) {
+			// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): the op under the lanes' global lock.
+			CpPar::LaneLockAcquire();
+			result = ExecuteOp(kind, view.payload, view.data);
+			CpPar::LaneLockRelease();
 		} else {
 			result = ExecuteOp(kind, view.payload, view.data);
 		}
@@ -8041,7 +8047,9 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 }
 
 bool GuestGpu::IsGpuThread() noexcept {
-	return g_gpu_thread;
+	// Astro Bot PC (KYTY_CP_PAR=2b, step 3b-2): the holder of the lanes' global lock too (in turn
+	// it is the token holder, which already has the identity).
+	return g_gpu_thread || (CpPar::Lanes2b() && CpPar::LaneLockHeld());
 }
 
 } // namespace Libs::Graphics
