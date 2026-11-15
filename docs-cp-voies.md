@@ -36,6 +36,7 @@ derrière `CpPar::Lanes2b()` / `m_lanes_2b`, faux hors 2b).
 | `63f97b56` | blocage 19 h 23 | liste reprise placée avant les listes plus jeunes dehors | BUILD_OK |
 | `390956fe` | arrêt 19 h 30 | une voie commence son segment à côté d'un segment gardé ; messages d'arrêt détaillés | BUILD_OK |
 | `2ff9b678` | mesure | temps du verrou des voies par type d'opération ; contrôle « out-of-order ends » sans course bénigne | BUILD_OK |
+| `2e783086` | P3, étape 1 | `KYTY_CP_PAR_FASTDRAW=1` : attente de l'emplacement préparé hors du verrou | BUILD_OK |
 
 ### Ce que fait 2b (en plus de 2a)
 
@@ -246,6 +247,52 @@ qui tourne est toujours le plus ancien), « dumps outside the lock » doit tombe
 
 
 
+
+### P3, étape 1 : `KYTY_CP_PAR_FASTDRAW=1` (15/11 soir, non essayé en jeu)
+
+**Mesure de départ** (session principale, `console-20261115-200915.txt`, 3 voies, 19,6 i/s) : par 10 s,
+B DrawIndex 305 742 prises / 3,16 s, DrawAuto 36 148 / 0,70 s, DispatchDirect 37 943 / 0,42 s, ReleaseMem
+151 095 / 0,30 s ; C DrawIndex 460 732 / 3,14 s ; hors tour 4,3 + 3,2 s ; reste du verrou 0,14 + 0,09 s.
+~6,3 s des 8,3 s tenus sont des DrawIndex hors tour.
+
+**Nombre de prises de DrawIndex** : une prise par opération (le compte est fait à la libération du
+verrou extérieur, une fois par opération ; les prises internes, ré-entrantes, ne comptent pas). Le
+compte est cohérent avec ~4 300 dessins par image : 4 300 × 19,6 i/s × 10 s ≈ 843 000 par 10 s, pour
+766 000 mesurés (B + C) ; le calcul « 170 000 » de la note oubliait le facteur 10 s. Pas de double prise.
+
+**Ce que fait l'étape 1.** Un dessin validé depuis un emplacement publié (DrawIndex, DrawAuto avec
+`DrawFlagPublished`) ou un dispatch préparé (`DispatchFlagPrepared`) commence par l'attente de tête du
+moteur DrawPrep (`Engine::ReadyHead`) : si un ouvrier prépare encore l'emplacement, la voie tournait en
+attendant… en tenant le verrou des voies, donc en arrêtant les autres voies. Avec `KYTY_CP_PAR_FASTDRAW=1`
+la voie attend d'abord **hors du verrou** que l'emplacement soit prêt (`Engine::WaitHeadPrepared` :
+lecture seule de l'état de l'emplacement, sans le réclamer ni le préparer ; 2 ms au plus, ensuite
+l'attente du commit sous le verrou reprend avec son garde-fou de services, comme avant). Le commit
+(`RenderExecutor::DrawIndex` / `DrawAuto` / dispatch) reste entièrement sous le verrou : aucune
+nouvelle concurrence sur les caches, donc aucun nouveau risque de perte du GPU. Défaut 0 ; seulement en
+mode simultané. Message au premier dessin : « committed draws wait for their prepared slot outside the
+lanes' lock: on ». Compteurs (ligne « 2b concurrent », par voie) : « fast draw: slots waited for outside
+the lock n (ms), ready n, unclaimed n » (unclaimed : aucun ouvrier n'avait pris l'emplacement, il est
+préparé sous le verrou comme avant).
+
+**Ce que l'étape 1 ne fait pas, et pourquoi.** Le commit lui-même (`RenderExecutor::DrawIndex` avec
+l'emplacement préparé) est la majorité du temps tenu. Le sortir du verrou demande de rendre sûrs entre
+voies, sur ce chemin : la validation de l'emplacement (lectures du cache de tampons et de textures :
+plages sales, générations), les téléversements et synchronisations du cache de tampons, les recherches
+et créations d'images (états d'image : surcouche déjà faite), l'allocation et l'écriture des
+descripteurs (tas commun), les pages du flux (anneau commun), les mémos de l'exécuteur (déjà par voie),
+le cache de pipelines (déjà lu par les ouvriers). Chacun de ces points, mal fait, peut corrompre un
+descripteur ou libérer une ressource en usage : perte du GPU. L'étape 2 prévue : un « chemin rapide »
+dans le commit qui, quand la validation réussit sans rien créer, téléverser ni synchroniser, n'utilise
+que des structures par voie (pool de descripteurs et sous-anneau de flux par voie) et des lectures de
+caches sous verrou lecteur ; sinon il reprend le verrou global (`KYTY_CP_PAR_VERIFY` y ajouterait une
+re-validation sous verrou et compterait les différences). Elle demande un relevé précis des écritures
+partagées du chemin `RenderExecutor::DrawIndex`, à faire avant tout code.
+
+**À relever en jeu** (`KYTY_CP_PAR_LANES=3`, `KYTY_CP_PAR_CONCURRENT=1`, avec puis sans
+`KYTY_CP_PAR_FASTDRAW=1`) : i/s ; ligne « 2b lock by op » (temps tenu par DrawIndex : doit baisser
+d'autant que les attentes déplacées) ; ligne 2b « lane lock … held » ; « overlap » ; les compteurs
+« fast draw » (si « slots waited for outside the lock » est petit en ms, l'attente de tête n'était pas
+le problème et seule l'étape 2 peut faire gagner) ; contrôles d'ordre à 0.
 
 ### Stable mais sans gain (4e série, 15/11 19 h 45–19 h 53) : où va le verrou des voies
 
