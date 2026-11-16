@@ -8,6 +8,7 @@
 #include "common/paceLog.h"
 #include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "kernel/waitGraph.h"              // Astro Bot PC (KYTY_WAIT_GRAPH)
+#include "kernel/mainCpu.h"                // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER)
 #include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/hangTrace.h"
@@ -1477,6 +1478,7 @@ static bool DoneBounded() {
 
 void GuestGpu::Done() {
 	LibKernel::WaitGraph::NoteFrame(); // Astro Bot PC (KYTY_WAIT_GRAPH)
+	LibKernel::MainCpu::NoteFrame();   // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER)
 	if (!DoneBounded()) {
 		GpuMutexLock lock(m_submission_mutex);
 		if (!IsGpuThread()) {

@@ -6,6 +6,7 @@
 #include "common/cpuPlacement.h"
 #include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "kernel/waitGraph.h"           // Astro Bot PC (KYTY_WAIT_GRAPH)
+#include "kernel/mainCpu.h"             // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER)
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
 #include "common/hangWatchdog.h"
@@ -3509,6 +3510,7 @@ static void* RunThread(void* arg) {
 		SetThreadDescription(GetCurrentThread(), wide);
 	}
 #endif
+	MainCpu::OnGuestThreadStart(thread->name.c_str()); // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER)
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
 	     thread->name.c_str(), thread->unique_id, os_thread_id,

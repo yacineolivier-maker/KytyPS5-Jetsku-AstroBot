@@ -10,6 +10,7 @@
 #include "common/hangTrace.h"
 #include "common/hostException.h"
 #include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
+#include "kernel/mainCpu.h"                 // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER)
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
@@ -1531,6 +1532,8 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 	Libs::Graphics::FramePath::MarkMainThread(); // Astro Bot PC (KYTY_FRAME_PATH)
+	// Astro Bot PC (KYTY_MAIN_CPU_SAMPLER, KYTY_MAIN_THREAD_CORE, KYTY_MAIN_THREAD_PRIORITY).
+	Libs::LibKernel::MainCpu::OnMainThreadStart();
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
 	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
