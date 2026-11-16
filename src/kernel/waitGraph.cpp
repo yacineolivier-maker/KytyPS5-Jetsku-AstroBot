@@ -342,7 +342,7 @@ void Report(uint64_t window_ns) {
 void ReporterRun() {
 	uint64_t last = NowNs();
 	for (;;) {
-		std::this_thread::sleep_for(std::chrono::seconds(10));
+		std::this_thread::sleep_for(std::chrono::nanoseconds(ReportPeriodNs));
 		const auto now = NowNs();
 		Report(now - last);
 		last = now;
