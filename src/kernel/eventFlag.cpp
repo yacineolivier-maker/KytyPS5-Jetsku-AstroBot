@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "kernel/waitGraph.h" // Astro Bot PC (KYTY_WAIT_GRAPH)
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -300,6 +301,8 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 	}
 
 	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
+	const WaitGraph::WaitScope wait_graph(ef, WaitGraph::Prim::EventFlag,
+	                                      reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
 
 	int ret = OK;
@@ -350,6 +353,7 @@ int KYTY_SYSV_ABI KernelSetEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	WaitGraph::Signal(ef, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // KYTY_WAIT_GRAPH
 	ef->Set(bit_pattern);
 
 	return OK;
@@ -375,6 +379,7 @@ int KYTY_SYSV_ABI KernelCancelEventFlag(KernelEventFlag ef, uint64_t set_pattern
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	WaitGraph::Signal(ef, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // KYTY_WAIT_GRAPH
 	ef->Cancel(set_pattern, num_wait_threads);
 
 	return OK;

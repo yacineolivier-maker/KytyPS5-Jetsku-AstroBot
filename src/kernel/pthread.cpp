@@ -5,6 +5,7 @@
 #include "common/condWaitUntil.h"
 #include "common/cpuPlacement.h"
 #include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
+#include "kernel/waitGraph.h"           // Astro Bot PC (KYTY_WAIT_GRAPH)
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
 #include "common/hangWatchdog.h"
@@ -2010,6 +2011,8 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 	// PRINT_NAME();
+	const WaitGraph::WaitScope wait_graph(mutex, WaitGraph::Prim::Mutex, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	                                      2000); // Astro Bot PC (KYTY_WAIT_GRAPH): contended only
 
 	// Placement samples of guest threads (common/cpuPlacement.h), every 64th lock.
 	static thread_local uint32_t placement_locks = 0;
@@ -2070,6 +2073,8 @@ int KYTY_SYSV_ABI PthreadMutexTrylock(PthreadMutex* mutex) {
 
 int KYTY_SYSV_ABI PthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec) {
 	// PRINT_NAME();
+	const WaitGraph::WaitScope wait_graph(mutex, WaitGraph::Prim::Mutex, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	                                      2000); // Astro Bot PC (KYTY_WAIT_GRAPH): contended only
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -2096,6 +2101,7 @@ int KYTY_SYSV_ABI PthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec
 
 int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex) {
 	// PRINT_NAME();
+	WaitGraph::Signal(mutex, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH)
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -2989,6 +2995,7 @@ int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid c
 
 int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 	// PRINT_NAME();
+	WaitGraph::Signal(cond, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH)
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3079,6 +3086,7 @@ int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr
 
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 	// PRINT_NAME();
+	WaitGraph::Signal(cond, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH)
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3098,6 +3106,7 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 	// PRINT_NAME();
+	WaitGraph::Signal(cond, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH)
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3120,6 +3129,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	// PRINT_NAME();
 	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
 	    ::Libs::Graphics::FramePath::Wait::Cond); // Astro Bot PC (KYTY_FRAME_PATH)
+	const WaitGraph::WaitScope wait_graph(cond, WaitGraph::Prim::Cond, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // KYTY_WAIT_GRAPH
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3187,6 +3197,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
 	// PRINT_NAME();
+	const WaitGraph::WaitScope wait_graph(cond, WaitGraph::Prim::Cond, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // KYTY_WAIT_GRAPH
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3253,6 +3264,7 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
 	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
 	    ::Libs::Graphics::FramePath::Wait::Cond); // Astro Bot PC (KYTY_FRAME_PATH)
+	const WaitGraph::WaitScope wait_graph(cond, WaitGraph::Prim::Cond, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // KYTY_WAIT_GRAPH
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -4004,6 +4016,7 @@ bool GuestYieldBackoffOnce() {
 } // namespace
 
 void KYTY_SYSV_ABI PthreadYield() {
+	WaitGraph::Yield(reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH): yield bursts
 	// Placement samples of spinning guest threads (the fence poller), every 4096th yield.
 	static thread_local uint32_t placement_yields = 0;
 	if ((++placement_yields & 4095u) == 0u) {
@@ -4266,6 +4279,15 @@ int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 	// signal check a system call return makes (SleepMicroWithSignalPoll).
 	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
 	    ::Libs::Graphics::FramePath::Wait::Sleep); // Astro Bot PC (KYTY_FRAME_PATH)
+	// Astro Bot PC (KYTY_WAIT_GRAPH): a sleep of at most 1 us is part of a yield loop.
+	std::optional<WaitGraph::WaitScope> wait_graph;
+	if (WaitGraph::Enabled()) {
+		if (microseconds <= 1) {
+			WaitGraph::Yield(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+		} else {
+			wait_graph.emplace(nullptr, WaitGraph::Prim::Sleep, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+		}
+	}
 	if (::Libs::Graphics::FramePath::Enabled() &&
 	    ::Libs::Graphics::FramePath::IsLabelPoll(
 	        reinterpret_cast<uint64_t>(__builtin_return_address(0)))) {
@@ -4304,6 +4326,14 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	{
 		const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
 		    ::Libs::Graphics::FramePath::Wait::Sleep); // Astro Bot PC (KYTY_FRAME_PATH)
+		std::optional<WaitGraph::WaitScope> wait_graph; // Astro Bot PC (KYTY_WAIT_GRAPH)
+		if (WaitGraph::Enabled()) {
+			if (nanos <= 1000) {
+				WaitGraph::Yield(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+			} else {
+				wait_graph.emplace(nullptr, WaitGraph::Prim::Sleep, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+			}
+		}
 		SleepNanoWithSignalPoll(nanos);
 	}
 

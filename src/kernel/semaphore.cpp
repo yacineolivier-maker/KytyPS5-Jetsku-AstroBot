@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
+#include "kernel/waitGraph.h"           // Astro Bot PC (KYTY_WAIT_GRAPH)
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -493,6 +494,8 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 
 	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
 	    ::Libs::Graphics::FramePath::Wait::Semaphore); // Astro Bot PC (KYTY_FRAME_PATH)
+	const WaitGraph::WaitScope wait_graph(sem, WaitGraph::Prim::KernelSema,
+	                                      reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	auto result = sem->Wait(need, time);
 
 	int ret = OK;
@@ -535,6 +538,7 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	WaitGraph::Signal(sem, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // KYTY_WAIT_GRAPH
 	auto result = sem->Signal(count);
 
 	int ret = OK;
@@ -557,6 +561,7 @@ int KYTY_SYSV_ABI KernelCancelSema(KernelSema sem, int count, int* threads) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	WaitGraph::Signal(sem, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // KYTY_WAIT_GRAPH
 	auto result = sem->Cancel(count, threads);
 
 	int ret = OK;
@@ -828,6 +833,9 @@ int KYTY_SYSV_ABI sem_destroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_wait(void* sem) {
+	const LibKernel::WaitGraph::WaitScope wait_graph(
+	    sem, LibKernel::WaitGraph::Prim::PosixSem,
+	    reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH)
 	const int result = SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -843,6 +851,9 @@ int KYTY_SYSV_ABI sem_trywait(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_reltimedwait_np(void* sem, uint32_t usec) {
+	const LibKernel::WaitGraph::WaitScope wait_graph(
+	    sem, LibKernel::WaitGraph::Prim::PosixSem,
+	    reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH)
 	const int result = SemTimedwaitImpl(sem, &usec);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -853,6 +864,9 @@ int KYTY_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abst
 		return SetErrnoReturn(POSIX_EINVAL);
 	}
 
+	const LibKernel::WaitGraph::WaitScope wait_graph(
+	    sem, LibKernel::WaitGraph::Prim::PosixSem,
+	    reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH)
 	const int result = SemTimedwaitImpl(sem, &micros);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -863,6 +877,7 @@ int KYTY_SYSV_ABI sem_post(void* sem) {
 		return SetErrnoReturn(POSIX_EINVAL);
 	}
 
+	LibKernel::WaitGraph::Signal(sem, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // KYTY_WAIT_GRAPH
 	const int result = obj->Post();
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -901,6 +916,9 @@ int KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemWait(void* sem) {
+	const LibKernel::WaitGraph::WaitScope wait_graph(
+	    sem, LibKernel::WaitGraph::Prim::PosixSem,
+	    reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH)
 	const int result = Posix::SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
@@ -917,6 +935,9 @@ int KYTY_SYSV_ABI PthreadSemTrywait(void* sem) {
 
 int KYTY_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec) {
 	uint32_t  micros = usec;
+	const LibKernel::WaitGraph::WaitScope wait_graph(
+	    sem, LibKernel::WaitGraph::Prim::PosixSem,
+	    reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH)
 	const int result = Posix::SemTimedwaitImpl(sem, &micros);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
@@ -927,6 +948,7 @@ int KYTY_SYSV_ABI PthreadSemPost(void* sem) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	LibKernel::WaitGraph::Signal(sem, reinterpret_cast<uint64_t>(__builtin_return_address(0))); // KYTY_WAIT_GRAPH
 	const int result = obj->Post();
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }

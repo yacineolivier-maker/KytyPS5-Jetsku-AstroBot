@@ -7,6 +7,7 @@
 #include "common/prepPhases.h"
 #include "common/paceLog.h"
 #include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
+#include "kernel/waitGraph.h"              // Astro Bot PC (KYTY_WAIT_GRAPH)
 #include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/hangTrace.h"
@@ -1475,6 +1476,7 @@ static bool DoneBounded() {
 }
 
 void GuestGpu::Done() {
+	LibKernel::WaitGraph::NoteFrame(); // Astro Bot PC (KYTY_WAIT_GRAPH)
 	if (!DoneBounded()) {
 		GpuMutexLock lock(m_submission_mutex);
 		if (!IsGpuThread()) {
@@ -1513,6 +1515,9 @@ void GuestGpu::Done() {
 	const auto pace_start = PaceLog::Enabled() ? PaceLog::NowNs() : 0;
 	{
 		Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::AgcDoneWait);
+		// Astro Bot PC (KYTY_WAIT_GRAPH): the CP's completions wake it (m_done_progress).
+		const LibKernel::WaitGraph::WaitScope wait_graph(&m_done_progress,
+		                                                 LibKernel::WaitGraph::Prim::AgcDone, 0, 2000);
 		Common::LockGuard         lock(m_queue_mutex);
 		auto                      prefix_done = [this, target] {
 			return m_stopping || m_in_flight.empty() || *m_in_flight.begin() > target;
@@ -2555,6 +2560,8 @@ void GuestGpu::ThreadRun(void* data) {
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
+				LibKernel::WaitGraph::Signal(&gpu->m_done_progress, 0,
+				                             "CP : soumissions terminees (AgcSuspendPoint)"); // KYTY_WAIT_GRAPH
 				gpu->m_done_progress.SignalAll();
 				should_stop = true;
 			} else if (!gpu->m_commands.empty()) {
@@ -2784,6 +2791,8 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 			gpu->m_in_flight.erase(submission.sequence);
 			if (gpu->m_done_waiters != 0) {
+				LibKernel::WaitGraph::Signal(&gpu->m_done_progress, 0,
+				                             "CP : soumissions terminees (AgcSuspendPoint)"); // KYTY_WAIT_GRAPH
 				gpu->m_done_progress.SignalAll();
 			}
 		}
@@ -7537,6 +7546,8 @@ void GuestGpu::CpParCollect(CpParFlight& flight) {
 		}
 		m_in_flight.erase(submission.sequence);
 		if (m_done_waiters != 0) {
+			LibKernel::WaitGraph::Signal(&m_done_progress, 0,
+			                             "CP : soumissions terminees (AgcSuspendPoint)"); // KYTY_WAIT_GRAPH
 			m_done_progress.SignalAll();
 		}
 		EXIT_IF(m_submission_count == 0);
