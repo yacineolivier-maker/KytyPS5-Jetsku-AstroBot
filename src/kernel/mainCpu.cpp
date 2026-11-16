@@ -96,6 +96,19 @@ struct Thread {
 std::mutex            g_mutex;
 std::vector<Thread*>  g_threads;
 std::atomic<uint64_t> g_frames {0};
+// Frame pacing (16/11 evening): sequence and end time of the last frame, histogram of the window.
+std::atomic<uint64_t> g_frame_seq {0};
+std::atomic<uint64_t> g_frame_end_ns {0};
+std::atomic<uint64_t> g_frame_prev_ns {0};
+constexpr int         HistBuckets = 6; // <34, 34-40, 40-50, 50-67, 67-100, >=100 ms
+std::array<std::atomic<uint64_t>, HistBuckets> g_hist {};
+double SpikeMs() {
+	static const double ms = [] {
+		const char* value = std::getenv("KYTY_MAIN_CPU_SPIKE_MS");
+		return value != nullptr && *value != 0 ? std::strtod(value, nullptr) : 45.0;
+	}();
+	return ms;
+}
 std::atomic<bool>     g_started {false};
 
 struct Ntdll {
@@ -299,6 +312,15 @@ void Report(uint64_t window_ns) {
 	const double fdiv   = frames != 0 ? static_cast<double>(frames) : 1.0;
 	std::printf("Kyty echantillons CPU 10 s : %.1f images/s ; temps par image (part de la fenetre)\n",
 	            static_cast<double>(frames) * 1e9 / static_cast<double>(window_ns));
+	{
+		uint64_t h[HistBuckets];
+		for (int i = 0; i < HistBuckets; i++) {
+			h[i] = g_hist[i].exchange(0, std::memory_order_relaxed);
+		}
+		std::printf("Kyty cadence 10 s : images <34 ms %" PRIu64 " ; 34-40 %" PRIu64 " ; 40-50 %" PRIu64
+		            " ; 50-67 %" PRIu64 " ; 67-100 %" PRIu64 " ; >=100 %" PRIu64 "\n",
+		            h[0], h[1], h[2], h[3], h[4], h[5]);
+	}
 	const auto ms = [fdiv](uint64_t ns) { return static_cast<double>(ns) / 1e6 / fdiv; };
 	for (auto* thread: g_threads) {
 		if (thread->total == 0) {
@@ -386,6 +408,11 @@ void SamplerRun() {
 		std::lock_guard lock(g_mutex);
 		ChooseActive();
 	}
+	// Per-frame breakdown of the main thread, printed for frames longer than KYTY_MAIN_CPU_SPIKE_MS.
+	std::array<uint64_t, CatCount>         spike_ns {};
+	std::unordered_map<uint64_t, uint64_t> spike_rips; // game function starts and Windows rips
+	uint64_t                               spike_seq     = g_frame_seq.load(std::memory_order_acquire);
+	uint32_t                               spike_printed = 0;
 	for (;;) {
 		// About 1 ms: the high-resolution timer (Sleep(1) may be 15.6 ms).
 		static thread_local HANDLE timer =
@@ -428,10 +455,66 @@ void SamplerRun() {
 			} else if (cat == WindowsOther || cat == OtherModule || cat == KernelWait) {
 				thread->win_rips[context.Rip] += weight;
 			}
+			if (thread->main) {
+				spike_ns[cat] += weight;
+				if (cat == Game || cat == WindowsOther || cat == OtherModule || cat == KernelWait ||
+				    cat == KernelYield || cat == GuestModule) {
+					spike_rips[context.Rip] += weight;
+				}
+			}
+		}
+		if (const auto seq = g_frame_seq.load(std::memory_order_acquire); seq != spike_seq) {
+			const uint64_t end  = g_frame_end_ns.load(std::memory_order_relaxed);
+			const uint64_t prev = g_frame_prev_ns.load(std::memory_order_relaxed);
+			const double   ms   = prev != 0 && end > prev ? static_cast<double>(end - prev) / 1e6 : 0.0;
+			if (seq == spike_seq + 1 && ms >= SpikeMs() && spike_printed < 40) {
+				spike_printed++;
+				std::vector<std::pair<uint64_t, uint32_t>> cats;
+				for (uint32_t c = 0; c < CatCount; c++) {
+					if (spike_ns[c] != 0) {
+						cats.emplace_back(spike_ns[c], c);
+					}
+				}
+				std::sort(cats.rbegin(), cats.rend());
+				std::string line;
+				char        part[320];
+				std::snprintf(part, sizeof(part), "Kyty pic : image %.1f ms ; fil principal :", ms);
+				line = part;
+				for (size_t i = 0; i < cats.size() && i < 5; i++) {
+					std::snprintf(part, sizeof(part), " %s %.1f ;", CatName(cats[i].second),
+					              static_cast<double>(cats[i].first) / 1e6);
+					line += part;
+				}
+				std::unordered_map<std::string, uint64_t> named;
+				for (const auto& [rip, ns]: spike_rips) {
+					if (rip >= EbootBase && rip < EbootEnd) {
+						std::snprintf(part, sizeof(part), "jeu 0x%" PRIx64, FunctionStart(rip) - EbootBase);
+						named[part] += ns;
+					} else if (rip >= EbootEnd && rip < GuestEnd) {
+						named["module invite"] += ns;
+					} else {
+						named[WindowsName(rip)] += ns;
+					}
+				}
+				std::vector<std::pair<std::string, uint64_t>> top(named.begin(), named.end());
+				std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+				line += " | detail :";
+				for (size_t i = 0; i < top.size() && i < 5; i++) {
+					std::snprintf(part, sizeof(part), " %s %.1f ;", top[i].first.c_str(),
+					              static_cast<double>(top[i].second) / 1e6);
+					line += part;
+				}
+				std::printf("%s\n", line.c_str());
+				std::fflush(stdout);
+			}
+			spike_seq = seq;
+			spike_ns.fill(0);
+			spike_rips.clear();
 		}
 		if (now - last_report >= ReportPeriodNs) {
 			Report(now - last_report);
-			last_report = now;
+			last_report   = now;
+			spike_printed = 0;
 			ChooseActive();
 		}
 	}
@@ -568,6 +651,15 @@ void OnGuestThreadStart(const char* name) {
 void NoteFrameSlow() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	g_frames.fetch_add(1, std::memory_order_relaxed);
+	const uint64_t now  = NowNs();
+	const uint64_t prev = g_frame_end_ns.exchange(now, std::memory_order_relaxed);
+	g_frame_prev_ns.store(prev, std::memory_order_relaxed);
+	g_frame_seq.fetch_add(1, std::memory_order_release);
+	if (prev != 0) {
+		const double ms = static_cast<double>(now - prev) / 1e6;
+		const int    b  = ms < 34.0 ? 0 : ms < 40.0 ? 1 : ms < 50.0 ? 2 : ms < 67.0 ? 3 : ms < 100.0 ? 4 : 5;
+		g_hist[b].fetch_add(1, std::memory_order_relaxed);
+	}
 #endif
 }
 

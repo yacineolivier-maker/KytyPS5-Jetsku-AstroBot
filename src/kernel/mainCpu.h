@@ -25,6 +25,9 @@
 //   pilote/autre module  any other module (GPU driver, ...)
 // Every 10 s: "Kyty echantillons CPU 10 s : ..." per thread, in ms per frame (frames =
 // sceAgcSuspendPoint calls) and percent of the window.
+// Also every 10 s: "Kyty cadence 10 s : ..." (frame-time histogram), and for each frame of the
+// main thread longer than KYTY_MAIN_CPU_SPIKE_MS (default 45): "Kyty pic : image N ms ; ..." with
+// that frame's categories and top functions (game, guest module, Windows export), 40 per 10 s at most.
 //
 // KYTY_MAIN_THREAD_CORE=<logical processor>: the guest main thread runs on that logical processor
 // only, and every processor of the same physical core (its SMT siblings, read with
