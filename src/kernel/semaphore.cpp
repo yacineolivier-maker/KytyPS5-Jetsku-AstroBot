@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -294,6 +295,8 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
+	    ::Libs::Graphics::FramePath::Wait::Semaphore); // Astro Bot PC (KYTY_FRAME_PATH)
 	auto result = sem->Wait(need, time);
 
 	int ret = OK;

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/hangWatchdog.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -32,6 +33,9 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics, bool track_dispatch)
 }
 
 MasterSemaphore::~MasterSemaphore() {
+	if (FramePath::Enabled()) {
+		FramePath::Detach(this); // Astro Bot PC (KYTY_FRAME_PATH): the monitor stops first
+	}
 	if (m_semaphore != nullptr) {
 		m_graphics.device.destroySemaphore(m_semaphore, nullptr);
 	}
@@ -63,6 +67,11 @@ void MasterSemaphore::Refresh() {
 		    m_watchdog_timeline, CurrentTick(), counter,
 		    m_submission_progress ? m_submission_progress->dispatched_tick.load() : CurrentTick() - 1);
 	}
+}
+
+bool MasterSemaphore::CounterQuiet(uint64_t& value) {
+	value = 0;
+	return m_graphics.device.getSemaphoreCounterValue(m_semaphore, &value) == vk::Result::eSuccess;
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {

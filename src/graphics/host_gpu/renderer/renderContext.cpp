@@ -5,6 +5,7 @@
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/faultCost.h"
@@ -195,6 +196,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
 	const CpGaps::Scope            fault_gap(CpGaps::Cat::Fault);
+	const FramePath::MainWaitScope frame_path_fault(FramePath::Wait::Fault); // Astro Bot PC
 	// Live cost numbers (faultCost.h); the slow-PC simulation's wait comes first, outside every lock.
 	const auto start = FaultCost::NowNs();
 	FaultCost::SimulateFault();

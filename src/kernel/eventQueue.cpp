@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/paceLog.h"
+#include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
@@ -22,6 +23,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <list>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -639,6 +641,10 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     Common::Thread::GetThreadIdUnique());
 
 	const uint64_t pace_begin = PaceLog::Enabled() ? PaceLog::NowNs() : 0;
+	std::optional<::Libs::Graphics::FramePath::MainWaitScope> frame_path_wait; // Astro Bot PC
+	if (timo == nullptr || *timo != 0) {
+		frame_path_wait.emplace(::Libs::Graphics::FramePath::Wait::Equeue); // KYTY_FRAME_PATH
+	}
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -650,6 +656,7 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
 	}
+	frame_path_wait.reset();
 	if (pace_begin != 0) {
 		const bool got = *out > 0;
 		PaceLog::NoteWait(pace_begin, PaceLog::NowNs(), Common::Thread::GetThreadIdUnique(),

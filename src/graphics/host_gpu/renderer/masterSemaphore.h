@@ -45,6 +45,9 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// Astro Bot PC (KYTY_FRAME_PATH=1, framePath.h): the timeline's counter, read without counters,
+	// watchdog scopes or exit on error (false: the query failed).
+	[[nodiscard]] bool CounterQuiet(uint64_t& value);
 
 private:
 	GraphicContext&       m_graphics;

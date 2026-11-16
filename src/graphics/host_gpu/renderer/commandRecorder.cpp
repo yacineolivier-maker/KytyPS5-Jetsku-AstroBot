@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
@@ -309,6 +310,11 @@ struct CommandRecorder::NativeExecutor {
 			EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 		}
 		auto& graphics = owner.m_graphics;
+		if (FramePath::Enabled()) {
+			FramePath::NoteRecorded(
+			    reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(owner.m_master.Handle())),
+			    p.tick); // Astro Bot PC (KYTY_FRAME_PATH)
+		}
 		if (graphics.submission_queue.Enabled()) {
 			QueuedSubmission queued {.submit              = p.submit,
 			                         .progress            = owner.m_master.GetSubmissionProgress(),
@@ -373,6 +379,11 @@ struct CommandRecorder::NativeExecutor {
 			EXIT_IF(progress == nullptr);
 			progress->dispatched_tick.store(p.tick, std::memory_order_release);
 			progress->dispatched_tick.notify_all();
+			if (FramePath::Enabled()) {
+				FramePath::NoteDispatched(
+				    reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(owner.m_master.Handle())),
+				    p.tick); // Astro Bot PC (KYTY_FRAME_PATH)
+			}
 		}
 		if (owner.m_registry_slot < MaxRecorders) {
 			g_recording[owner.m_registry_slot].store(nullptr, std::memory_order_release);
