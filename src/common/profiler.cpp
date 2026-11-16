@@ -37,6 +37,11 @@
 #include <unistd.h>
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Minimal declarations (windows.h is not included here in every configuration).
+extern "C" __declspec(dllimport) int __stdcall MultiByteToWideChar(unsigned int, unsigned long, const char*, int, wchar_t*, int);
+extern "C" __declspec(dllimport) long __stdcall SetThreadDescription(void*, const wchar_t*);
+#endif
 namespace {
 
 thread_local std::vector<Profiler::ScopedBlock*> g_block_stack;
@@ -1286,6 +1291,14 @@ void EndBlock() {
 
 void SetThreadName(const char* name) {
 	if (name != nullptr) HangWatchdog::SetThreadName(name);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Also set the Windows thread description, readable by debuggers and profilers (GetThreadDescription).
+	if (name != nullptr) {
+		wchar_t wide[128] = {};
+		::MultiByteToWideChar(65001 /* CP_UTF8 */, 0, name, -1, wide, 127);
+		::SetThreadDescription(reinterpret_cast<void*>(-2) /* current thread */, wide);
+	}
+#endif
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
 	}

@@ -3484,6 +3484,13 @@ static void* RunThread(void* arg) {
 	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
 #endif
 	Common::PlaceCurrentThreadGuest();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	{   // Guest thread described as "jeu:<name given by the game>" ("jeu" = game) for Windows tools.
+		wchar_t wide[128] = L"jeu:";
+		MultiByteToWideChar(CP_UTF8, 0, thread->name.c_str(), -1, wide + 4, 123);
+		SetThreadDescription(GetCurrentThread(), wide);
+	}
+#endif
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
 	     thread->name.c_str(), thread->unique_id, os_thread_id,
