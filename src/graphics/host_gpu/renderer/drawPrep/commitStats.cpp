@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -119,7 +120,17 @@ uint32_t RunBucket(uint32_t length) {
 	return bucket;
 }
 
+// KYTY_CP_COMMIT_STATS: commit time per render pass shape (size, layers, attachments), printed as a "Passes" line.
+struct PassAgg {
+	uint64_t draws     = 0;
+	uint64_t commit    = 0;
+	uint64_t gap       = 0;
+	uint64_t instances = 0;
+};
+
 struct State {
+	std::unordered_map<uint64_t, PassAgg> passes;
+	uint64_t                              pass_serial = 0;
 	// The draw being committed.
 	bool                             active   = false;
 	bool                             recorded = false;
@@ -507,6 +518,32 @@ void Print(State& s, uint64_t now_ns, uint64_t now_tsc) {
 	line += text;
 	std::printf("%s\n", line.c_str());
 	PrintStartPhases(s, seconds, ns_per_tick);
+	{
+		std::vector<std::pair<uint64_t, PassAgg>> v(s.passes.begin(), s.passes.end());
+		std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) {
+			return x.second.commit + x.second.gap > y.second.commit + y.second.gap;
+		});
+		const double f = static_cast<double>(std::max<uint64_t>(1, s.frames));
+		std::string  pl;
+		std::snprintf(text, sizeof(text), "Passes %.0fs: frames %" PRIu64 " (ms/frame = commit+gap)",
+		              seconds, s.frames);
+		pl += text;
+		for (size_t i = 0; i < v.size() && i < 20; i++) {
+			const auto  k  = v[i].first;
+			const auto& pa = v[i].second;
+			std::snprintf(text, sizeof(text),
+			              " | %ux%u l%u c%u%s draws %.0f inst %.1f commit %.2f gap %.2f",
+			              static_cast<unsigned>(k >> 48u), static_cast<unsigned>((k >> 32u) & 0xffffu),
+			              static_cast<unsigned>((k >> 16u) & 0xffu), static_cast<unsigned>((k >> 8u) & 0xffu),
+			              (k & 1u) != 0 ? " d" : "", static_cast<double>(pa.draws) / f,
+			              static_cast<double>(pa.instances) / f,
+			              static_cast<double>(pa.commit) * ns_per_tick * 1e-6 / f,
+			              static_cast<double>(pa.gap) * ns_per_tick * 1e-6 / f);
+			pl += text;
+		}
+		std::printf("%s\n", pl.c_str());
+		s.passes.clear();
+	}
 	std::fflush(stdout);
 	s.classes      = {};
 	s.runs         = {};
@@ -754,6 +791,21 @@ void EndDraw() {
 	}
 	for (size_t p = 0; p < ItemCount; p++) {
 		c.items[p] += s.items[p];
+	}
+	if (s.recorded) {
+		const auto& b   = s.shape;
+		const auto  key = (static_cast<uint64_t>(b.pass_width & 0xffffu) << 48u) |
+		                  (static_cast<uint64_t>(b.pass_height & 0xffffu) << 32u) |
+		                  (static_cast<uint64_t>(b.pass_layers & 0xffu) << 16u) |
+		                  (static_cast<uint64_t>(b.pass_colors & 0xffu) << 8u) | (b.pass_depth ? 1u : 0u);
+		auto& pa = s.passes[key];
+		pa.draws++;
+		pa.commit += now - s.begin;
+		pa.gap += s.gap;
+		if (b.rendering_serial != s.pass_serial) {
+			pa.instances++;
+			s.pass_serial = b.rendering_serial;
+		}
 	}
 	Print(s, NowNs(), now);
 	// The next gap starts after this diagnostic's own work (the classification and sets above).

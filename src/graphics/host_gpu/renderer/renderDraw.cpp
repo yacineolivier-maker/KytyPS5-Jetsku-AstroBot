@@ -3678,6 +3678,11 @@ static CommitStats::DrawShape MakeCommitShape(
 	shape.pipeline = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
 	    static_cast<VkPipeline>(pipeline.pipeline)));
 	shape.shader_writes = static_cast<bool>(shader_write_stages);
+	shape.pass_width    = rendering.width;
+	shape.pass_height   = rendering.height;
+	shape.pass_layers   = rendering.num_layers;
+	shape.pass_colors   = rendering.num_color_attachments;
+	shape.pass_depth    = static_cast<bool>(rendering.depth_stencil_attachment.image_view);
 	// Structure: programs, texture views and layouts, samplers, attachments.
 	for (const auto* stage: stages) {
 		words.Add(reinterpret_cast<uintptr_t>(stage->runtime->program));
