@@ -2145,6 +2145,10 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		{
 			Profiler::ScopedLoadingOperation guest_copy(Profiler::LoadingOperation::AprGuestCopy);
 			HangWatchdog::Scope copy("ampr-guest-copy", destination + *bytes_read, read);
+			static const bool subst = std::getenv("KYTY_APP0_SUBST") != nullptr;
+			if (subst) [[unlikely]] {
+				LibKernel::FileSystem::ApplyApp0Substs(Common::PathToString(host_path), buffer.data(), read);
+			}
 			std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
 		}
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprGuestCopiedBytes, read);
