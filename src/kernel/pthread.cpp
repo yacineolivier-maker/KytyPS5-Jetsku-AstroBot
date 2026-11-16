@@ -600,7 +600,53 @@ static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& 
 // empty SwitchToThread with Sleep(0), a second system call per yield. In Astro Bot's GPU-fence
 // poll (eboot 0x114b2f0: scePthreadYield + sceKernelUsleep(0) in a loop) that Sleep(0) was about
 // 15 of the thread's 48 ms/flip (DEEP-TRACE-U52 section 3.6).
+// Astro Bot PC (KYTY_MAIN_YIELD_SPIN=<ns>[,<every>], default off): on the guest main thread, a
+// yield (scePthreadYield, sched_yield, a sleep of at most 1 us) pauses <ns> on its core
+// (_mm_pause) instead of SwitchToThread, which hands the core to another ready thread. The 16/11
+// sampler put 3-5 ms per frame of the main thread (which sets the frame rate) in
+// Common::YieldToReadyThread, called from the game's tbb wait loop (eboot 0xaee72b). Every
+// <every>-th call (default 64) still yields, so nothing starves.
+static bool MainYieldSpinOnce(uint64_t min_ns) {
+	struct MainYieldSpin {
+		uint64_t ns    = 0;
+		uint32_t every = 64;
+	};
+	static const MainYieldSpin spin = [] {
+		MainYieldSpin c;
+		const char*   value = std::getenv("KYTY_MAIN_YIELD_SPIN");
+		if (value != nullptr && *value != 0) {
+			char* end = nullptr;
+			c.ns      = std::min<uint64_t>(std::strtoull(value, &end, 10), 100'000);
+			if (end != nullptr && *end == ',') {
+				c.every = std::max<uint32_t>(static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10)), 1u);
+			}
+		}
+		if (c.ns != 0) {
+			std::printf("Kyty yield du fil principal : pause %llu ns sur place, vrai yield 1 fois sur %u "
+			            "(KYTY_MAIN_YIELD_SPIN)\n",
+			            static_cast<unsigned long long>(c.ns), c.every);
+			std::fflush(stdout);
+		}
+		return c;
+	}();
+	if (spin.ns == 0 || !::Libs::Graphics::FramePath::OnMainThread()) {
+		return false;
+	}
+	static thread_local uint32_t calls = 0;
+	if (++calls % spin.every == 0) {
+		return false;
+	}
+	const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(std::max(spin.ns, min_ns));
+	do {
+		_mm_pause();
+	} while (std::chrono::steady_clock::now() < end);
+	return true;
+}
+
 static void SchedulerBackoffOnce() {
+	if (MainYieldSpinOnce(0)) {
+		return;
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (GuestSchedLegacy()) {
 		if (SwitchToThread() == 0) {
@@ -623,6 +669,9 @@ static bool SleepMicroSchedulerBackoff(uint64_t microseconds) {
 
 	if (GuestSchedLegacy()) {
 		SchedulerBackoffOnce();
+		return true;
+	}
+	if (MainYieldSpinOnce(microseconds * 1000)) {
 		return true;
 	}
 	Common::YieldAndPauseMicro(static_cast<uint32_t>(microseconds));
@@ -4042,45 +4091,6 @@ void KYTY_SYSV_ABI PthreadYield() {
 				::Libs::Graphics::FramePath::NoteLabelPoll(begin, end);
 			}
 			return;
-		}
-	}
-	// Astro Bot PC (KYTY_MAIN_YIELD_SPIN=<ns>[,<every>], default off): the guest main thread's
-	// scePthreadYield pauses <ns> on its core (_mm_pause) instead of SwitchToThread, which hands the
-	// core to another ready thread: the 16/11 sampler counted 3-5 ms per frame of the main thread
-	// (which sets the frame rate) inside NtYieldExecution. Every <every>-th call (default 64) still
-	// yields, so nothing starves.
-	{
-		struct MainYieldSpin {
-			uint64_t ns    = 0;
-			uint32_t every = 64;
-		};
-		static const MainYieldSpin spin = [] {
-			MainYieldSpin c;
-			const char*   value = std::getenv("KYTY_MAIN_YIELD_SPIN");
-			if (value != nullptr && *value != 0) {
-				char* end = nullptr;
-				c.ns      = std::min<uint64_t>(std::strtoull(value, &end, 10), 100'000);
-				if (end != nullptr && *end == ',') {
-					c.every = std::max<uint32_t>(static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10)), 1u);
-				}
-			}
-			if (c.ns != 0) {
-				std::printf("Kyty yield du fil principal : pause %llu ns sur place, vrai yield 1 fois sur %u "
-				            "(KYTY_MAIN_YIELD_SPIN)\n",
-				            static_cast<unsigned long long>(c.ns), c.every);
-				std::fflush(stdout);
-			}
-			return c;
-		}();
-		if (spin.ns != 0 && ::Libs::Graphics::FramePath::OnMainThread()) {
-			static thread_local uint32_t calls = 0;
-			if (++calls % spin.every != 0) {
-				const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(spin.ns);
-				do {
-					_mm_pause();
-				} while (std::chrono::steady_clock::now() < end);
-				return;
-			}
 		}
 	}
 	if (GuestYieldBackoffOnce()) {
