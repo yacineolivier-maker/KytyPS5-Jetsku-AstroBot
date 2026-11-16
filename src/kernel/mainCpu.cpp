@@ -89,6 +89,7 @@ struct Thread {
 	std::array<uint64_t, CatCount>        ns {};
 	std::unordered_map<uint64_t, uint64_t> game_rips;
 	std::unordered_map<uint64_t, uint64_t> emu_offsets;
+	std::unordered_map<uint64_t, uint64_t> win_rips;
 	uint64_t                              total = 0;
 };
 
@@ -169,6 +170,54 @@ uint32_t Classify(uint64_t rip, uint64_t* emu_offset) {
 		}
 	}
 	return OtherModule;
+}
+
+// "module!export+0xN" for an address in a loaded DLL: the nearest export at or below it (internal functions
+// show as the export before them).
+std::unordered_map<uint64_t, std::string> g_win_name_cache;
+std::string WindowsName(uint64_t rip) {
+	if (auto it = g_win_name_cache.find(rip); it != g_win_name_cache.end()) {
+		return it->second;
+	}
+	std::string name = "?";
+	HMODULE     module = nullptr;
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCWSTR>(rip), &module) != 0 &&
+	    module != nullptr) {
+		char path[MAX_PATH] {};
+		GetModuleFileNameA(module, path, MAX_PATH);
+		const char* base_name = std::strrchr(path, '\\');
+		base_name             = base_name != nullptr ? base_name + 1 : path;
+		const auto  base      = reinterpret_cast<const uint8_t*>(module);
+		const auto  offset    = static_cast<uint32_t>(rip - reinterpret_cast<uint64_t>(module));
+		const auto* dos       = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		const auto* nt        = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		const auto& dir       = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+		const char* best      = nullptr;
+		uint32_t    best_rva  = 0;
+		if (dir.VirtualAddress != 0) {
+			const auto* exp       = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+			const auto* functions = reinterpret_cast<const uint32_t*>(base + exp->AddressOfFunctions);
+			const auto* names     = reinterpret_cast<const uint32_t*>(base + exp->AddressOfNames);
+			const auto* ordinals  = reinterpret_cast<const uint16_t*>(base + exp->AddressOfNameOrdinals);
+			for (uint32_t i = 0; i < exp->NumberOfNames; i++) {
+				const uint32_t rva = functions[ordinals[i]];
+				if (rva <= offset && rva >= best_rva && (rva < dir.VirtualAddress || rva >= dir.VirtualAddress + dir.Size)) {
+					best_rva = rva;
+					best     = reinterpret_cast<const char*>(base + names[i]);
+				}
+			}
+		}
+		char text[256];
+		if (best != nullptr) {
+			std::snprintf(text, sizeof(text), "%s!%s+0x%x", base_name, best, offset - best_rva);
+		} else {
+			std::snprintf(text, sizeof(text), "%s+0x%x", base_name, offset);
+		}
+		name = text;
+	}
+	g_win_name_cache.emplace(rip, name);
+	return name;
 }
 
 // The start of the eboot function holding `rip`: the first byte after the int3 padding before it.
@@ -301,9 +350,27 @@ void Report(uint64_t window_ns) {
 			}
 			std::printf("%s\n", text.c_str());
 		}
+		// Windows and other modules, by export (sampled RIP; inside a system call it is the stub).
+		std::unordered_map<std::string, uint64_t> win;
+		for (const auto& [rip, ns]: thread->win_rips) {
+			win[WindowsName(rip)] += ns;
+		}
+		std::vector<std::pair<std::string, uint64_t>> win_sorted(win.begin(), win.end());
+		std::sort(win_sorted.begin(), win_sorted.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		if (!win_sorted.empty()) {
+			std::string text = "    Windows/modules :";
+			for (size_t i = 0; i < win_sorted.size() && i < 8; i++) {
+				char part[320];
+				std::snprintf(part, sizeof(part), " %s %.2f ;", win_sorted[i].first.c_str(), ms(win_sorted[i].second));
+				text += part;
+			}
+			std::printf("%s\n", text.c_str());
+		}
 		thread->ns.fill(0);
 		thread->game_rips.clear();
 		thread->emu_offsets.clear();
+		thread->win_rips.clear();
 		thread->total = 0;
 	}
 	std::fflush(stdout);
@@ -358,6 +425,8 @@ void SamplerRun() {
 				thread->game_rips[context.Rip] += weight;
 			} else if (cat == Emulator) {
 				thread->emu_offsets[emu_offset & ~uint64_t {0xf}] += weight;
+			} else if (cat == WindowsOther || cat == OtherModule || cat == KernelWait) {
+				thread->win_rips[context.Rip] += weight;
 			}
 		}
 		if (now - last_report >= ReportPeriodNs) {
