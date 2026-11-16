@@ -9,7 +9,9 @@
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 // macOS has no clock_nanosleep.
@@ -195,12 +197,87 @@ namespace Common {
 
 using thread_id_t = std::thread::id;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Astro Bot PC (KYTY_HOST_MUTEX_SRW=1, default 0): Common::Mutex as a recursive lock over an SRW
+// lock (owner thread id + depth) and Common::CondVar over SleepConditionVariableSRW, instead of a
+// critical section. The 16/11 sampler put 2-3 ms per frame of the game's main thread in
+// NtSetInformationThread, reached from RtlLeaveCriticalSection under the guest kernel objects
+// (semaphores, event flags, queues). Decided once, before the first mutex.
+static bool HostMutexSrw() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_HOST_MUTEX_SRW");
+		const bool  srw   = value != nullptr && std::strcmp(value, "1") == 0;
+		if (srw) {
+			std::printf("Kyty verrous hote : SRW recursif au lieu des sections critiques (KYTY_HOST_MUTEX_SRW)\n");
+			std::fflush(stdout);
+		}
+		return srw;
+	}();
+	return on;
+}
+#endif
+
 struct MutexPrivate {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	MutexPrivate() { InitializeCriticalSectionAndSpinCount(&m_cs, CsSpinCount()); }
-	~MutexPrivate() { DeleteCriticalSection(&m_cs); }
+	MutexPrivate(): m_srw_mode(HostMutexSrw()) {
+		if (!m_srw_mode) {
+			InitializeCriticalSectionAndSpinCount(&m_cs, CsSpinCount());
+		}
+	}
+	~MutexPrivate() {
+		if (!m_srw_mode) {
+			DeleteCriticalSection(&m_cs);
+		}
+	}
 	KYTY_CLASS_NO_COPY(MutexPrivate);
-	CRITICAL_SECTION m_cs {};
+	void SrwLock() {
+		const DWORD self = GetCurrentThreadId();
+		if (m_owner.load(std::memory_order_relaxed) == self) {
+			m_depth++;
+			return;
+		}
+		AcquireSRWLockExclusive(&m_srw);
+		m_owner.store(self, std::memory_order_relaxed);
+		m_depth = 1;
+	}
+	bool SrwTryLock() {
+		const DWORD self = GetCurrentThreadId();
+		if (m_owner.load(std::memory_order_relaxed) == self) {
+			m_depth++;
+			return true;
+		}
+		if (TryAcquireSRWLockExclusive(&m_srw) == 0) {
+			return false;
+		}
+		m_owner.store(self, std::memory_order_relaxed);
+		m_depth = 1;
+		return true;
+	}
+	void SrwUnlock() {
+		if (--m_depth == 0) {
+			m_owner.store(0, std::memory_order_relaxed);
+			ReleaseSRWLockExclusive(&m_srw);
+		}
+	}
+	// Condition wait: the whole recursion is released and restored.
+	bool SrwSleep(PCONDITION_VARIABLE cv, DWORD ms) {
+		const uint32_t depth = m_depth;
+		m_depth              = 0;
+		m_owner.store(0, std::memory_order_relaxed);
+		const BOOL ok = SleepConditionVariableSRW(cv, &m_srw, ms, 0);
+		const DWORD error = ok ? 0 : GetLastError();
+		m_owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+		m_depth = depth;
+		if (!ok) {
+			SetLastError(error);
+		}
+		return ok != 0;
+	}
+	bool               m_srw_mode = false;
+	CRITICAL_SECTION   m_cs {};
+	SRWLOCK            m_srw = SRWLOCK_INIT;
+	std::atomic<DWORD> m_owner {0};
+	uint32_t           m_depth = 0;
 #else
 	std::recursive_mutex m_mutex;
 #endif
@@ -393,6 +470,15 @@ void Mutex::Lock() {
 	// The uncontended path publishes no wait record. The slow path retains the resource even
 	// when EnterCriticalSection/the standard mutex never returns.
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (m_mutex->m_srw_mode) {
+		if (HangWatchdog::Enabled() && !m_mutex->SrwTryLock()) {
+			HangWatchdog::Scope wait("host-mutex", reinterpret_cast<uint64_t>(this));
+			m_mutex->SrwLock();
+		} else if (!HangWatchdog::Enabled()) {
+			m_mutex->SrwLock();
+		}
+		return;
+	}
 	if (!HangWatchdog::Enabled()) {
 		EnterCriticalSection(&m_mutex->m_cs);
 		return;
@@ -413,6 +499,10 @@ void Mutex::Lock() {
 
 void Mutex::Unlock() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (m_mutex->m_srw_mode) {
+		m_mutex->SrwUnlock();
+		return;
+	}
 	LeaveCriticalSection(&m_mutex->m_cs);
 #else
 	m_mutex->m_mutex.unlock();
@@ -421,6 +511,9 @@ void Mutex::Unlock() {
 
 bool Mutex::TryLock() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (m_mutex->m_srw_mode) {
+		return m_mutex->SrwTryLock();
+	}
 	return (TryEnterCriticalSection(&m_mutex->m_cs) != 0);
 #else
 	return m_mutex->m_mutex.try_lock();
@@ -445,9 +538,9 @@ void CondVar::Wait(Mutex* mutex) {
 			return;
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		LeaveCriticalSection(&mutex->m_mutex->m_cs);
+		mutex->Unlock();
 		callback();
-		EnterCriticalSection(&mutex->m_mutex->m_cs);
+		mutex->Lock();
 #else
 		cpp_lock.unlock();
 		callback();
@@ -455,6 +548,14 @@ void CondVar::Wait(Mutex* mutex) {
 #endif
 	};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (mutex->m_mutex->m_srw_mode) {
+		if (g_cond_wait_poll_callback == nullptr) {
+			mutex->m_mutex->SrwSleep(&m_cond_var->m_cv, INFINITE);
+		} else if (!mutex->m_mutex->SrwSleep(&m_cond_var->m_cv, 10) && GetLastError() == ERROR_TIMEOUT) {
+			poll_callback();
+		}
+		return;
+	}
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
 	if (g_cond_wait_poll_callback == nullptr) {
@@ -490,6 +591,10 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (mutex->m_mutex->m_srw_mode) {
+		const bool woke = mutex->m_mutex->SrwSleep(&m_cond_var->m_cv, (micros < 1000 ? 1 : micros / 1000));
+		return !(!woke && GetLastError() == ERROR_TIMEOUT);
+	}
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
 	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
