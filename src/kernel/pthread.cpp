@@ -32,6 +32,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <chrono>
+#include <immintrin.h>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -4041,6 +4042,45 @@ void KYTY_SYSV_ABI PthreadYield() {
 				::Libs::Graphics::FramePath::NoteLabelPoll(begin, end);
 			}
 			return;
+		}
+	}
+	// Astro Bot PC (KYTY_MAIN_YIELD_SPIN=<ns>[,<every>], default off): the guest main thread's
+	// scePthreadYield pauses <ns> on its core (_mm_pause) instead of SwitchToThread, which hands the
+	// core to another ready thread: the 16/11 sampler counted 3-5 ms per frame of the main thread
+	// (which sets the frame rate) inside NtYieldExecution. Every <every>-th call (default 64) still
+	// yields, so nothing starves.
+	{
+		struct MainYieldSpin {
+			uint64_t ns    = 0;
+			uint32_t every = 64;
+		};
+		static const MainYieldSpin spin = [] {
+			MainYieldSpin c;
+			const char*   value = std::getenv("KYTY_MAIN_YIELD_SPIN");
+			if (value != nullptr && *value != 0) {
+				char* end = nullptr;
+				c.ns      = std::min<uint64_t>(std::strtoull(value, &end, 10), 100'000);
+				if (end != nullptr && *end == ',') {
+					c.every = std::max<uint32_t>(static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10)), 1u);
+				}
+			}
+			if (c.ns != 0) {
+				std::printf("Kyty yield du fil principal : pause %llu ns sur place, vrai yield 1 fois sur %u "
+				            "(KYTY_MAIN_YIELD_SPIN)\n",
+				            static_cast<unsigned long long>(c.ns), c.every);
+				std::fflush(stdout);
+			}
+			return c;
+		}();
+		if (spin.ns != 0 && ::Libs::Graphics::FramePath::OnMainThread()) {
+			static thread_local uint32_t calls = 0;
+			if (++calls % spin.every != 0) {
+				const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(spin.ns);
+				do {
+					_mm_pause();
+				} while (std::chrono::steady_clock::now() < end);
+				return;
+			}
 		}
 	}
 	if (GuestYieldBackoffOnce()) {
