@@ -51,6 +51,15 @@ inline void NoteFrame() noexcept {
 		NoteFrameSlow();
 	}
 }
+// A guest sleep (sceKernelUsleep / nanosleep): its guest return address, the time asked for and
+// the time it took. Every 10 s: "Kyty sommeils invites 10 s : ..." by requested size, and the
+// callers that slept the longest.
+void NoteGuestSleepSlow(uint64_t ra, uint64_t requested_ns, uint64_t actual_ns) noexcept;
+inline void NoteGuestSleep(uint64_t ra, uint64_t requested_ns, uint64_t actual_ns) noexcept {
+	if (g_sampler_enabled) {
+		NoteGuestSleepSlow(ra, requested_ns, actual_ns);
+	}
+}
 
 } // namespace Libs::LibKernel::MainCpu
 

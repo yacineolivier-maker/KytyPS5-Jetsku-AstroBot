@@ -4349,6 +4349,16 @@ int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 		::Libs::Graphics::FramePath::NoteLabelPoll(begin, ::Libs::Graphics::FramePath::NowNs());
 		return OK;
 	}
+	if (MainCpu::g_sampler_enabled) { // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER): guest sleeps
+		const auto begin = std::chrono::steady_clock::now();
+		SleepMicroWithSignalPoll(microseconds);
+		MainCpu::NoteGuestSleepSlow(reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+		                            static_cast<uint64_t>(microseconds) * 1000,
+		                            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                      std::chrono::steady_clock::now() - begin)
+		                                                      .count()));
+		return OK;
+	}
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -4386,7 +4396,12 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 				wait_graph.emplace(nullptr, WaitGraph::Prim::Sleep, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			}
 		}
+		const auto begin = std::chrono::steady_clock::now();
 		SleepNanoWithSignalPoll(nanos);
+		MainCpu::NoteGuestSleep(reinterpret_cast<uint64_t>(__builtin_return_address(0)), nanos,
+		                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                  std::chrono::steady_clock::now() - begin)
+		                                                  .count()));
 	}
 
 	if (rmtp != nullptr) {

@@ -106,6 +106,13 @@ std::atomic<uint64_t> g_frame_end_ns {0};
 std::atomic<uint64_t> g_frame_prev_ns {0};
 constexpr int         HistBuckets = 6; // <34, 34-40, 40-50, 50-67, 67-100, >=100 ms
 std::array<std::atomic<uint64_t>, HistBuckets> g_hist {};
+// Guest sleeps (16/11 evening): by requested size, and by caller.
+constexpr int SleepBuckets = 6; // 0, <=1 us, <=100 us, <=1 ms, <=10 ms, more
+std::array<std::atomic<uint64_t>, SleepBuckets> g_sleep_count {};
+std::array<std::atomic<uint64_t>, SleepBuckets> g_sleep_req_ns {};
+std::array<std::atomic<uint64_t>, SleepBuckets> g_sleep_act_ns {};
+std::mutex                                       g_sleep_mutex;
+std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> g_sleep_callers; // ra -> count, actual ns
 double SpikeMs() {
 	static const double ms = [] {
 		const char* value = std::getenv("KYTY_MAIN_CPU_SPIKE_MS");
@@ -333,6 +340,44 @@ void Report(uint64_t window_ns) {
 		            h[0], h[1], h[2], h[3], h[4], h[5]);
 	}
 	const auto ms = [fdiv](uint64_t ns) { return static_cast<double>(ns) / 1e6 / fdiv; };
+	{
+		static const char* names[SleepBuckets] = {"0", "<=1us", "<=100us", "<=1ms", "<=10ms", ">10ms"};
+		std::string text = "Kyty sommeils invites 10 s (nombre, demande moyen / obtenu moyen us, ms/image) :";
+		for (int i = 0; i < SleepBuckets; i++) {
+			const auto n   = g_sleep_count[i].exchange(0, std::memory_order_relaxed);
+			const auto req = g_sleep_req_ns[i].exchange(0, std::memory_order_relaxed);
+			const auto act = g_sleep_act_ns[i].exchange(0, std::memory_order_relaxed);
+			if (n == 0) {
+				continue;
+			}
+			char part[160];
+			std::snprintf(part, sizeof(part), " %s %" PRIu64 " (%.1f / %.1f, %.2f) ;", names[i], n,
+			              static_cast<double>(req) / 1e3 / static_cast<double>(n),
+			              static_cast<double>(act) / 1e3 / static_cast<double>(n), ms(act));
+			text += part;
+		}
+		std::printf("%s\n", text.c_str());
+		std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> callers;
+		{
+			std::lock_guard lock(g_sleep_mutex);
+			callers.assign(g_sleep_callers.begin(), g_sleep_callers.end());
+			g_sleep_callers.clear();
+		}
+		std::sort(callers.begin(), callers.end(),
+		          [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+		std::string top = "  sommeils par appelant (jeu va : nombre, obtenu moyen us, ms/image) :";
+		for (size_t i = 0; i < callers.size() && i < 8; i++) {
+			const auto ra = callers[i].first;
+			char       part[160];
+			std::snprintf(part, sizeof(part), " 0x%" PRIx64 " : %" PRIu64 ", %.1f, %.2f ;",
+			              ra >= EbootBase && ra < EbootEnd ? ra - EbootBase : ra, callers[i].second.first,
+			              static_cast<double>(callers[i].second.second) / 1e3 /
+			                  static_cast<double>(callers[i].second.first),
+			              ms(callers[i].second.second));
+			top += part;
+		}
+		std::printf("%s\n", top.c_str());
+	}
 	for (auto* thread: g_threads) {
 		if (thread->total == 0) {
 			continue;
@@ -708,6 +753,18 @@ void OnGuestThreadStart(const char* name) {
 #else
 	(void)name;
 #endif
+}
+
+void NoteGuestSleepSlow(uint64_t ra, uint64_t requested_ns, uint64_t actual_ns) noexcept {
+	const int b = requested_ns == 0 ? 0 : requested_ns <= 1000 ? 1 : requested_ns <= 100'000 ? 2
+	            : requested_ns <= 1'000'000 ? 3 : requested_ns <= 10'000'000 ? 4 : 5;
+	g_sleep_count[b].fetch_add(1, std::memory_order_relaxed);
+	g_sleep_req_ns[b].fetch_add(requested_ns, std::memory_order_relaxed);
+	g_sleep_act_ns[b].fetch_add(actual_ns, std::memory_order_relaxed);
+	std::lock_guard lock(g_sleep_mutex);
+	auto& entry = g_sleep_callers[ra];
+	entry.first++;
+	entry.second += actual_ns;
 }
 
 void NoteFrameSlow() noexcept {
