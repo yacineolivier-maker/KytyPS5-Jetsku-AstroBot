@@ -589,6 +589,16 @@ MemoryTracker::FaultPolicy BufferFaultPolicy() {
 		}
 	}
 	policy.copy_outside_lock = ParseEnvU64("KYTY_UPLOAD_COPY_OUTSIDE_LOCK", 1) != 0;
+	// Astro Bot PC (default 1 and 0: unchanged): see RegionManager::FaultPolicy.
+	policy.hot_period =
+	    static_cast<uint32_t>(std::clamp<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_PERIOD", 1), 1, 8));
+	policy.hot_window = ParseEnvU64("KYTY_HOT_PAGE_WINDOW", 0) != 0;
+	if (policy.hot_frames != 0 && (policy.hot_period != 1 || policy.hot_window)) {
+		std::printf("Kyty pages chaudes : periode %u image(s)%s, %u pages au plus (KYTY_HOT_PAGE_PERIOD, "
+		            "KYTY_HOT_PAGE_WINDOW, KYTY_HOT_PAGE_MAX)\n",
+		            policy.hot_period, policy.hot_window ? ", fenetre entiere" : "", policy.hot_max);
+		std::fflush(stdout);
+	}
 	return policy;
 }
 

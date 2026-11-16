@@ -243,6 +243,16 @@ public:
 		uint32_t ahead_pages = 1; // power of two dividing TRACKER_REGION_PAGES; 1 = off
 		uint32_t hot_frames  = 0; // 0 = hot pages off
 		uint32_t hot_max     = 0;
+		// Astro Bot PC (KYTY_HOT_PAGE_PERIOD): a fault continues a page's streak when the page's
+		// last counted fault was 1..hot_period frames earlier (1: consecutive frames, as before).
+		// Astro Bot's job threads refill triple-buffered data: the same page faults every 3rd frame,
+		// so with 1 it never became hot (15/11-16/11: ~45 faults/frame on pages seen 2-3 frames
+		// earlier).
+		uint32_t hot_period = 1;
+		// Astro Bot PC (KYTY_HOT_PAGE_WINDOW=1): a promotion also makes hot the pages this fault's
+		// fault-ahead window just made CPU-dirty (one fault opens a whole window, so only its first
+		// page ever faults), within hot_max.
+		bool hot_window = false;
 		// Written uploads copy with no region lock held (MemoryTracker::ForEachWrittenUploadRange).
 		bool copy_outside_lock = false;
 	};
@@ -273,6 +283,7 @@ public:
 		// The pages whose CPU-dirty bits may change: the faulting ones and the fault-ahead window.
 		size_t changed_begin = start;
 		size_t changed_end   = end;
+		RegionBits ahead_marked; // the fault-ahead pages this call made CPU-dirty (KYTY_HOT_PAGE_WINDOW)
 		if (policy.ahead_pages > 1) {
 			const size_t window_begin = start / policy.ahead_pages * policy.ahead_pages;
 			const size_t window_end = std::min<size_t>((end + policy.ahead_pages - 1) /
@@ -286,6 +297,7 @@ public:
 			    RegionBits(all, window_begin, window_end) & ~m_gpu_dirty & ~m_cpu_dirty;
 			result.ahead_pages = window.Count();
 			m_cpu_dirty |= window;
+			ahead_marked = window;
 			for (const auto [first, last]: window) {
 				on_ahead(m_cpu_addr + first * TRACKER_PAGE_SIZE,
 				         (last - first) * TRACKER_PAGE_SIZE);
@@ -301,14 +313,15 @@ public:
 			m_history = std::make_unique<FaultHistory>();
 		}
 		const auto current  = static_cast<uint16_t>(frame);
-		const auto previous = static_cast<uint16_t>(frame - 1);
 		for (size_t page = start; page < end; page++) {
 			auto& streak = m_history->streak[page];
 			auto& last   = m_history->frame[page];
 			if (already_dirty.Get(page) || (streak != 0 && last == current)) {
 				continue;
 			}
-			streak = (streak != 0 && last == previous && streak != UINT8_MAX)
+			// Frames since the page's last counted fault (1 = the previous frame).
+			const auto since = static_cast<uint16_t>(current - last);
+			streak = (streak != 0 && since >= 1u && since <= policy.hot_period && streak != UINT8_MAX)
 			             ? static_cast<uint8_t>(streak + 1)
 			             : uint8_t {1};
 			last   = current;
@@ -323,6 +336,26 @@ public:
 			m_hot.Set(page);
 			m_history->used[page] = current;
 			result.promoted++;
+			if (policy.hot_window && policy.ahead_pages > 1) {
+				// The window pages this fault made CPU-dirty (not GPU-dirty, CPU-dirty since this
+				// call; hot pages are always CPU-dirty, which they are).
+				const size_t window_begin = page / policy.ahead_pages * policy.ahead_pages;
+				const size_t window_end =
+				    std::min<size_t>(window_begin + policy.ahead_pages, TRACKER_REGION_PAGES);
+				for (size_t other = window_begin; other < window_end; other++) {
+					if (other == page || !ahead_marked.Get(other) || m_hot.Get(other)) {
+						continue;
+					}
+					if (hot_count.fetch_add(1, std::memory_order_relaxed) >= policy.hot_max) {
+						hot_count.fetch_sub(1, std::memory_order_relaxed);
+						break;
+					}
+					m_hot.Set(other);
+					m_history->used[other] = current;
+					m_history->streak[other] = 0;
+					result.promoted++;
+				}
+			}
 		}
 		return result;
 	}
