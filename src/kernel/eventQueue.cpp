@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/paceLog.h"
+#include "kernel/waitGraph.h" // Astro Bot PC (KYTY_WAIT_GRAPH)
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
@@ -449,6 +450,15 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 }
 
 int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data) {
+	if (WaitGraph::Enabled()) {
+		// Astro Bot PC (KYTY_WAIT_GRAPH): emulator threads trigger for the GPU, video out, timers.
+		const char* label = filter == KERNEL_EVFILT_GRAPHICS    ? "GPU : interruption (EOP)"
+		                    : filter == KERNEL_EVFILT_VIDEO_OUT ? "VideoOut : flip/vblank"
+		                    : (filter == KERNEL_EVFILT_TIMER || filter == KERNEL_EVFILT_HRTIMER)
+		                        ? "minuterie equeue"
+		                        : "equeue (fil emulateur)";
+		WaitGraph::Signal(this, 0, label);
+	}
 	Common::LockGuard lock(m_mutex);
 
 	if (m_closed) {
@@ -639,6 +649,11 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     Common::Thread::GetThreadIdUnique());
 
 	const uint64_t pace_begin = PaceLog::Enabled() ? PaceLog::NowNs() : 0;
+	std::optional<WaitGraph::WaitScope> wait_graph; // Astro Bot PC (KYTY_WAIT_GRAPH)
+	if (WaitGraph::Enabled() && (timo == nullptr || *timo != 0)) {
+		wait_graph.emplace(owner.get(), WaitGraph::Prim::Equeue,
+		                   reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	}
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -650,6 +665,7 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
 	}
+	wait_graph.reset();
 	if (pace_begin != 0) {
 		const bool got = *out > 0;
 		PaceLog::NoteWait(pace_begin, PaceLog::NowNs(), Common::Thread::GetThreadIdUnique(),

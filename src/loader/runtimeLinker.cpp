@@ -21,6 +21,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kernel/waitGraph.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -1528,6 +1529,7 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 
 void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
+	Libs::LibKernel::WaitGraph::MarkMainThread(); // KYTY_WAIT_GRAPH: the guest main thread
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
 	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
