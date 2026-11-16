@@ -2061,6 +2061,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
+	MainCpu::NoteCpu(); // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER): placement
 	// PRINT_NAME();
 	const WaitGraph::WaitScope wait_graph(mutex, WaitGraph::Prim::Mutex, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
 	                                      2000); // Astro Bot PC (KYTY_WAIT_GRAPH): contended only
@@ -3177,6 +3178,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
+	MainCpu::NoteCpu(); // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER): placement
 	// PRINT_NAME();
 	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
 	    ::Libs::Graphics::FramePath::Wait::Cond); // Astro Bot PC (KYTY_FRAME_PATH)
@@ -3312,6 +3314,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+	MainCpu::NoteCpu(); // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER): placement
 	PRINT_NAME();
 	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(
 	    ::Libs::Graphics::FramePath::Wait::Cond); // Astro Bot PC (KYTY_FRAME_PATH)
@@ -4068,6 +4071,7 @@ bool GuestYieldBackoffOnce() {
 } // namespace
 
 void KYTY_SYSV_ABI PthreadYield() {
+	MainCpu::NoteCpu(); // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER): placement
 	WaitGraph::NoteYield(reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH): yield bursts
 	// Placement samples of spinning guest threads (the fence poller), every 4096th yield.
 	static thread_local uint32_t placement_yields = 0;
@@ -4327,6 +4331,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	MainCpu::NoteCpu(); // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER): placement
 	// usleep(0) returns at once, as FreeBSD's nanosleep does for a zero time, after the pending
 	// signal check a system call return makes (SleepMicroWithSignalPoll).
 	const ::Libs::Graphics::FramePath::MainWaitScope frame_path_wait(

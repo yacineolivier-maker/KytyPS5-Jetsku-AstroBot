@@ -46,6 +46,13 @@ void OnMainThreadStart();
 void OnGuestThreadStart(const char* name);
 // One guest frame (sceAgcSuspendPoint).
 void NoteFrameSlow() noexcept;
+// The calling guest thread notes its current logical processor (placement report).
+void NoteCpuSlow() noexcept;
+inline void NoteCpu() noexcept {
+	if (g_sampler_enabled) {
+		NoteCpuSlow();
+	}
+}
 inline void NoteFrame() noexcept {
 	if (g_sampler_enabled) {
 		NoteFrameSlow();

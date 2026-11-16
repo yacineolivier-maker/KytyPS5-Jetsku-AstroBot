@@ -83,6 +83,8 @@ struct Thread {
 	std::string name;
 	bool        main     = false;
 	uint64_t    last_cpu = 0; // 100 ns units
+	std::atomic<uint32_t> processor {0xffffffffu};
+	bool                  last_running = false; // last sample: not in a wait or a sleep stub // last logical processor the thread reported (NoteCpu)
 	uint64_t    cpu_delta = 0;
 	bool        active   = false;
 	// window statistics
@@ -98,6 +100,14 @@ struct Thread {
 };
 
 std::mutex            g_mutex;
+thread_local Thread*  t_self = nullptr; // this thread's record (registered threads)
+// Physical core of each logical processor of group 0 (placement report).
+std::array<int, 64>   g_core_of {};
+// Placement window (sampler thread only).
+std::array<uint64_t, 64>                         g_main_on_cpu {};
+uint64_t                                         g_main_running   = 0;
+uint64_t                                         g_main_shared    = 0;
+std::unordered_map<std::string, uint64_t>        g_main_shared_by;
 std::vector<Thread*>  g_threads;
 std::atomic<uint64_t> g_frames {0};
 // Frame pacing (16/11 evening): sequence and end time of the last frame, histogram of the window.
@@ -340,6 +350,32 @@ void Report(uint64_t window_ns) {
 		            h[0], h[1], h[2], h[3], h[4], h[5]);
 	}
 	const auto ms = [fdiv](uint64_t ns) { return static_cast<double>(ns) / 1e6 / fdiv; };
+	if (g_main_running != 0) {
+		std::string text;
+		char        part[160];
+		std::snprintf(part, sizeof(part),
+		              "Kyty placement 10 s : fil principal actif %" PRIu64 " echantillons, frere SMT occupe par un fil suivi %.0f %% (",
+		              g_main_running, 100.0 * static_cast<double>(g_main_shared) / static_cast<double>(g_main_running));
+		text = part;
+		for (const auto& [name, n]: g_main_shared_by) {
+			std::snprintf(part, sizeof(part), " %s %.0f %% ;", name.c_str(),
+			              100.0 * static_cast<double>(n) / static_cast<double>(g_main_running));
+			text += part;
+		}
+		text += " ) ; processeurs :";
+		for (int i = 0; i < 64; i++) {
+			if (g_main_on_cpu[i] != 0) {
+				std::snprintf(part, sizeof(part), " %d:%.0f%%", i,
+				              100.0 * static_cast<double>(g_main_on_cpu[i]) / static_cast<double>(g_main_running));
+				text += part;
+			}
+		}
+		std::printf("%s\n", text.c_str());
+		g_main_on_cpu.fill(0);
+		g_main_running = 0;
+		g_main_shared  = 0;
+		g_main_shared_by.clear();
+	}
 	{
 		static const char* names[SleepBuckets] = {"0", "<=1us", "<=100us", "<=1ms", "<=10ms", ">10ms"};
 		std::string text = "Kyty sommeils invites 10 s (nombre, demande moyen / obtenu moyen us, ms/image) :";
@@ -473,6 +509,30 @@ void Report(uint64_t window_ns) {
 
 void SamplerRun() {
 	InitNtdll();
+	{
+		g_core_of.fill(-1);
+		DWORD length = 0;
+		GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+		std::vector<uint8_t> buffer(length);
+		auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
+		if (length != 0 && GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length) != 0) {
+			int core = 0;
+			for (DWORD offset = 0; offset < length;) {
+				auto* entry = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+				if (entry->Relationship == RelationProcessorCore && entry->Processor.GroupCount > 0 &&
+				    entry->Processor.GroupMask[0].Group == 0) {
+					const KAFFINITY mask = entry->Processor.GroupMask[0].Mask;
+					for (int i = 0; i < 64; i++) {
+						if ((mask >> i) & 1) {
+							g_core_of[i] = core;
+						}
+					}
+					core++;
+				}
+				offset += entry->Size;
+			}
+		}
+	}
 	SetThreadDescription(GetCurrentThread(), L"emu:echantillonneur CPU");
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 	uint64_t last_report = NowNs();
@@ -549,6 +609,7 @@ void SamplerRun() {
 			uint64_t   emu_offset = 0;
 			const auto cat        = Classify(context.Rip, &emu_offset);
 			thread->ns[cat] += weight;
+			thread->last_running = cat != KernelWait && cat != KernelYield;
 			thread->total += weight;
 			if (cat == Game) {
 				thread->game_rips[context.Rip] += weight;
@@ -567,6 +628,33 @@ void SamplerRun() {
 				if (cat == Game || cat == WindowsOther || cat == OtherModule || cat == KernelWait ||
 				    cat == KernelYield || cat == GuestModule) {
 					spike_rips[context.Rip] += weight;
+				}
+			}
+		}
+		// Placement: is the main thread's SMT sibling running another sampled thread?
+		{
+			const Thread* main_thread = nullptr;
+			for (auto* thread: g_threads) {
+				if (thread->main && thread->active) {
+					main_thread = thread;
+				}
+			}
+			if (main_thread != nullptr && main_thread->last_running) {
+				const uint32_t cpu = main_thread->processor.load(std::memory_order_relaxed);
+				if (cpu < 64 && g_core_of[cpu] >= 0) {
+					g_main_running++;
+					g_main_on_cpu[cpu]++;
+					for (auto* thread: g_threads) {
+						if (thread == main_thread || !thread->active || !thread->last_running) {
+							continue;
+						}
+						const uint32_t other = thread->processor.load(std::memory_order_relaxed);
+						if (other < 64 && other != cpu && g_core_of[other] == g_core_of[cpu]) {
+							g_main_shared++;
+							g_main_shared_by[thread->name]++;
+							break;
+						}
+					}
 				}
 			}
 		}
@@ -629,6 +717,7 @@ void SamplerRun() {
 
 void Register(const char* name, bool main) {
 	auto*  thread = new Thread;
+	t_self        = thread;
 	HANDLE handle = nullptr;
 	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
 	                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0) == 0) {
@@ -765,6 +854,12 @@ void NoteGuestSleepSlow(uint64_t ra, uint64_t requested_ns, uint64_t actual_ns) 
 	auto& entry = g_sleep_callers[ra];
 	entry.first++;
 	entry.second += actual_ns;
+}
+
+void NoteCpuSlow() noexcept {
+	if (auto* self = t_self; self != nullptr) {
+		self->processor.store(GetCurrentProcessorNumber(), std::memory_order_relaxed);
+	}
 }
 
 void NoteFrameSlow() noexcept {

@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/framePath.h" // Astro Bot PC (KYTY_FRAME_PATH)
+#include "kernel/mainCpu.h"            // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER)
 #include "kernel/waitGraph.h"           // Astro Bot PC (KYTY_WAIT_GRAPH)
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -636,6 +637,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	MainCpu::NoteCpu(); // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER): placement
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
