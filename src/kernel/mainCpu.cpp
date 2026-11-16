@@ -90,6 +90,10 @@ struct Thread {
 	std::unordered_map<uint64_t, uint64_t> game_rips;
 	std::unordered_map<uint64_t, uint64_t> emu_offsets;
 	std::unordered_map<uint64_t, uint64_t> win_rips;
+	// Main thread, samples inside a sleep (NtDelayExecution / NtYieldExecution) or a blocking wait:
+	// key = first kyty_emulator.exe return address on the stack (offset) << 32 | first eboot one (va).
+	std::unordered_map<uint64_t, uint64_t> sleep_callers;
+	std::unordered_map<uint64_t, uint64_t> wait_callers;
 	uint64_t                              total = 0;
 };
 
@@ -116,6 +120,7 @@ struct Ntdll {
 	uint64_t yield[2] {};
 	HMODULE  modules[4] {};
 	HMODULE  exe = nullptr;
+	uint64_t exe_size = 0;
 };
 Ntdll g_nt;
 
@@ -133,6 +138,12 @@ void InitNtdll() {
 	g_nt.modules[2] = GetModuleHandleW(L"kernel32.dll");
 	g_nt.modules[3] = GetModuleHandleW(L"win32u.dll");
 	g_nt.exe        = GetModuleHandleW(nullptr);
+	{
+		const auto* base = reinterpret_cast<const uint8_t*>(g_nt.exe);
+		const auto* dos  = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		const auto* nt   = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		g_nt.exe_size    = nt->OptionalHeader.SizeOfImage;
+	}
 }
 
 bool InStub(uint64_t rip, uint64_t start) {
@@ -393,6 +404,23 @@ void Report(uint64_t window_ns) {
 		thread->game_rips.clear();
 		thread->emu_offsets.clear();
 		thread->win_rips.clear();
+		for (int kind = 0; kind < 2; kind++) {
+			auto& callers = kind == 0 ? thread->sleep_callers : thread->wait_callers;
+			if (callers.empty()) {
+				continue;
+			}
+			std::vector<std::pair<uint64_t, uint64_t>> list(callers.begin(), callers.end());
+			std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+			std::string text = kind == 0 ? "    sommeils, appelants (emu+off / jeu va) :" : "    attentes, appelants (emu+off / jeu va) :";
+			for (size_t i = 0; i < list.size() && i < 8; i++) {
+				char part[96];
+				std::snprintf(part, sizeof(part), " 0x%" PRIx64 "/0x%" PRIx64 " %.2f ;", list[i].first >> 32,
+				              list[i].first & 0xffffffffull, ms(list[i].second));
+				text += part;
+			}
+			std::printf("%s\n", text.c_str());
+			callers.clear();
+		}
 		thread->total = 0;
 	}
 	std::fflush(stdout);
@@ -439,6 +467,35 @@ void SamplerRun() {
 			CONTEXT context {};
 			context.ContextFlags = CONTEXT_CONTROL;
 			const bool ok        = GetThreadContext(thread->handle, &context) != 0;
+			// Main thread inside a sleep or a wait: who called it (stack read while suspended).
+			uint64_t caller_key  = 0;
+			int      caller_kind = 0; // 1 sleep, 2 wait
+			if (ok && thread->main) {
+				for (auto start: g_nt.yield) {
+					if (InStub(context.Rip, start)) {
+						caller_kind = 1;
+					}
+				}
+				for (auto start: g_nt.wait) {
+					if (InStub(context.Rip, start)) {
+						caller_kind = 2;
+					}
+				}
+				if (caller_kind != 0 && context.Rsp != 0) {
+					const auto  exe_base = reinterpret_cast<uint64_t>(g_nt.exe);
+					const auto* stack    = reinterpret_cast<const uint64_t*>(context.Rsp);
+					uint64_t    emu = 0, game = 0;
+					for (int i = 0; i < 160 && (emu == 0 || game == 0); i++) {
+						const uint64_t q = stack[i];
+						if (emu == 0 && q > exe_base && q < exe_base + g_nt.exe_size) {
+							emu = q - exe_base;
+						} else if (game == 0 && q > EbootBase && q < EbootEnd) {
+							game = q - EbootBase;
+						}
+					}
+					caller_key = (emu << 32) | (game & 0xffffffffull);
+				}
+			}
 			ResumeThread(thread->handle);
 			if (!ok) {
 				continue;
@@ -454,6 +511,11 @@ void SamplerRun() {
 				thread->emu_offsets[emu_offset & ~uint64_t {0xf}] += weight;
 			} else if (cat == WindowsOther || cat == OtherModule || cat == KernelWait) {
 				thread->win_rips[context.Rip] += weight;
+			}
+			if (caller_kind == 1) {
+				thread->sleep_callers[caller_key] += weight;
+			} else if (caller_kind == 2) {
+				thread->wait_callers[caller_key] += weight;
 			}
 			if (thread->main) {
 				spike_ns[cat] += weight;
