@@ -421,7 +421,7 @@ WaitScope::~WaitScope() {
 	AddWait(t_self, waker, m_prim, m_ra, ns);
 }
 
-void Yield(uint64_t return_address) noexcept {
+void NoteYield(uint64_t return_address) noexcept {
 	if (!Enabled()) {
 		return;
 	}

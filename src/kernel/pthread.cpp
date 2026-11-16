@@ -4016,7 +4016,7 @@ bool GuestYieldBackoffOnce() {
 } // namespace
 
 void KYTY_SYSV_ABI PthreadYield() {
-	WaitGraph::Yield(reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH): yield bursts
+	WaitGraph::NoteYield(reinterpret_cast<uint64_t>(__builtin_return_address(0))); // Astro Bot PC (KYTY_WAIT_GRAPH): yield bursts
 	// Placement samples of spinning guest threads (the fence poller), every 4096th yield.
 	static thread_local uint32_t placement_yields = 0;
 	if ((++placement_yields & 4095u) == 0u) {
@@ -4283,7 +4283,7 @@ int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 	std::optional<WaitGraph::WaitScope> wait_graph;
 	if (WaitGraph::Enabled()) {
 		if (microseconds <= 1) {
-			WaitGraph::Yield(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+			WaitGraph::NoteYield(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 		} else {
 			wait_graph.emplace(nullptr, WaitGraph::Prim::Sleep, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 		}
@@ -4329,7 +4329,7 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 		std::optional<WaitGraph::WaitScope> wait_graph; // Astro Bot PC (KYTY_WAIT_GRAPH)
 		if (WaitGraph::Enabled()) {
 			if (nanos <= 1000) {
-				WaitGraph::Yield(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+				WaitGraph::NoteYield(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			} else {
 				wait_graph.emplace(nullptr, WaitGraph::Prim::Sleep, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			}

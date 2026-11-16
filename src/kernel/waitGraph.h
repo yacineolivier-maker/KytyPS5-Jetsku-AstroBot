@@ -67,7 +67,7 @@ private:
 };
 
 // A yield (or a sleep of at most 1 us) of the calling thread, called from `return_address`.
-void Yield(uint64_t return_address) noexcept;
+void NoteYield(uint64_t return_address) noexcept;
 
 // One guest frame (sceAgcSuspendPoint).
 void NoteFrame() noexcept;
