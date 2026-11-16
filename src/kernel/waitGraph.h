@@ -47,18 +47,35 @@ enum class Prim : uint8_t {
 
 // The calling thread signals `object` (wakes, posts, unlocks, sets, triggers). `label`: the waker's
 // name when the caller is not a guest thread (a string literal; ignored on guest threads).
-void Signal(const void* object, uint64_t return_address, const char* label = nullptr) noexcept;
+// Off: inline, one load of the flag and no call (the out-of-line parts run only when on).
+void SignalSlow(const void* object, uint64_t return_address, const char* label) noexcept;
+inline void Signal(const void* object, uint64_t return_address, const char* label = nullptr) noexcept {
+	if (Enabled()) {
+		SignalSlow(object, return_address, label);
+	}
+}
 
 // A blocking wait of the calling thread on `object`; waits shorter than `min_ns` are not counted
 // (uncontended mutexes).
 class WaitScope {
 public:
-	WaitScope(const void* object, Prim prim, uint64_t return_address, uint64_t min_ns = 0) noexcept;
-	~WaitScope();
+	WaitScope(const void* object, Prim prim, uint64_t return_address, uint64_t min_ns = 0) noexcept {
+		if (Enabled()) {
+			Begin(object, prim, return_address, min_ns);
+		}
+	}
+	~WaitScope() {
+		if (m_start != 0) {
+			End();
+		}
+	}
 	WaitScope(const WaitScope&)            = delete;
 	WaitScope& operator=(const WaitScope&) = delete;
 
 private:
+	void Begin(const void* object, Prim prim, uint64_t return_address, uint64_t min_ns) noexcept;
+	void End() noexcept;
+
 	const void* m_object  = nullptr;
 	uint64_t    m_ra      = 0;
 	uint64_t    m_start   = 0;
@@ -67,10 +84,20 @@ private:
 };
 
 // A yield (or a sleep of at most 1 us) of the calling thread, called from `return_address`.
-void NoteYield(uint64_t return_address) noexcept;
+void NoteYieldSlow(uint64_t return_address) noexcept;
+inline void NoteYield(uint64_t return_address) noexcept {
+	if (Enabled()) {
+		NoteYieldSlow(return_address);
+	}
+}
 
 // One guest frame (sceAgcSuspendPoint).
-void NoteFrame() noexcept;
+void NoteFrameSlow() noexcept;
+inline void NoteFrame() noexcept {
+	if (Enabled()) {
+		NoteFrameSlow();
+	}
+}
 
 } // namespace Libs::LibKernel::WaitGraph
 

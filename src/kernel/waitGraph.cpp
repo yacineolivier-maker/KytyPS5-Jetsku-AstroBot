@@ -358,7 +358,7 @@ void StartReporter() {
 
 } // namespace
 
-void Signal(const void* object, uint64_t return_address, const char* label) noexcept {
+void SignalSlow(const void* object, uint64_t return_address, const char* label) noexcept {
 	if (!Enabled() || object == nullptr) {
 		return;
 	}
@@ -375,8 +375,8 @@ void Signal(const void* object, uint64_t return_address, const char* label) noex
 	slot.key.store(reinterpret_cast<uint64_t>(object), std::memory_order_release);
 }
 
-WaitScope::WaitScope(const void* object, Prim prim, uint64_t return_address,
-                     uint64_t min_ns) noexcept {
+void WaitScope::Begin(const void* object, Prim prim, uint64_t return_address,
+                      uint64_t min_ns) noexcept {
 	if (!Enabled()) {
 		return;
 	}
@@ -394,10 +394,7 @@ WaitScope::WaitScope(const void* object, Prim prim, uint64_t return_address,
 	m_start  = NowNs();
 }
 
-WaitScope::~WaitScope() {
-	if (m_start == 0) {
-		return;
-	}
+void WaitScope::End() noexcept {
 	const auto end = NowNs();
 	const auto ns  = end - m_start;
 	if (ns < m_min_ns) {
@@ -421,7 +418,7 @@ WaitScope::~WaitScope() {
 	AddWait(t_self, waker, m_prim, m_ra, ns);
 }
 
-void NoteYield(uint64_t return_address) noexcept {
+void NoteYieldSlow(uint64_t return_address) noexcept {
 	if (!Enabled()) {
 		return;
 	}
@@ -441,7 +438,7 @@ void NoteYield(uint64_t return_address) noexcept {
 	rec->burst_last = now;
 }
 
-void NoteFrame() noexcept {
+void NoteFrameSlow() noexcept {
 	if (Enabled()) {
 		g_frames.fetch_add(1, std::memory_order_relaxed);
 	}
