@@ -21,6 +21,10 @@
 
 #include <algorithm>
 #include <atomic>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+#include <thread>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -76,7 +80,60 @@ static SemaMode GuestSemaMode() {
 	return mode;
 }
 
+// Astro Bot PC (KYTY_GUEST_SEMA_SPIN_US=<us>, default 0 = off, 1..1000): a kernel semaphore wait
+// that would block first spins (pause) up to <us> for the count, without being registered as a
+// waiter. Astro Bot's main thread and its "SystemWakeup" thread exchange ~1,300 signal/wait pairs
+// per frame through the game's semaphore wrappers (eboot 0x17a0 wait, 0x17f0 timed wait; the
+// answer comes ~4 us later, KYTY_WAIT_GRAPH 16/11): a waiter that gets its count while spinning
+// costs no sleep, and the signaller finds no sleeping waiter, so it makes no wake-up call. Same
+// rules: a spinner takes the count only as a wait called at that moment would (count available,
+// under the lock); registered waiters are served first by Signal (WakeWaiters) as before; the
+// spin is deducted from a timed wait's time; a poll (time 0) never spins; a deleted semaphore
+// ends the spin. Works with and without KYTY_GUEST_SEMA_LIGHT. Every 10 s:
+// "Kyty semaphores invites attente active 10 s : ...".
+static uint32_t GuestSemaSpinUs() {
+	static const uint32_t us = [] {
+		const char* value  = std::getenv("KYTY_GUEST_SEMA_SPIN_US");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+		const auto  result = static_cast<uint32_t>(std::min<unsigned long>(parsed, 1000ul));
+		if (result != 0) {
+			std::printf("Kyty semaphores invites : attente active de %u us avant sommeil "
+			            "(KYTY_GUEST_SEMA_SPIN_US)\n",
+			            result);
+			std::fflush(stdout);
+		}
+		return result;
+	}();
+	return us;
+}
+
 namespace {
+std::atomic<uint64_t> g_spin_served {0};  // waits served while spinning (no sleep, no wake-up call)
+std::atomic<uint64_t> g_spin_slept {0};   // waits that spun, then slept
+std::atomic<uint64_t> g_spin_ns {0};      // time spent spinning
+std::atomic<uint64_t> g_spin_report_ns {0};
+
+void SpinReport(uint64_t now) {
+	auto last = g_spin_report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_spin_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ull ||
+	    !g_spin_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const double seconds = static_cast<double>(now - last) / 1e9;
+	const auto   served  = g_spin_served.exchange(0, std::memory_order_relaxed);
+	const auto   slept   = g_spin_slept.exchange(0, std::memory_order_relaxed);
+	const auto   spun_ns = g_spin_ns.exchange(0, std::memory_order_relaxed);
+	std::printf("Kyty semaphores invites attente active 10 s : %.0f/s servies pendant l'attente active "
+	            "(sommeil et reveil evites), %.0f/s endormies ensuite, %.1f ms/s d'attente active\n",
+	            static_cast<double>(served) / seconds, static_cast<double>(slept) / seconds,
+	            static_cast<double>(spun_ns) / 1e6 / seconds);
+	std::fflush(stdout);
+}
+
 std::atomic<uint64_t> g_sema_signals {0};
 std::atomic<uint64_t> g_sema_waits {0};
 std::atomic<uint64_t> g_sema_blocking {0};
@@ -121,7 +178,9 @@ public:
 
 	KernelSemaPrivate(const std::string& name, bool fifo, int init_count, int max_count)
 	    : m_name(name), m_fifo_order(fifo), m_count(init_count), m_init_count(init_count),
-	      m_max_count(max_count), m_mode(GuestSemaMode()) {};
+	      m_max_count(max_count), m_mode(GuestSemaMode()) {
+		PublishCount();
+	};
 	virtual ~KernelSemaPrivate();
 
 	KYTY_CLASS_NO_COPY(KernelSemaPrivate);
@@ -245,6 +304,13 @@ private:
 	std::vector<WaitingThread*> m_waiting_threads;
 	bool                        m_fifo_order;
 	int                         m_count;
+	// KYTY_GUEST_SEMA_SPIN_US: m_count as last stored under the lock, read by spinning waiters.
+	std::atomic<int> m_count_hint {0};
+	void             PublishCount() noexcept { m_count_hint.store(m_count, std::memory_order_release); }
+	// KYTY_GUEST_SEMA_SPIN_US: waiters spinning unregistered (under the lock) and the deletion,
+	// which they read while spinning.
+	int               m_spinners = 0;
+	std::atomic<bool> m_deleted_hint {false};
 	int                         m_init_count;
 	int                         m_max_count;
 	SemaMode                    m_mode;
@@ -263,6 +329,7 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 	}
 
 	m_status = Status::Deleted;
+	m_deleted_hint.store(true, std::memory_order_release); // KYTY_GUEST_SEMA_SPIN_US
 
 	for (auto* waiter: m_waiting_threads) {
 		if (!waiter->ready) {
@@ -272,7 +339,7 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 		}
 	}
 
-	while (!m_waiting_threads.empty()) {
+	while (!m_waiting_threads.empty() || m_spinners != 0) {
 		Unlock();
 		Common::Thread::SleepMicro(10);
 		Lock();
@@ -297,6 +364,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_wait
 	}
 
 	m_count = (set_count < 0 ? m_init_count : set_count);
+	PublishCount();
 
 	for (auto* waiter: m_waiting_threads) {
 		if (!waiter->ready) {
@@ -328,6 +396,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 	m_count += signal_count;
 
 	WakeWaiters(); // reveille seulement les fils servis
+	PublishCount(); // KYTY_GUEST_SEMA_SPIN_US: what is left for a spinning waiter
 	Check();
 
 	return Result::Ok;
@@ -387,6 +456,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 
 	if (m_count >= need_count) {
 		m_count -= need_count;
+		PublishCount();
 		Check();
 		if (ptr_micros != nullptr) {
 			*ptr_micros = micros;
@@ -396,6 +466,84 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 
 	if (!infinitely && micros == 0) {
 		return Result::TimedOut;
+	}
+
+	if (const auto spin_us = GuestSemaSpinUs(); spin_us != 0) {
+		// KYTY_GUEST_SEMA_SPIN_US: spin unregistered, then take the count as a wait called now
+		// would; the lock is held again whatever happens (Guard).
+		const auto spin_start = std::chrono::steady_clock::now();
+		const auto budget_us  = infinitely ? spin_us : std::min<uint32_t>(spin_us, micros);
+		const auto deadline   = spin_start + std::chrono::microseconds(budget_us);
+		bool       served     = false;
+		m_spinners++; // under the lock: the destructor waits for spinners too
+		Unlock();
+		for (;;) {
+			for (int i = 0; i < 16; i++) {
+#if defined(_M_X64) || defined(__x86_64__)
+				_mm_pause();
+#else
+				std::this_thread::yield();
+#endif
+			}
+			const bool deleted = m_deleted_hint.load(std::memory_order_acquire);
+			if (deleted || m_count_hint.load(std::memory_order_acquire) >= need_count) {
+				Lock();
+				if (m_status == Status::Deleted) {
+					m_spinners--;
+					return Result::Deleted; // Guard unlocks
+				}
+				if (m_count >= need_count) {
+					m_count -= need_count;
+					PublishCount();
+					Check();
+					served = true;
+					break; // lock held
+				}
+				Unlock();
+			}
+			if (std::chrono::steady_clock::now() >= deadline) {
+				Lock();
+				break;
+			}
+		}
+		m_spinners--; // lock held again
+		const auto spun = std::chrono::steady_clock::now() - spin_start;
+		const auto spun_ns =
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(spun).count());
+		g_spin_ns.fetch_add(spun_ns, std::memory_order_relaxed);
+		(served ? g_spin_served : g_spin_slept).fetch_add(1, std::memory_order_relaxed);
+		SpinReport(static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(
+		        std::chrono::steady_clock::now().time_since_epoch())
+		        .count()));
+		if (served) {
+			if (ptr_micros != nullptr) {
+				const auto used = static_cast<uint32_t>(spun_ns / 1000u);
+				*ptr_micros     = micros > used ? micros - used : 0;
+			}
+			return Result::Ok;
+		}
+		if (m_status == Status::Deleted) {
+			return Result::Deleted;
+		}
+		if (m_count >= need_count) { // came in just after the deadline
+			m_count -= need_count;
+			PublishCount();
+			Check();
+			if (ptr_micros != nullptr) {
+				const auto used = static_cast<uint32_t>(spun_ns / 1000u);
+				*ptr_micros     = micros > used ? micros - used : 0;
+			}
+			return Result::Ok;
+		}
+		if (!infinitely) {
+			const auto used = static_cast<uint32_t>(spun_ns / 1000u);
+			if (used >= micros) {
+				*ptr_micros = 0;
+				return Result::TimedOut;
+			}
+			micros -= used;
+		}
 	}
 
 	if (m_mode == SemaMode::Verify) {
