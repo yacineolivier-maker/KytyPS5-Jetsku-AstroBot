@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <bitset>
 #include <chrono>
 #include <cinttypes>
@@ -76,10 +77,14 @@ public:
 	// With the fault map on, a host-lock wait outside a fault counts as that thread's lock wait.
 	explicit SpinGuard(ParkingSpinLock& lock, FaultCost::Split part = FaultCost::Split::CountLock)
 	    : m_lock(lock) {
-		if (!m_lock.try_lock()) [[unlikely]] {
+		Acquire(m_lock, part);
+	}
+	// The acquisition alone (Astro Bot PC: also the host_lock slices, KYTY_PAGE_HOST_LOCK_SLICES).
+	static void Acquire(ParkingSpinLock& lock, FaultCost::Split part) noexcept {
+		if (!lock.try_lock()) [[unlikely]] {
 			const bool timed = FaultCost::MapEnabled();
 			const auto start = timed ? FaultCost::NowNs() : 0;
-			(void)m_lock.LockContended(false);
+			(void)lock.LockContended(false);
 			if (timed) {
 				const auto ns = FaultCost::NowNs() - start;
 				if (FaultCost::SplitActive()) {
@@ -96,6 +101,30 @@ public:
 private:
 	ParkingSpinLock& m_lock;
 };
+
+// Astro Bot PC (KYTY_PAGE_HOST_LOCK_SLICES): host_lock slices per region (power of two, 1..64).
+constexpr size_t MaxHostSlices = 64;
+
+size_t HostSliceShiftInit() {
+	const char* value  = std::getenv("KYTY_PAGE_HOST_LOCK_SLICES");
+	size_t      slices = value != nullptr ? std::strtoull(value, nullptr, 10) : 1;
+	if (slices < 1 || slices > MaxHostSlices || (slices & (slices - 1)) != 0) {
+		slices = 1;
+	}
+	if (slices > 1) {
+		std::printf("Kyty PageManager : verrou hote decoupe en %zu tranches par region "
+		            "(KYTY_PAGE_HOST_LOCK_SLICES)\n",
+		            slices);
+		std::fflush(stdout);
+	}
+	// log2(pages per slice); REGION_PAGES is a power of two.
+	return static_cast<size_t>(std::countr_zero(REGION_PAGES / slices));
+}
+
+size_t HostSliceShift() {
+	static const size_t shift = HostSliceShiftInit();
+	return shift;
+}
 
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
@@ -420,8 +449,14 @@ struct PageManager::Impl {
 	//    is recorded. The only change that can happen meanwhile is a deferred release, which only
 	//    loosens the counts. So at every host_lock release no page's host protection is looser
 	//    than its counts, and the last update to run writes the latest state.
+	//  Astro Bot PC (KYTY_PAGE_HOST_LOCK_SLICES=<n>, default 1): host_lock is n locks, each for
+	//    REGION_PAGES / n consecutive pages ("slices"). Every host call and the decision it rests
+	//    on concern a page range, and take the slices that cover it in ascending order (HostGuard):
+	//    each page is still covered by exactly one lock, so the rules above hold page by page,
+	//    while updates of disjoint slices of a region (write faults of different fault-ahead
+	//    windows, re-protections of other buffers) no longer wait for each other's VirtualProtect.
 	struct Region {
-		ParkingSpinLock                     host_lock;
+		std::array<ParkingSpinLock, MaxHostSlices> host_locks;
 		ParkingSpinLock                     lock;
 		std::array<PageState, REGION_PAGES> pages;
 		// The protection last requested from the host for each page, under both locks. ReadWrite
@@ -684,6 +719,71 @@ struct PageManager::Impl {
 		}
 	}
 
+	// KYTY_PAGE_HOST_LOCK_SLICES: the host_lock slices of pages [first, last) (at least one page).
+	static void HostSlices(size_t first, size_t last, size_t& lo, size_t& hi) noexcept {
+		const auto shift = HostSliceShift();
+		lo               = first >> shift;
+		hi               = (std::max(last, first + 1) - 1) >> shift;
+	}
+	// Holds the host_lock slices of [first, last), taken in ascending order.
+	class HostGuard final {
+	public:
+		HostGuard(Region& region, size_t first, size_t last,
+		          FaultCost::Split part = FaultCost::Split::HostLock) noexcept
+		    : m_region(region) {
+			HostSlices(first, last, m_lo, m_hi);
+			for (size_t slice = m_lo; slice <= m_hi; slice++) {
+				SpinGuard::Acquire(region.host_locks[slice], part);
+			}
+		}
+		~HostGuard() {
+			for (size_t slice = m_hi + 1; slice-- > m_lo;) {
+				m_region.host_locks[slice].unlock();
+			}
+		}
+		KYTY_CLASS_NO_COPY(HostGuard);
+
+	private:
+		Region& m_region;
+		size_t  m_lo = 0;
+		size_t  m_hi = 0;
+	};
+	// Takes every slice of [first, last) without waiting, or none.
+	static bool TryLockHost(Region& region, size_t first, size_t last) noexcept {
+		size_t lo = 0;
+		size_t hi = 0;
+		HostSlices(first, last, lo, hi);
+		for (size_t slice = lo; slice <= hi; slice++) {
+			if (!region.host_locks[slice].try_lock()) {
+				while (slice-- > lo) {
+					region.host_locks[slice].unlock();
+				}
+				return false;
+			}
+		}
+		return true;
+	}
+	static void UnlockHost(Region& region, size_t first, size_t last) noexcept {
+		size_t lo = 0;
+		size_t hi = 0;
+		HostSlices(first, last, lo, hi);
+		for (size_t slice = hi + 1; slice-- > lo;) {
+			region.host_locks[slice].unlock();
+		}
+	}
+	// No slice of [first, last) is held right now.
+	static bool HostFree(const Region& region, size_t first, size_t last) noexcept {
+		size_t lo = 0;
+		size_t hi = 0;
+		HostSlices(first, last, lo, hi);
+		for (size_t slice = lo; slice <= hi; slice++) {
+			if (!region.host_locks[slice].IsFree()) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	// Brings the host protection of pages [first, last) to what their counts ask, calling the
 	// host only for the runs whose recorded protection differs (a run may bridge pages already at
 	// its level). Takes both locks itself. Returns the host calls made.
@@ -698,7 +798,7 @@ struct PageManager::Impl {
 			bool settled = false;
 			{
 				SpinGuard counts(region.lock);
-				if (region.host_lock.IsFree()) {
+				if (HostFree(region, first, last)) {
 					settled = true;
 					for (size_t page = first; page < last; page++) {
 						if (ToLevel(region.pages[page].Perms()) != region.applied[page]) {
@@ -711,12 +811,12 @@ struct PageManager::Impl {
 					}
 				}
 			}
-			ApplySpanFastNote(settled, !settled && !region.host_lock.IsFree());
+			ApplySpanFastNote(settled, !settled && !HostFree(region, first, last));
 			if (settled) {
 				return 0;
 			}
 		}
-		SpinGuard host(region.host_lock, FaultCost::Split::HostLock);
+		HostGuard host(region, first, last);
 		RunList   runs;
 		uint32_t  calls = 0;
 		{
@@ -951,7 +1051,7 @@ struct PageManager::Impl {
 		size_t     hi         = 0;
 		uint64_t   pages      = 0;
 		uint64_t   race_pages = 0;
-		const bool exact      = region.host_lock.try_lock();
+		const bool exact      = TryLockHost(region, first, last);
 		const bool race_old   = DeferRaceOld();
 		{
 			SpinGuard counts(region.lock);
@@ -987,7 +1087,7 @@ struct PageManager::Impl {
 			}
 		}
 		if (exact) {
-			region.host_lock.unlock();
+			UnlockHost(region, first, last);
 		}
 		if (race_pages != 0) {
 			g_dp.race_pages.fetch_add(race_pages, std::memory_order_relaxed);
@@ -1016,7 +1116,7 @@ struct PageManager::Impl {
 	// or on the host (Windows): a guest write there would not fault, so the copy that follows
 	// would be the last one to see it.
 	void VerifyDeferredApplied(Region& region, uint64_t base_addr, size_t first, size_t last) noexcept {
-		SpinGuard host(region.host_lock, FaultCost::Split::HostLock);
+		HostGuard host(region, first, last);
 		SpinGuard counts(region.lock);
 		g_dp.verify_checks.fetch_add(1, std::memory_order_relaxed);
 		const auto report = [&](const char* what, size_t page, int counts_level, int level) {
@@ -1134,7 +1234,7 @@ struct PageManager::Impl {
 				return;
 			}
 		}
-		SpinGuard host(region.host_lock, FaultCost::Split::HostLock);
+		HostGuard host(region, first, last);
 		RunList   runs;
 		{
 			SpinGuard counts(region.lock);
@@ -1293,8 +1393,8 @@ void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {
 			continue; // never watched: the host protection is not the tracker's
 		}
 		{
-			SpinGuard host(region->host_lock, FaultCost::Split::HostLock);
-			SpinGuard counts(region->lock);
+			Impl::HostGuard host(*region, first, last);
+			SpinGuard       counts(region->lock);
 			// The host reset these pages; ApplySpan below protects them again (pending pages stay
 			// pending until it records them).
 			std::fill(region->applied.data() + first, region->applied.data() + last,
