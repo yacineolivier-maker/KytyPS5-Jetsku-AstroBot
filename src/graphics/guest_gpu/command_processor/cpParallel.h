@@ -263,6 +263,7 @@
 // Not done yet (step 3b-3): simultaneous execution; the CP fields kept across ops, RenderMutex
 // ownership and the sequencer's executed-op counter are still those of the token holder.
 
+#include <atomic>
 #include <cstdint>
 
 namespace Libs::Graphics::CpPar {
@@ -280,7 +281,16 @@ enum class Mode : uint8_t {
 };
 
 // KYTY_CP_PAR, read once.
-[[nodiscard]] Mode GetMode();
+// Astro Bot PC (audit 17/11, lot C4): GetMode() is called many times per packet (Enabled() and the
+// helpers below); the value read once by GetModeSlow() (its function-local static, as before) is
+// kept in g_mode_cache (0: not read yet, else the mode + 1), so later calls are one relaxed load
+// instead of an out-of-line call and the local static's guard check. KYTY_CP_PAR is not live.
+inline std::atomic<uint8_t> g_mode_cache {0};
+[[nodiscard]] Mode GetModeSlow();
+[[nodiscard]] inline Mode GetMode() {
+	const auto cached = g_mode_cache.load(std::memory_order_relaxed);
+	return cached != 0 ? static_cast<Mode>(cached - 1u) : GetModeSlow();
+}
 [[nodiscard]] inline bool Enabled() {
 	return GetMode() != Mode::Off;
 }

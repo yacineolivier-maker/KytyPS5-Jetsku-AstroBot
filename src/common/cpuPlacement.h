@@ -233,6 +233,67 @@ struct PlacementHistogram {
 };
 void TakePlacementHistogram(PlacementHistogram& out);
 
+// Astro Bot PC (17/11, bimodal 20 / 24.8 fps): the heavy threads and their logical processors.
+//
+// Heavy threads register once, on themselves, at their entry point (ThreadLayoutRegister): the
+// guest main thread (kernel/mainCpu.cpp), Thread_Gpu, CpSequencer, CP recorder and the DrawPrep
+// workers. Registering costs nothing when both switches below are off.
+//
+// KYTY_THREAD_LAYOUT_LOG=1: a background thread ("Thread layout log") reads every 5 ms, for each
+// registered thread, its cycle time (QueryThreadCycleTime, no suspension) and the logical processor
+// it last noted itself (SamplePlacement call sites and ThreadLayoutNoteCpu: Windows gives no other
+// way to know where another thread runs; a note older than 50 ms counts as unknown). A thread is
+// "busy" in a 5 ms tick when it used at least half of it. Two busy threads on the two logical
+// processors of one physical core are an SMT collision. Every 10 s:
+//   Kyty placement fils 10 s : mode=... ; fils=N ; tsc=x.xx GHz ; ticks=N
+//   Kyty placement fil : nom=Thread_Gpu ; role=gpu ; ideal=4 ; coeur_ideal=2 ; impose=4 ;
+//       dernier=5 ; coeur=2 ; age_ms=0 ; cpu=74.1% ; occupe=70.2% ; frere_smt_occupe=12.3% ;
+//       meme_logique=0.0% ; notes=1234
+//   Kyty placement collisions 10 s : courantes : A+B 8.1% ; ... | ideales : A+B (frere) ; ...
+// cpu: the thread's CPU time over the interval (cycles / TSC rate). frere_smt_occupe: share of its
+// busy ticks where another busy heavy thread was on its SMT sibling. Courantes: share of all ticks
+// where both threads of the pair were busy on sibling processors. Ideales: pairs whose ideal
+// processors (GetThreadIdealProcessorEx) are the same or SMT siblings.
+//
+// KYTY_IDEAL_LAYOUT (default off; soft preference only, no affinity, nothing reserved):
+//   1 (or on, ideal): SetThreadIdealProcessorEx, deterministic. The guest main thread, Thread_Gpu,
+//     CpSequencer and CP recorder get distinct physical cores (GetSystemCpuSetInformation
+//     CoreIndex / LogicalProcessorIndex; cores ordered by: every logical processor allowed, not the
+//     core of logical processor 0 (interrupts), SchedulingClass, CoreIndex), the first logical
+//     processor of each. DrawPrep workers and other registered threads take, in registration
+//     order, the logical processors of the remaining cores (one per core before the second SMT
+//     sibling), then the SMT siblings of the four heavy cores (recorder's first, main's last).
+//   cpuset: the four heavy threads get SetThreadSelectedCpuSets = their whole physical core (both
+//     logical processors); others as with 1 (ideal processor only).
+//   <list>, e.g. 2,4,6,8,10,0: explicit logical processors for main, gpu, sequencer, recorder,
+//     then DrawPrep/others round-robin over the rest of the list (ideal processor only).
+//   Ignored (logged) when KYTY_CPU_RESERVE, KYTY_CPU_SETS, KYTY_MAIN_THREAD_CORE or the V-cache
+//   placement manage the CPU sets. KYTY_CP_SEQ_IDEAL_CPU / KYTY_CP_RECORDER_IDEAL_CPU, applied after
+//   the registration, still win for their thread.
+//   One "Kyty placement disposition" line at the first registration, one "Kyty placement :" line
+//   per registered thread with what was applied.
+enum class ThreadLayoutRole : uint8_t { Main = 0, Gpu, Sequencer, Recorder, DrawPrep, Other, Count };
+
+// Pure: the cores and logical processors of KYTY_IDEAL_LAYOUT=1 (group 0 only).
+struct IdealLayout {
+	static constexpr size_t                     Heavy = 4; // main, gpu, sequencer, recorder
+	std::array<int, Heavy>                      heavy_logical {-1, -1, -1, -1};
+	std::array<int, Heavy>                      heavy_core {-1, -1, -1, -1};
+	std::array<std::vector<uint32_t>, Heavy>    heavy_ids; // CPU set ids of each heavy core
+	std::vector<uint32_t>                       others;    // logical processors, in order of use
+	std::string                                 description;
+};
+[[nodiscard]] IdealLayout ComputeIdealLayout(const std::vector<CpuSetInfo>& sets);
+// Pure: "2,4,6,8" as an ordered list of logical processors (0..63); false if malformed.
+[[nodiscard]] bool ParseLogicalList(const char* text, std::vector<uint32_t>* out);
+
+// The calling thread is a heavy thread (`name` is copied). Applies KYTY_IDEAL_LAYOUT and adds it to
+// the KYTY_THREAD_LAYOUT_LOG registry. No-op when both are off.
+void ThreadLayoutRegister(const char* name, ThreadLayoutRole role);
+// The calling registered thread notes its current logical processor (SamplePlacement does it too).
+void ThreadLayoutNoteCpu();
+[[nodiscard]] bool ThreadLayoutLogEnabled(); // KYTY_THREAD_LAYOUT_LOG=1
+
 } // namespace Common
 
 #endif // EMULATOR_SRC_COMMON_CPUPLACEMENT_H_

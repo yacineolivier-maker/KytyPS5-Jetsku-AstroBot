@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/command_processor/cpSequencer.h"
 
 #include "common/assert.h"
+#include "common/cpuPlacement.h" // Astro Bot PC (KYTY_IDEAL_LAYOUT, KYTY_THREAD_LAYOUT_LOG)
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -254,6 +255,7 @@ void Sequencer::Run() {
 	CpPar::SetWaitSlot(4); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1: the stall watchdog)
 	// The resolver waits for it at every ordering point, like a CP waits for its fetcher.
 	Common::RaiseCurrentThreadPriority();
+	Common::ThreadLayoutRegister("CpSequencer", Common::ThreadLayoutRole::Sequencer); // Astro Bot PC (KYTY_IDEAL_LAYOUT, KYTY_THREAD_LAYOUT_LOG)
 #if defined(_WIN32)
 	if (const auto* ideal = std::getenv("KYTY_CP_SEQ_IDEAL_CPU"); ideal != nullptr) {
 		const auto       cpu = static_cast<uint32_t>(std::strtoul(ideal, nullptr, 10));
@@ -276,6 +278,7 @@ void Sequencer::Run() {
 			m_intake.pop_front();
 		}
 		HangWatchdog::SetCpContext(0, intake.sequence);
+		Common::ThreadLayoutNoteCpu(); // KYTY_THREAD_LAYOUT_LOG: no SamplePlacement on this thread
 		const bool running = m_processor.SequenceSubmission(intake);
 		HangWatchdog::SetCpContext(UINT32_MAX, 0);
 		if (!running) {

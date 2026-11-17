@@ -1142,6 +1142,56 @@ private:
 
 } // namespace
 
+// Astro Bot PC (audit 17/11, lot C2): KYTY_DRAW_PREP_SPIN_ADAPT=N (default 0: off; 1 means 4): a
+// hot worker (KYTY_DRAW_PREP_HOT) whose last N idle spins all ran out (KYTY_DRAW_PREP_SPIN_US, 200 us
+// by default) without finding a slot parks right away instead (after 64 pauses), and spins again
+// once work comes back quickly: a slot claimed before its idle spin ran out, or a wake-up within
+// the spin length after it went idle (spinning would have caught that slot). Otherwise the loop is
+// workerGate.h's RunPreparationWorker for a hot worker: same claim, cold wake and park protocol
+// (ParkHot), so no slot is missed; a parked worker only costs the producer's wake (OnPublish).
+// Measured on DrawPrep#3 (audit): its idle loop took 10 % of its time against 7.75 % of Prepare.
+template <typename WindowT, typename Prepare, typename OnColdWake>
+static void RunAdaptiveHotWorker(WorkerGate& gate, WindowT& window, uint64_t spin_ns, uint32_t futile_limit,
+                                 const std::atomic<bool>& stop, Prepare&& prepare,
+                                 OnColdWake&& on_cold_wake) {
+	auto     idle_start = WorkerNowNs();
+	uint32_t spins      = 0;
+	uint32_t futile     = 0;     // consecutive idle spins that ran out without a slot
+	bool     after_park = false; // this idle period began with a park
+	while (!stop.load(std::memory_order_acquire)) {
+		uint64_t seq = 0;
+		if (auto* slot = window.TryClaim(seq); slot != nullptr) {
+			if (!after_park) {
+				futile = 0; // found while spinning: spinning pays
+			}
+			after_park = false;
+			if (gate.HasCold() && gate.MaybeWakeCold(window.Unclaimed())) {
+				on_cold_wake();
+			}
+			prepare(*slot, seq);
+			idle_start = WorkerNowNs();
+			spins      = 0;
+			continue;
+		}
+		WorkerRelax();
+		const bool direct = futile >= futile_limit;
+		if ((++spins & (direct ? 63u : 255u)) != 0u || (!direct && WorkerNowNs() - idle_start < spin_ns)) {
+			continue;
+		}
+		if (!direct) {
+			futile++;
+		}
+		gate.ParkHot([&window] { return window.HasClaimable(); }, stop);
+		const auto woke = WorkerNowNs();
+		if (direct && woke - idle_start < spin_ns) {
+			futile = 0; // the work came back within the spin length: spin again
+		}
+		after_park = true;
+		idle_start = woke;
+		spins      = 0;
+	}
+}
+
 // The parallel-mode window and its DrawPrep#k threads. Workers only run Prepare on claimed
 // slots (register snapshot in, preparation out); everything else stays on the GPU thread.
 // Parking follows WorkerGate (workerGate.h): KYTY_DRAW_PREP_HOT workers spin as before, the
@@ -1149,10 +1199,10 @@ private:
 struct Engine::Workers {
 	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns,
 	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns, StealPolicy steal,
-	        bool cold_token, const char* name_format = "DrawPrep#%u")
+	        bool cold_token, const char* name_format = "DrawPrep#%u", uint32_t spin_adapt = 0)
 	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns),
 	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token),
-	      name_format(name_format) {
+	      name_format(name_format), spin_adapt(spin_adapt) {
 		for (uint32_t index = 0; index < count; index++) {
 			threads.emplace_back([this, index] { Run(index); });
 		}
@@ -1204,9 +1254,23 @@ struct Engine::Workers {
 		char name[32];
 		std::snprintf(name, sizeof(name), name_format, index + 1u); // Astro Bot PC (KYTY_CP_PAR)
 		Profiler::SetThreadName(name);
+		Common::ThreadLayoutRegister(name, Common::ThreadLayoutRole::DrawPrep); // Astro Bot PC (KYTY_IDEAL_LAYOUT, KYTY_THREAD_LAYOUT_LOG)
 		t_worker_thread = true;
 		uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 64th slot
 		t_worker_number = index + 1u;
+		if (spin_adapt != 0 && gate.Hot(index)) {
+			// Astro Bot PC (KYTY_DRAW_PREP_SPIN_ADAPT, lot C2).
+			RunAdaptiveHotWorker(
+			    gate, window, spin_ns, spin_adapt, stop,
+			    [this, &placement_count](Slot& slot, uint64_t seq) {
+				    PrepareClaimed(slot, seq);
+				    if ((++placement_count & 63u) == 0u) {
+					    Common::SamplePlacement(Common::ThreadRole::Host);
+				    }
+			    },
+			    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
+			return;
+		}
 		RunPreparationWorker(
 		    gate, window, index, spin_ns, cold_spin_ns, stop,
 		    [this, &placement_count](Slot& slot, uint64_t seq) {
@@ -1227,6 +1291,7 @@ struct Engine::Workers {
 	WorkerGate               gate;
 	// Astro Bot PC (KYTY_CP_PAR=1b1): the threads' name ("DrawPrep#%u", or "DrawPrep B#%u").
 	const char*              name_format;
+	uint32_t                 spin_adapt = 0; // Astro Bot PC (KYTY_DRAW_PREP_SPIN_ADAPT): 0 off, else N
 	std::atomic<bool>        stop {false};
 	std::vector<std::thread> threads;
 };
@@ -1267,13 +1332,23 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		// KYTY_DRAW_PREP_COLD_TOKEN=1: the cold-wake protocol whose wakes cannot stick
 		// (workerGate.h); with the default one the cold workers stop waking after a race.
 		const bool cold_token = EnvUnsigned("KYTY_DRAW_PREP_COLD_TOKEN", 0, 0, 1) != 0;
+		// Astro Bot PC (audit 17/11, lot C2): KYTY_DRAW_PREP_SPIN_ADAPT (RunAdaptiveHotWorker): 0
+		// off (default), 1 = after 4 idle spins without a slot, N >= 2 = after N.
+		const auto spin_adapt_value = EnvUnsigned("KYTY_DRAW_PREP_SPIN_ADAPT", 0, 0, 1000);
+		const auto spin_adapt       = spin_adapt_value == 1 ? 4u : spin_adapt_value;
 		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
 		                                      uint64_t {spin_us} * 1000u, hot, wake_backlog,
 		                                      uint64_t {cold_spin_us} * 1000u, steal, cold_token,
 		                                      lane == 0   ? "DrawPrep#%u"
 		                                      : lane == 1 ? "DrawPrep B#%u"
 		                                      : lane == 2 ? "DrawPrep C#%u"
-		                                                  : "DrawPrep D#%u");
+		                                                  : "DrawPrep D#%u",
+		                                      spin_adapt);
+		if (spin_adapt != 0) {
+			LOGF("DrawPrep: KYTY_DRAW_PREP_SPIN_ADAPT: hot workers park at once after %u idle spins "
+			     "without a slot\n",
+			     spin_adapt);
+		}
 		// Astro Bot PC (KYTY_CP_PAR=2a): context B's workers read lane B's memo (if it has one).
 		m_workers->plan_context =
 		    MakeBindingPlanContext(m_renderer, &m_renderer.GetRenderExecutor(lane));

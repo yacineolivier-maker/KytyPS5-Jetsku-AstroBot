@@ -1072,6 +1072,7 @@ void CommandRecorder::Run(std::stop_token stop) {
 	// KYTY_CPU_RESERVE=cp+recorder: its own physical core; cp: off the CP's core, with the other
 	// threads (common/cpuPlacement.h).
 	Common::PlaceCurrentThread(Common::ThreadRole::Recorder);
+	Common::ThreadLayoutRegister("CP recorder", Common::ThreadLayoutRole::Recorder); // Astro Bot PC (KYTY_IDEAL_LAYOUT, KYTY_THREAD_LAYOUT_LOG)
 #if defined(_WIN32)
 	if (const auto* ideal = std::getenv("KYTY_CP_RECORDER_IDEAL_CPU"); ideal != nullptr) {
 		const auto       cpu = static_cast<uint32_t>(std::strtoul(ideal, nullptr, 10));

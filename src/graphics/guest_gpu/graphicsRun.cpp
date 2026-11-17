@@ -743,10 +743,70 @@ static uint64_t CpBlockedSpinNs() {
 	return static_cast<uint64_t>(g_cp_blocked_spin_us.Get()) * 1000u;
 }
 
+// Astro Bot PC (audit 17/11, lot C4): the same value as steady_clock::now() in nanoseconds (the MSVC
+// STL's own conversion of the performance counter), with the counter's frequency read once instead
+// of at every call (fixed since boot; 1.3 % of Thread_Gpu went to re-reading it).
 static uint64_t CpNowNs() {
+#if defined(_MSVC_STL_VERSION) && defined(_WIN32)
+	// Constant-initialized (no guard on the path): 0 until the first call reads the frequency.
+	static std::atomic<long long> cached_frequency {0};
+	long long                     frequency = cached_frequency.load(std::memory_order_relaxed);
+	if (frequency == 0) {
+		frequency = _Query_perf_frequency();
+		cached_frequency.store(frequency, std::memory_order_relaxed);
+	}
+	const long long counter = _Query_perf_counter();
+	if (frequency == 10'000'000) {
+		return static_cast<uint64_t>(counter * 100);
+	}
+	const long long whole = (counter / frequency) * 1'000'000'000;
+	const long long part  = (counter % frequency) * 1'000'000'000 / frequency;
+	return static_cast<uint64_t>(whole + part);
+#else
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
 	                                 .count());
+#endif
+}
+
+// Astro Bot PC (audit 17/11, lot C1): KYTY_CP_BLOCKED_WAKE_GEN=1 (default off; live). With every
+// queue suspended, Thread_Gpu re-runs the suspended fronts (Process: WAIT_REG_MEM / WAIT_FLIP_DONE
+// re-evaluation, sequencer ring peek, watchdog notes) only when something that can unblock them
+// happened since it last evaluated them, or when the poll interval passed:
+// - every wake-up source bumps g_cp_wake_gen (CpWakeGenBump): completion-runner operations
+//   (NotifyProgress, also when no queue was marked blocked yet: the race the spin used to cover),
+//   flips (NotifyGpuProgress -> NotifyProgress), deferred label writes (RemoveDeferredLabel), new
+//   submissions and service commands (Enqueue, SendCommand, TrySendCommand), shutdown, and
+//   Thread_Gpu's own progress (a slice that completed or progressed, a service command it ran);
+// - what no one signals (a WAIT_REG_MEM on memory the guest CPU writes, a REWIND valid bit, the
+//   frame fence's 2 s timeout) is polled every KYTY_CP_BLOCKED_POLL_US (default 25, live, at most
+//   1000) during the KYTY_CP_BLOCKED_SPIN_US spin, and at every 1 ms condition-variable timeout
+//   after it (CondVar::WaitFor cannot sleep less than 1 ms: the 1 ms safety net is unchanged).
+// The generation is read (acquire) before the fronts are re-run, and each source bumps it (release)
+// after its own state change: a change the re-run did not see bumps the generation after that
+// read, so the next look re-runs them. Not used with KYTY_CP_PAR (resolver lanes on other threads)
+// or KYTY_CP_WAKEUPS=0.
+static Live::Switch g_cp_blocked_wake_gen("KYTY_CP_BLOCKED_WAKE_GEN", Live::ParseDefaultOff);
+static Live::Switch g_cp_blocked_poll_us("KYTY_CP_BLOCKED_POLL_US", [](const char* value) -> int64_t {
+	const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 25ul;
+	return static_cast<int64_t>(std::min(parsed, 1000ul));
+});
+alignas(64) static std::atomic<uint64_t> g_cp_wake_gen {1};
+
+static void CpWakeGenBump() {
+	g_cp_wake_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// Astro Bot PC (audit 17/11, lot C4): HangWatchdog::DebugDelay returns at once unless
+// KYTY_HANG_DELAY_SITE is set (read once, at its first call); the per-slice call is skipped then.
+static bool CpHangDelaySelected() {
+	static std::atomic<int8_t> selected {-1};
+	auto                       value = selected.load(std::memory_order_relaxed);
+	if (value < 0) {
+		value = std::getenv("KYTY_HANG_DELAY_SITE") != nullptr ? 1 : 0;
+		selected.store(value, std::memory_order_relaxed);
+	}
+	return value != 0;
 }
 
 // cp.csv label rows (KYTY_HANG_TRACE_CP).
@@ -1097,6 +1157,7 @@ void GuestGpu::Shutdown() {
 		Common::LockGuard lock(m_queue_mutex);
 		m_accepting = false;
 		m_stopping  = true;
+		CpWakeGenBump(); // Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN)
 		m_work_available.SignalAll();
 	}
 	if (m_thread.joinable()) {
@@ -1130,6 +1191,7 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
+	CpWakeGenBump(); // Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN)
 	m_work_available.Signal();
 }
 
@@ -1232,11 +1294,15 @@ bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
 	}
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
+	CpWakeGenBump(); // Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN)
 	m_work_available.Signal();
 	return true;
 }
 
 void GuestGpu::NotifyProgress() {
+	// Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN): before the fast path, which misses a queue that is
+	// being suspended right now (marked blocked after this call).
+	CpWakeGenBump();
 	// Cheap when nothing is blocked (called after every completion-runner operation).
 	if (!m_has_blocked.exchange(false, std::memory_order_acq_rel)) {
 		return;
@@ -1314,6 +1380,7 @@ void GuestGpu::RemoveDeferredLabel(uint64_t address, uint64_t tick) {
 	m_deferred_label_count.store(static_cast<uint32_t>(m_deferred_labels.size()),
 	                             std::memory_order_release);
 	// A queue suspended on this label (WAIT_REG_MEM) can make progress now.
+	CpWakeGenBump(); // Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN)
 	for (auto& queue: m_queues) {
 		if (!queue.empty()) {
 			queue.front().blocked = false;
@@ -2477,6 +2544,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
+	CpWakeGenBump(); // Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN)
 	m_work_available.Signal();
 	if (CpPar::LaneConcurrent()) {
 		CpPar::WakeDispatcher(); // Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1): Thread_Gpu may hand it out
@@ -2502,6 +2570,7 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::RaiseCurrentThreadPriority();
 	// KYTY_CPU_RESERVE: its own physical core.
 	Common::PlaceCurrentThread(Common::ThreadRole::Cp);
+	Common::ThreadLayoutRegister("Thread_Gpu", Common::ThreadLayoutRole::Gpu); // Astro Bot PC (KYTY_IDEAL_LAYOUT, KYTY_THREAD_LAYOUT_LOG)
 	// KYTY_CP_GAP_STATS (drawPrep/cpGaps.h): this thread's time by cause.
 	CpGaps::AttachThread();
 	g_gpu_thread = true;
@@ -2532,6 +2601,13 @@ void GuestGpu::ThreadRun(void* data) {
 
 	const bool wakeups       = CpWakeupsEnabled();
 	uint64_t   spin_deadline = 0; // 0: not spinning on blocked queues
+	// Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN): the wake-up generation read before the suspended
+	// fronts were last re-run (0: none, re-run them), when the next poll is due, and the counts of
+	// the "CP wake-gen 10s" line.
+	uint64_t wake_seen_gen   = 0;
+	uint64_t wake_next_poll  = 0;
+	uint64_t wake_report_ns  = 0;
+	uint64_t wake_reruns_gen = 0, wake_reruns_poll = 0, wake_skips = 0, wake_sleeps = 0;
 	for (;;) {
 		if (CpPar::LaneConcurrent()) {
 			// Astro Bot PC (KYTY_CP_PAR_CONCURRENT=1, obstacle 4): the lists out first (requests,
@@ -2616,6 +2692,55 @@ void GuestGpu::ThreadRun(void* data) {
 					                                     gpu->m_submission_count);
 					gpu->m_processing = false;
 					const CpGaps::Scope gap(CpGaps::Cat::Blocked);
+					// Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN, lot C1): see g_cp_blocked_wake_gen.
+					const bool wake_gen = wakeups && g_cp_blocked_wake_gen.On() && !CpPar::Enabled();
+					if (wake_gen) {
+						const auto now = CpNowNs();
+						const auto gen = g_cp_wake_gen.load(std::memory_order_acquire);
+						if (wake_report_ns == 0) {
+							wake_report_ns = now;
+						} else if (now - wake_report_ns >= 10'000'000'000ull) {
+							std::printf("Kyty CP wake-gen 10s: fronts re-run %" PRIu64 " (signal) + %" PRIu64
+							            " (poll), looks without re-run %" PRIu64 ", sleeps %" PRIu64
+							            " (poll %" PRId64 " us, spin %" PRId64 " us)\n",
+							            wake_reruns_gen, wake_reruns_poll, wake_skips, wake_sleeps,
+							            g_cp_blocked_poll_us.Get(), g_cp_blocked_spin_us.Get());
+							wake_report_ns  = now;
+							wake_reruns_gen = wake_reruns_poll = wake_skips = wake_sleeps = 0;
+						}
+						if (spin_deadline == 0) {
+							spin_deadline = now + CpBlockedSpinNs();
+						}
+						const bool signaled = gen != wake_seen_gen;
+						if (signaled || now >= wake_next_poll) {
+							// Something happened (or the poll is due): the fronts are re-run below.
+							(signaled ? wake_reruns_gen : wake_reruns_poll)++;
+							wake_seen_gen  = gen;
+							wake_next_poll = now + static_cast<uint64_t>(g_cp_blocked_poll_us.Get()) * 1000u;
+							gpu->m_has_blocked.store(false, std::memory_order_release);
+							for (auto& queue: gpu->m_queues) {
+								if (!queue.empty()) {
+									queue.front().blocked = false;
+								}
+							}
+							continue;
+						}
+						wake_skips++;
+						if (now < spin_deadline) {
+							// Spin phase: wait for a signal without re-running the fronts.
+							Profiler::CountFrameEvent(Profiler::FrameEvent::CpBlockedSpins);
+							gpu->m_queue_mutex.Unlock();
+							std::this_thread::yield();
+							gpu->m_queue_mutex.Lock();
+						} else {
+							// At least 1 ms (CondVar::WaitFor), so the poll is due when it returns.
+							wake_sleeps++;
+							Profiler::CountFrameEvent(Profiler::FrameEvent::CpBlockedSleeps);
+							gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 1000);
+						}
+						continue;
+					}
+					wake_seen_gen = 0; // Astro Bot PC: switched off (live): the next look re-runs them
 					if (!wakeups) {
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					} else {
@@ -2709,6 +2834,7 @@ void GuestGpu::ThreadRun(void* data) {
 				DrawRun::NoteForeignActivity("service command");
 			}
 			spin_deadline = 0;
+			CpWakeGenBump(); // Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN): its writes may unblock a queue
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -2726,11 +2852,24 @@ void GuestGpu::ThreadRun(void* data) {
 				HangTrace::RecordQueueWait(submission.queue_id, slice_start - submission.enqueue_ns);
 			}
 		}
-		HangTrace::SetCpContext(submission.queue_id, submission.sequence);
-		HangWatchdog::SetCpContext(submission.queue_id, submission.sequence);
-		HangWatchdog::NoteQueue(submission.queue_id, submission.sequence, "executing",
-		                        submission.frame_fence);
-		HangWatchdog::DebugDelay("queue", submission.queue_id);
+		// Astro Bot PC (audit 17/11, lot C4): the trace and watchdog calls are skipped when they are
+		// off; each returns at once then (the trace's CP context is read only by RecordCp, which
+		// needs HangTrace::Enabled(); the watchdog's calls test Enabled() first; DebugDelay needs
+		// KYTY_HANG_DELAY_SITE). The watchdog is live (KYTY_HANG_WATCHDOG): each call site tests its
+		// flag as the callee would.
+		const bool slice_trace    = HangTrace::Enabled();
+		const bool slice_watchdog = HangWatchdog::Enabled();
+		if (slice_trace) {
+			HangTrace::SetCpContext(submission.queue_id, submission.sequence);
+		}
+		if (slice_watchdog) {
+			HangWatchdog::SetCpContext(submission.queue_id, submission.sequence);
+			HangWatchdog::NoteQueue(submission.queue_id, submission.sequence, "executing",
+			                        submission.frame_fence);
+		}
+		if (CpHangDelaySelected()) {
+			HangWatchdog::DebugDelay("queue", submission.queue_id);
+		}
 		Live::CpSliceBegin(); // CP busy time in the "Live:" lines (KYTY_LIVE_FILE only)
 		bool complete = false;
 		if (FramePath::Enabled()) {
@@ -2751,11 +2890,13 @@ void GuestGpu::ThreadRun(void* data) {
 				                          scheduler.CurrentTick() - 1u);
 			}
 		}
-		HangWatchdog::NoteQueue(
-		    submission.queue_id, submission.sequence,
-		    complete ? "complete"
-		             : (submission.command_execution.Yielded() ? "yielded" : "blocked"),
-		    submission.frame_fence);
+		if (HangWatchdog::Enabled()) {
+			HangWatchdog::NoteQueue(
+			    submission.queue_id, submission.sequence,
+			    complete ? "complete"
+			             : (submission.command_execution.Yielded() ? "yielded" : "blocked"),
+			    submission.frame_fence);
+		}
 		Live::CpSliceEnd();
 		if (HangTrace::Enabled()) {
 			HangTrace::RecordQueueBusy(submission.queue_id, HangTrace::NowNs() - slice_start,
@@ -2769,11 +2910,18 @@ void GuestGpu::ThreadRun(void* data) {
 			event.value = submission.slice_progress ? 1 : 0;
 			HangTrace::RecordCp(event);
 		}
-		HangTrace::SetCpContext(UINT32_MAX, 0);
-		HangWatchdog::SetCpContext(UINT32_MAX, 0);
+		if (slice_trace) {
+			HangTrace::SetCpContext(UINT32_MAX, 0);
+		}
+		if (HangWatchdog::Enabled()) {
+			HangWatchdog::SetCpContext(UINT32_MAX, 0);
+		}
 
 		if (complete || submission.slice_progress) {
 			spin_deadline = 0;
+			// Astro Bot PC (KYTY_CP_BLOCKED_WAKE_GEN): its CP writes, labels and fence changes may
+			// unblock the other queues.
+			CpWakeGenBump();
 		}
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete && submission.command_execution.Yielded()) {

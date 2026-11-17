@@ -1439,6 +1439,19 @@ vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32
 				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
 				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided,
 				                          data.size_bytes());
+				// Astro Bot PC (audit 17/11, lot C3): KYTY_UPLOAD_LAST_REUSED=1 (default off) reports
+				// this hit as a reuse (*fresh = false), as the table path below does: the range was
+				// allocated earlier in this tick for byte-identical data, so an earlier descriptor of
+				// this recording may refer to it. Without it the hit stays "fresh", and
+				// KYTY_PUSH_SHADOW_FRESH_SKIP / KYTY_SET_REUSE_FRESH skip the push comparison and the
+				// set reuse lookup that could have matched (a lost saving, not a wrong image).
+				static std::atomic<int64_t> last_reused_once {Common::OnceUnset};
+				if (static_cast<bool>(Common::Once(last_reused_once, [] {
+					    const auto* value = std::getenv("KYTY_UPLOAD_LAST_REUSED");
+					    return value != nullptr && std::strcmp(value, "1") == 0;
+				    }))) {
+					return reused(last.allocation);
+				}
 				return last.allocation;
 			}
 			const auto allocation = NativeUpload(m_context, data);

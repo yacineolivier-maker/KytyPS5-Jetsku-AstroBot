@@ -28,6 +28,13 @@
 // Also every 10 s: "Kyty cadence 10 s : ..." (frame-time histogram), and for each frame of the
 // main thread longer than KYTY_MAIN_CPU_SPIKE_MS (default 45): "Kyty pic : image N ms ; ..." with
 // that frame's categories and top functions (game, guest module, Windows export), 40 per 10 s at most.
+// Also every 10 s (17/11): "Kyty libc top 10 (...) : total T ; libc.prx!NID a / b (p %) ; ..." :
+// the samples of every sampled thread inside a guest module other than the eboot (libc.prx,
+// libSceNpCppWebApi.prx; libSceLibcInternal is HLE in Kyty, its time is "emulateur"), by the
+// nearest exported function at or below the address (module dynamic symbol table, through
+// RuntimeLinker::FindProgramByAddr). a = ms/image over all sampled threads, b = of which the main
+// thread. Names are NIDs (resolve offline); "(apres)" marks an address past the export's st_size
+// (an internal function after it); "hors module connu": guest-range samples no module claims.
 //
 // KYTY_MAIN_THREAD_CORE=<logical processor>: the guest main thread runs on that logical processor
 // only, and every processor of the same physical core (its SMT siblings, read with

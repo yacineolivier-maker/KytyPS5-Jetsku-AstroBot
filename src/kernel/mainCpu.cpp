@@ -1,6 +1,10 @@
 #include "kernel/mainCpu.h"
 
 #include "common/common.h"
+#include "common/cpuPlacement.h"
+#include "common/singleton.h"
+#include "loader/elf.h"
+#include "loader/runtimeLinker.h"
 #include "graphics/presentation/fluidityLog.h"
 
 #include <algorithm>
@@ -93,6 +97,7 @@ struct Thread {
 	std::unordered_map<uint64_t, uint64_t> game_rips;
 	std::unordered_map<uint64_t, uint64_t> emu_offsets;
 	std::unordered_map<uint64_t, uint64_t> win_rips;
+	std::unordered_map<uint64_t, uint64_t> guest_rips; // guest modules (libc.prx...) and unclassified rips
 	// Main thread, samples inside a sleep (NtDelayExecution / NtYieldExecution) or a blocking wait:
 	// key = first kyty_emulator.exe return address on the stack (offset) << 32 | first eboot one (va).
 	std::unordered_map<uint64_t, uint64_t> sleep_callers;
@@ -287,6 +292,83 @@ uint64_t FunctionStart(uint64_t rip) {
 	return result;
 }
 
+// Guest modules (libc.prx, ...): the exported functions of each loaded module, from its dynamic
+// symbol table (names are NIDs, "NID#library#module" without the ids; resolve them offline with a
+// NID database). An address goes to the nearest exported function at or below it (internal
+// functions show as the export before them).
+struct GuestExport {
+	uint64_t    vaddr = 0;
+	uint64_t    size  = 0;
+	std::string name;
+};
+struct GuestModuleTable {
+	std::string              module;
+	uint64_t                 base = 0;
+	uint64_t                 end  = 0;
+	std::vector<GuestExport> exports; // sorted by vaddr
+};
+std::vector<GuestModuleTable> g_guest_modules; // sampler thread only
+
+const GuestModuleTable* GuestModuleOf(uint64_t rip) {
+	for (const auto& table: g_guest_modules) {
+		if (rip >= table.base && rip < table.end) {
+			return &table;
+		}
+	}
+	auto* linker  = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto* program = linker->FindProgramByAddr(rip);
+	if (program == nullptr || program->dynamic_info == nullptr || program->base_vaddr == EbootBase) {
+		return nullptr;
+	}
+	GuestModuleTable table;
+	table.module = program->file_name.filename().string();
+	table.base   = program->base_vaddr;
+	table.end    = program->base_vaddr + std::max(program->base_size_aligned, program->base_size);
+	const auto* info = program->dynamic_info.get();
+	if (info->symbol_table != nullptr && info->str_table != nullptr && info->symbol_table_entry_size != 0) {
+		const auto* bytes = reinterpret_cast<const uint8_t*>(info->symbol_table);
+		for (uint64_t offset = 0; offset + sizeof(Loader::Elf64_Sym) <= info->symbol_table_total_size;
+		     offset += info->symbol_table_entry_size) {
+			const auto* sym = reinterpret_cast<const Loader::Elf64_Sym*>(bytes + offset);
+			if (sym->st_value == 0 || sym->GetType() != Loader::STT_FUNC || sym->st_name >= info->str_table_size) {
+				continue;
+			}
+			std::string name = info->str_table + sym->st_name;
+			if (const auto hash = name.find('#'); hash != std::string::npos) {
+				name.resize(hash); // the NID; the library and module ids follow
+			}
+			table.exports.push_back({program->base_vaddr + sym->st_value, sym->st_size, name});
+		}
+	}
+	std::sort(table.exports.begin(), table.exports.end(),
+	          [](const GuestExport& a, const GuestExport& b) { return a.vaddr < b.vaddr; });
+	if (rip < table.base || rip >= table.end) {
+		// FindProgramByAddr also covers segments past base_size: keep at least this address.
+		table.base = std::min(table.base, rip);
+		table.end  = std::max(table.end, rip + 1);
+	}
+	g_guest_modules.push_back(std::move(table));
+	return &g_guest_modules.back();
+}
+
+// "libc.prx!NID" for the function holding `rip` ("libc.prx+0xN" before the first export); empty
+// outside the guest modules (and in the eboot).
+std::string GuestFunction(uint64_t rip) {
+	const auto* table = GuestModuleOf(rip);
+	if (table == nullptr) {
+		return {};
+	}
+	const auto it = std::upper_bound(table->exports.begin(), table->exports.end(), rip,
+	                                 [](uint64_t value, const GuestExport& e) { return value < e.vaddr; });
+	if (it == table->exports.begin()) {
+		char text[160];
+		std::snprintf(text, sizeof(text), "%s+0x%" PRIx64, table->module.c_str(), rip - table->base);
+		return text;
+	}
+	const auto& e = *(it - 1);
+	return table->module + "!" + e.name + (e.size != 0 && rip >= e.vaddr + e.size ? " (apres)" : "");
+}
+
 uint64_t CpuTime(HANDLE handle) {
 	FILETIME creation {}, exit {}, kernel {}, user {};
 	if (GetThreadTimes(handle, &creation, &exit, &kernel, &user) == 0) {
@@ -414,6 +496,51 @@ void Report(uint64_t window_ns) {
 			top += part;
 		}
 		std::printf("%s\n", top.c_str());
+	}
+	// Guest modules (libc.prx, ...) by exported function, every sampled thread together.
+	{
+		std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> by_function; // all, main thread
+		uint64_t                                                     total = 0, unresolved = 0;
+		for (auto* thread: g_threads) {
+			for (const auto& [rip, ns]: thread->guest_rips) {
+				auto name = GuestFunction(rip);
+				if (name.empty()) {
+					if (rip >= EbootEnd && rip < GuestEnd) {
+						unresolved += ns;
+					}
+					continue;
+				}
+				auto& entry = by_function[name];
+				entry.first += ns;
+				entry.second += thread->main ? ns : 0;
+				total += ns;
+			}
+			thread->guest_rips.clear();
+		}
+		if (total != 0 || unresolved != 0) {
+			std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> sorted(by_function.begin(),
+			                                                                         by_function.end());
+			std::sort(sorted.begin(), sorted.end(),
+			          [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+			char part[320];
+			std::snprintf(part, sizeof(part),
+			              "Kyty libc top 10 (modules invites, fils echantillonnes ; ms/image tous / dont fil principal) : "
+			              "total %.2f ;",
+			              ms(total));
+			std::string text = part;
+			for (size_t i = 0; i < sorted.size() && i < 10; i++) {
+				std::snprintf(part, sizeof(part), " %s %.2f / %.2f (%.0f %%) ;", sorted[i].first.c_str(),
+				              ms(sorted[i].second.first), ms(sorted[i].second.second),
+				              100.0 * static_cast<double>(sorted[i].second.first) /
+				                  static_cast<double>(std::max<uint64_t>(total, 1)));
+				text += part;
+			}
+			if (unresolved != 0) {
+				std::snprintf(part, sizeof(part), " hors module connu %.2f ;", ms(unresolved));
+				text += part;
+			}
+			std::printf("%s (%zu fonctions)\n", text.c_str(), sorted.size());
+		}
 	}
 	for (auto* thread: g_threads) {
 		if (thread->total == 0) {
@@ -618,6 +745,8 @@ void SamplerRun() {
 				thread->emu_offsets[emu_offset & ~uint64_t {0xf}] += weight;
 			} else if (cat == WindowsOther || cat == OtherModule || cat == KernelWait) {
 				thread->win_rips[context.Rip] += weight;
+			} else if (cat == GuestModule || cat == Unknown) {
+				thread->guest_rips[context.Rip] += weight;
 			}
 			if (caller_kind == 1) {
 				thread->sleep_callers[caller_key] += weight;
@@ -828,6 +957,8 @@ void OnMainThreadStart() {
 	}
 	PinMainThread();
 	SetMainPriority();
+	// KYTY_IDEAL_LAYOUT, KYTY_THREAD_LAYOUT_LOG (common/cpuPlacement.h).
+	Common::ThreadLayoutRegister("MainThread", Common::ThreadLayoutRole::Main);
 	if (g_sampler_enabled) {
 		Register("MainThread", true);
 		bool expected = false;

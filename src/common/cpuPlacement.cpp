@@ -22,6 +22,7 @@
 #include <windows.h>
 // After windows.h.
 #include <tlhelp32.h>
+#include <intrin.h> // __rdtsc (KYTY_THREAD_LAYOUT_LOG)
 #endif
 
 namespace Common {
@@ -1256,6 +1257,616 @@ AffinityScan ScanThreadAffinities(bool repin) {
 	return scan;
 }
 
+// ---- Heavy-thread layout: KYTY_THREAD_LAYOUT_LOG and KYTY_IDEAL_LAYOUT (cpuPlacement.h) ---------
+
+IdealLayout ComputeIdealLayout(const std::vector<CpuSetInfo>& sets) {
+	IdealLayout out;
+	struct Core {
+		uint32_t                       index       = 0;
+		uint8_t                        sched       = 0;
+		bool                           has_lp0     = false;
+		bool                           all_allowed = true;
+		std::vector<const CpuSetInfo*> logical;
+	};
+	std::map<uint32_t, Core> by_index;
+	for (const auto& set: sets) {
+		if (set.group != 0 || set.logical >= 64) {
+			continue;
+		}
+		auto& core = by_index[set.core];
+		core.index = set.core;
+		if (!set.allowed) {
+			core.all_allowed = false;
+			continue;
+		}
+		core.logical.push_back(&set);
+		core.sched   = std::max(core.sched, set.scheduling_class);
+		core.has_lp0 = core.has_lp0 || set.logical == 0;
+	}
+	std::vector<Core> cores;
+	for (auto& [index, core]: by_index) {
+		if (!core.logical.empty()) {
+			std::sort(core.logical.begin(), core.logical.end(),
+			          [](const CpuSetInfo* a, const CpuSetInfo* b) { return a->logical < b->logical; });
+			cores.push_back(core);
+		}
+	}
+	std::stable_sort(cores.begin(), cores.end(), [](const Core& a, const Core& b) {
+		if (a.all_allowed != b.all_allowed) {
+			return a.all_allowed;
+		}
+		if (a.has_lp0 != b.has_lp0) {
+			return !a.has_lp0;
+		}
+		if (a.sched != b.sched) {
+			return a.sched > b.sched;
+		}
+		return a.index < b.index;
+	});
+	const size_t heavy = std::min(IdealLayout::Heavy, cores.size());
+	static const char* const names[IdealLayout::Heavy] = {"principal", "gpu", "sequenceur",
+	                                                      "enregistreur"};
+	std::string text = "coeurs lourds :";
+	for (size_t i = 0; i < heavy; i++) {
+		out.heavy_logical[i] = cores[i].logical.front()->logical;
+		out.heavy_core[i]    = static_cast<int>(cores[i].index);
+		std::string lps;
+		for (const auto* set: cores[i].logical) {
+			out.heavy_ids[i].push_back(set->id);
+			lps += (lps.empty() ? "" : ",") + std::to_string(set->logical);
+		}
+		text += " " + std::string(names[i]) + "=coeur " + std::to_string(cores[i].index) + " (" +
+		        lps + ")";
+	}
+	// The remaining cores, one logical processor per core per round, then the heavy cores' SMT
+	// siblings (the recorder's first, the main thread's last).
+	size_t rounds = 0;
+	for (size_t i = heavy; i < cores.size(); i++) {
+		rounds = std::max(rounds, cores[i].logical.size());
+	}
+	for (size_t round = 0; round < rounds; round++) {
+		for (size_t i = heavy; i < cores.size(); i++) {
+			if (round < cores[i].logical.size()) {
+				out.others.push_back(cores[i].logical[round]->logical);
+			}
+		}
+	}
+	for (size_t i = heavy; i-- > 0;) {
+		for (size_t k = 1; k < cores[i].logical.size(); k++) {
+			out.others.push_back(cores[i].logical[k]->logical);
+		}
+	}
+	text += " ; autres fils, dans l'ordre :";
+	for (auto logical: out.others) {
+		text += " " + std::to_string(logical);
+	}
+	if (cores.empty()) {
+		text = "aucun processeur autorise";
+	}
+	out.description = text;
+	return out;
+}
+
+bool ParseLogicalList(const char* text, std::vector<uint32_t>* out) {
+	if (text == nullptr || *text == '\0' || out == nullptr) {
+		return false;
+	}
+	out->clear();
+	const char* p = text;
+	while (*p != '\0') {
+		if (*p < '0' || *p > '9') {
+			return false;
+		}
+		uint32_t value = 0;
+		while (*p >= '0' && *p <= '9') {
+			value = value * 10u + static_cast<uint32_t>(*p - '0');
+			if (value > 63) {
+				return false;
+			}
+			p++;
+		}
+		out->push_back(value);
+		if (*p == ',') {
+			p++;
+			if (*p == '\0') {
+				return false;
+			}
+		} else if (*p != '\0') {
+			return false;
+		}
+	}
+	return !out->empty();
+}
+
+namespace {
+
+enum class LayoutMode : uint8_t { Off, Ideal, CpuSet, Explicit };
+
+struct LayoutConfig {
+	bool                  log  = false;
+	LayoutMode            mode = LayoutMode::Off;
+	std::vector<uint32_t> list; // Explicit
+	std::string           text; // the KYTY_IDEAL_LAYOUT value
+	bool                  valid = true;
+};
+
+const LayoutConfig& GetLayoutConfig() {
+	static const LayoutConfig config = [] {
+		LayoutConfig c;
+		const auto*  log = EnvValue("KYTY_THREAD_LAYOUT_LOG");
+		c.log            = log != nullptr && std::strcmp(log, "0") != 0;
+		const auto* value = EnvValue("KYTY_IDEAL_LAYOUT");
+		if (value != nullptr) {
+			c.text = value;
+			if (std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0) {
+				c.mode = LayoutMode::Off;
+			} else if (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0 ||
+			           std::strcmp(value, "ideal") == 0) {
+				c.mode = LayoutMode::Ideal;
+			} else if (std::strcmp(value, "cpuset") == 0) {
+				c.mode = LayoutMode::CpuSet;
+			} else if (ParseLogicalList(value, &c.list)) {
+				c.mode = LayoutMode::Explicit;
+			} else {
+				c.valid = false;
+			}
+		}
+		return c;
+	}();
+	return config;
+}
+
+const char* LayoutModeName(LayoutMode mode) {
+	switch (mode) {
+		case LayoutMode::Ideal: return "ideal";
+		case LayoutMode::CpuSet: return "cpuset";
+		case LayoutMode::Explicit: return "explicite";
+		default: return "non";
+	}
+}
+
+const char* LayoutRoleName(ThreadLayoutRole role) {
+	switch (role) {
+		case ThreadLayoutRole::Main: return "principal";
+		case ThreadLayoutRole::Gpu: return "gpu";
+		case ThreadLayoutRole::Sequencer: return "sequenceur";
+		case ThreadLayoutRole::Recorder: return "enregistreur";
+		case ThreadLayoutRole::DrawPrep: return "drawprep";
+		default: return "autre";
+	}
+}
+
+#if defined(_WIN32)
+
+constexpr size_t LayoutSlotCount = 48;
+
+struct LayoutSlot {
+	std::atomic<uint32_t> state {0}; // 0 free, 1 being filled, 2 live
+	std::atomic<uint32_t> generation {0};
+	char                  name[48] {};
+	ThreadLayoutRole      role     = ThreadLayoutRole::Other;
+	HANDLE                handle   = nullptr;
+	int                   imposed  = -1; // the ideal logical processor KYTY_IDEAL_LAYOUT set
+	std::atomic<uint32_t> processor {UINT32_MAX};
+	std::atomic<uint64_t> note_ms {0};
+	std::atomic<uint32_t> notes {0};
+};
+
+std::array<LayoutSlot, LayoutSlotCount>& LayoutSlots() {
+	static auto* slots = new std::array<LayoutSlot, LayoutSlotCount>; // never destroyed
+	return *slots;
+}
+
+thread_local LayoutSlot* t_layout_slot = nullptr;
+
+inline void LayoutNote() {
+	if (auto* slot = t_layout_slot; slot != nullptr) {
+		slot->processor.store(CurrentLogicalProcessor(), std::memory_order_relaxed);
+		slot->note_ms.store(GetTickCount64(), std::memory_order_relaxed);
+		slot->notes.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+// Assignment state (KYTY_IDEAL_LAYOUT), under its mutex.
+struct LayoutAssign {
+	std::mutex              mutex;
+	bool                    ready   = false;
+	bool                    blocked = false; // another placement manages the CPU sets
+	IdealLayout             layout;
+	std::vector<CpuSetInfo> sets;
+	size_t                  next_other = 0;
+};
+
+LayoutAssign& GetLayoutAssign() {
+	static auto* assign = new LayoutAssign;
+	return *assign;
+}
+
+int CoreOfLogicalIn(const std::vector<CpuSetInfo>& sets, uint32_t logical) {
+	for (const auto& set: sets) {
+		if (set.group == 0 && set.logical == logical) {
+			return set.core;
+		}
+	}
+	return -1;
+}
+
+void PrepareLayoutLocked(LayoutAssign& assign, const LayoutConfig& config) {
+	if (assign.ready) {
+		return;
+	}
+	assign.ready = true;
+	InitCpuPlacement();
+	uint64_t affinity = 0;
+	{
+		auto&           state = GetState();
+		std::lock_guard lock(state.mutex);
+		assign.sets    = ReadCpuSets(affinity, state.external);
+		assign.blocked = state.vcache_applied;
+	}
+	std::string why;
+	if (GetCpuReserveMode() != CpuReserveMode::Off) {
+		why = "KYTY_CPU_RESERVE";
+	} else if (CpuSetsMask() != 0) {
+		why = "KYTY_CPU_SETS";
+	} else if (EnvValue("KYTY_MAIN_THREAD_CORE") != nullptr) {
+		why = "KYTY_MAIN_THREAD_CORE";
+	} else if (assign.blocked) {
+		why = "placement V-cache";
+	}
+	assign.blocked = !why.empty();
+	assign.layout  = ComputeIdealLayout(assign.sets);
+	if (config.mode == LayoutMode::Explicit) {
+		for (size_t i = 0; i < IdealLayout::Heavy; i++) {
+			const bool has          = i < config.list.size();
+			assign.layout.heavy_logical[i] = has ? static_cast<int>(config.list[i]) : -1;
+			assign.layout.heavy_core[i] =
+			    has ? CoreOfLogicalIn(assign.sets, config.list[i]) : -1;
+		}
+		assign.layout.others.assign(
+		    config.list.begin() + static_cast<std::ptrdiff_t>(std::min(config.list.size(), IdealLayout::Heavy)),
+		    config.list.end());
+		std::string text = "liste explicite :";
+		for (auto v: config.list) {
+			text += " " + std::to_string(v);
+		}
+		assign.layout.description = text;
+	}
+	if (config.mode != LayoutMode::Off) {
+		std::printf("Kyty placement disposition : KYTY_IDEAL_LAYOUT=%s (%s) ; %s%s%s\n",
+		            config.text.c_str(), LayoutModeName(config.mode),
+		            assign.layout.description.c_str(), assign.blocked ? " ; IGNORE : " : "",
+		            assign.blocked ? (why + " gere deja les ensembles de processeurs").c_str() : "");
+	} else if (!config.valid) {
+		std::printf("Kyty placement disposition : KYTY_IDEAL_LAYOUT=%s non reconnu (1, cpuset ou "
+		            "liste de processeurs) : ignore\n",
+		            config.text.c_str());
+	}
+	std::fflush(stdout);
+}
+
+// KYTY_IDEAL_LAYOUT for the calling thread; returns the ideal logical processor set (or -1).
+int ApplyLayoutToCurrentThread(ThreadLayoutRole role, const char* name) {
+	const auto& config = GetLayoutConfig();
+	if (config.mode == LayoutMode::Off && config.valid) {
+		return -1;
+	}
+	auto&           assign = GetLayoutAssign();
+	std::lock_guard lock(assign.mutex);
+	PrepareLayoutLocked(assign, config);
+	if (config.mode == LayoutMode::Off || assign.blocked) {
+		return -1;
+	}
+	const auto heavy_index = static_cast<size_t>(role);
+	int        logical     = -1;
+	bool       cpuset_ok   = false;
+	std::string sets_text;
+	if (heavy_index < IdealLayout::Heavy) {
+		logical = assign.layout.heavy_logical[heavy_index];
+		if (config.mode == LayoutMode::CpuSet && !assign.layout.heavy_ids[heavy_index].empty()) {
+			const auto& ids = assign.layout.heavy_ids[heavy_index];
+			std::vector<ULONG> list(ids.begin(), ids.end());
+			cpuset_ok = SetThreadSelectedCpuSets(GetCurrentThread(), list.data(),
+			                                     static_cast<ULONG>(list.size())) != 0;
+			sets_text = cpuset_ok ? " ; ensemble = coeur " +
+			                            std::to_string(assign.layout.heavy_core[heavy_index])
+			                      : " ; ensemble : ECHEC";
+		}
+	} else if (!assign.layout.others.empty()) {
+		logical = static_cast<int>(
+		    assign.layout.others[assign.next_other++ % assign.layout.others.size()]);
+	}
+	bool ideal_ok = false;
+	if (logical >= 0) {
+		PROCESSOR_NUMBER number {};
+		number.Group  = 0;
+		number.Number = static_cast<BYTE>(logical);
+		ideal_ok      = SetThreadIdealProcessorEx(GetCurrentThread(), &number, nullptr) != 0;
+	}
+	std::printf("Kyty placement : %s (%s) -> processeur ideal %d (coeur %d) %s%s\n", name,
+	            LayoutRoleName(role), logical, logical >= 0 ? CoreOfLogicalIn(assign.sets, static_cast<uint32_t>(logical)) : -1,
+	            logical < 0 ? "non fixe" : ideal_ok ? "applique" : "ECHEC", sets_text.c_str());
+	std::fflush(stdout);
+	return ideal_ok ? logical : -1;
+}
+
+uint32_t IdealOf(HANDLE handle) {
+	PROCESSOR_NUMBER number {};
+	if (GetThreadIdealProcessorEx(handle, &number) == 0) {
+		return UINT32_MAX;
+	}
+	return static_cast<uint32_t>(number.Group) * 64u + number.Number;
+}
+
+std::string LogicalText(uint32_t logical) {
+	return logical == UINT32_MAX ? std::string("?") : std::to_string(logical);
+}
+
+std::string CoreText(uint32_t logical) {
+	if (logical == UINT32_MAX) {
+		return "?";
+	}
+	const auto core = CoreOfLogicalProcessor(logical);
+	return core == UINT32_MAX ? std::string("?") : std::to_string(core);
+}
+
+// The KYTY_THREAD_LAYOUT_LOG thread: 5 ms ticks, a report every 10 s.
+void LayoutLoggerRun() {
+	Profiler::SetThreadName("Thread layout log");
+	SetThreadDescription(GetCurrentThread(), L"emu:placement des fils");
+	PlaceCurrentThreadCold();
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+	// QueryThreadCycleTime counts TSC ticks: its rate, measured once.
+	double tsc_hz = 0.0;
+	{
+		const auto     t0 = std::chrono::steady_clock::now();
+		const uint64_t c0 = __rdtsc();
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		const uint64_t c1 = __rdtsc();
+		const auto     t1 = std::chrono::steady_clock::now();
+		tsc_hz = static_cast<double>(c1 - c0) / std::chrono::duration<double>(t1 - t0).count();
+	}
+	HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */,
+	                                      TIMER_ALL_ACCESS);
+	auto&  slots = LayoutSlots();
+	struct Stats {
+		uint32_t generation = UINT32_MAX;
+		uint64_t last_cycles = 0;
+		uint64_t cycles      = 0;
+		uint32_t busy        = 0;
+		uint32_t sibling     = 0; // busy, with another busy heavy thread on its SMT sibling
+		uint32_t same        = 0; // busy, with another busy heavy thread on its logical processor
+		uint32_t known       = 0; // busy with a known processor
+	};
+	std::array<Stats, LayoutSlotCount>                                stats {};
+	std::array<std::array<uint32_t, LayoutSlotCount>, LayoutSlotCount> pairs {};
+	uint32_t ticks       = 0;
+	auto     last_tick   = std::chrono::steady_clock::now();
+	auto     last_report = last_tick;
+	for (;;) {
+		if (timer != nullptr) {
+			LARGE_INTEGER due {};
+			due.QuadPart = -50'000; // 5 ms
+			SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0);
+			WaitForSingleObject(timer, INFINITE);
+		} else {
+			Sleep(5);
+		}
+		const auto   now    = std::chrono::steady_clock::now();
+		const double dt     = std::chrono::duration<double>(now - last_tick).count();
+		last_tick           = now;
+		const auto   now_ms = GetTickCount64();
+		std::array<uint32_t, LayoutSlotCount> cpu {};
+		std::array<bool, LayoutSlotCount>     busy {};
+		for (size_t i = 0; i < LayoutSlotCount; i++) {
+			auto& slot = slots[i];
+			busy[i]    = false;
+			cpu[i]     = UINT32_MAX;
+			if (slot.state.load(std::memory_order_acquire) != 2) {
+				continue;
+			}
+			auto&      s   = stats[i];
+			const auto gen = slot.generation.load(std::memory_order_relaxed);
+			ULONG64    c   = 0;
+			(void)QueryThreadCycleTime(slot.handle, &c);
+			if (s.generation != gen) {
+				s             = Stats {};
+				s.generation  = gen;
+				s.last_cycles = c;
+				for (auto& row: pairs) {
+					row[i] = 0;
+				}
+				pairs[i].fill(0);
+				continue;
+			}
+			const uint64_t delta = c - std::min<uint64_t>(c, s.last_cycles);
+			s.last_cycles        = c;
+			s.cycles += delta;
+			busy[i] = static_cast<double>(delta) >= 0.5 * tsc_hz * dt;
+			if (now_ms - std::min(now_ms, slot.note_ms.load(std::memory_order_relaxed)) <= 50) {
+				cpu[i] = slot.processor.load(std::memory_order_relaxed);
+			}
+			if (busy[i]) {
+				s.busy++;
+				if (cpu[i] != UINT32_MAX) {
+					s.known++;
+				}
+			}
+		}
+		ticks++;
+		for (size_t i = 0; i < LayoutSlotCount; i++) {
+			if (!busy[i] || cpu[i] == UINT32_MAX) {
+				continue;
+			}
+			bool sib = false, same = false;
+			for (size_t j = 0; j < LayoutSlotCount; j++) {
+				if (j == i || !busy[j] || cpu[j] == UINT32_MAX) {
+					continue;
+				}
+				if (cpu[j] == cpu[i]) {
+					same = true;
+				} else if (CoreOfLogicalProcessor(cpu[i]) != UINT32_MAX &&
+				           CoreOfLogicalProcessor(cpu[i]) == CoreOfLogicalProcessor(cpu[j])) {
+					sib = true;
+					if (j > i) {
+						pairs[i][j]++;
+					}
+				}
+			}
+			stats[i].sibling += sib ? 1u : 0u;
+			stats[i].same += same ? 1u : 0u;
+		}
+		if (now - last_report < std::chrono::seconds(10)) {
+			continue;
+		}
+		const double window = std::chrono::duration<double>(now - last_report).count();
+		last_report         = now;
+		const auto&  config = GetLayoutConfig();
+		uint32_t     live   = 0;
+		for (auto& slot: slots) {
+			live += slot.state.load(std::memory_order_acquire) == 2 ? 1u : 0u;
+		}
+		std::printf("Kyty placement fils 10 s : mode=%s ; fils=%u ; tsc=%.2f GHz ; ticks=%u\n",
+		            LayoutModeName(config.mode), live, tsc_hz / 1e9, ticks);
+		std::array<uint32_t, LayoutSlotCount> ideal {};
+		for (size_t i = 0; i < LayoutSlotCount; i++) {
+			auto& slot = slots[i];
+			ideal[i]   = UINT32_MAX;
+			if (slot.state.load(std::memory_order_acquire) != 2) {
+				continue;
+			}
+			auto&       s        = stats[i];
+			ideal[i]             = IdealOf(slot.handle);
+			const auto  last     = slot.processor.load(std::memory_order_relaxed);
+			const auto  note     = slot.note_ms.load(std::memory_order_relaxed);
+			const auto  pct      = [&](uint32_t n, uint32_t of) {
+                return of != 0 ? 100.0 * static_cast<double>(n) / static_cast<double>(of) : 0.0;
+			};
+			std::printf("Kyty placement fil : nom=%s ; role=%s ; ideal=%s ; coeur_ideal=%s ; "
+			            "impose=%d ; dernier=%s ; coeur=%s ; age_ms=%s ; cpu=%.1f%% ; occupe=%.1f%% ; "
+			            "frere_smt_occupe=%.1f%% ; meme_logique=%.1f%% ; notes=%u\n",
+			            slot.name, LayoutRoleName(slot.role), LogicalText(ideal[i]).c_str(),
+			            CoreText(ideal[i]).c_str(), slot.imposed, LogicalText(last).c_str(),
+			            CoreText(last).c_str(),
+			            note != 0 ? std::to_string(now_ms - std::min(now_ms, note)).c_str() : "?",
+			            tsc_hz > 0.0 ? 100.0 * static_cast<double>(s.cycles) / (tsc_hz * window) : 0.0,
+			            pct(s.busy, ticks), pct(s.sibling, s.known), pct(s.same, s.known),
+			            slot.notes.exchange(0, std::memory_order_relaxed));
+		}
+		// Pairs: current collisions (share of ticks), then ideal collisions.
+		std::vector<std::pair<uint32_t, std::pair<size_t, size_t>>> list;
+		for (size_t i = 0; i < LayoutSlotCount; i++) {
+			for (size_t j = i + 1; j < LayoutSlotCount; j++) {
+				if (pairs[i][j] != 0) {
+					list.push_back({pairs[i][j], {i, j}});
+				}
+			}
+		}
+		std::sort(list.rbegin(), list.rend());
+		std::string text = "Kyty placement collisions 10 s : courantes :";
+		char        part[160];
+		for (size_t k = 0; k < list.size() && k < 10; k++) {
+			std::snprintf(part, sizeof(part), " %s+%s %.1f%% ;", slots[list[k].second.first].name,
+			              slots[list[k].second.second].name,
+			              100.0 * static_cast<double>(list[k].first) / static_cast<double>(std::max(ticks, 1u)));
+			text += part;
+		}
+		text += " | ideales :";
+		for (size_t i = 0; i < LayoutSlotCount; i++) {
+			for (size_t j = i + 1; j < LayoutSlotCount; j++) {
+				if (ideal[i] == UINT32_MAX || ideal[j] == UINT32_MAX) {
+					continue;
+				}
+				const auto ci = CoreOfLogicalProcessor(ideal[i]);
+				if (ideal[i] == ideal[j] || (ci != UINT32_MAX && ci == CoreOfLogicalProcessor(ideal[j]))) {
+					std::snprintf(part, sizeof(part), " %s+%s (%s) ;", slots[i].name, slots[j].name,
+					              ideal[i] == ideal[j] ? "meme" : "frere");
+					text += part;
+				}
+			}
+		}
+		std::printf("%s\n", text.c_str());
+		std::fflush(stdout);
+		// Reset the window; free the slots of threads that ended.
+		ticks = 0;
+		for (size_t i = 0; i < LayoutSlotCount; i++) {
+			auto& s   = stats[i];
+			s.cycles  = 0;
+			s.busy    = 0;
+			s.sibling = 0;
+			s.same    = 0;
+			s.known   = 0;
+			pairs[i].fill(0);
+			auto& slot = slots[i];
+			DWORD code = 0;
+			if (slot.state.load(std::memory_order_acquire) == 2 &&
+			    GetExitCodeThread(slot.handle, &code) != 0 && code != STILL_ACTIVE) {
+				CloseHandle(slot.handle);
+				slot.handle = nullptr;
+				slot.state.store(0, std::memory_order_release);
+			}
+		}
+	}
+}
+
+#endif
+
+} // namespace
+
+bool ThreadLayoutLogEnabled() {
+	return GetLayoutConfig().log;
+}
+
+void ThreadLayoutRegister(const char* name, ThreadLayoutRole role) {
+#if defined(_WIN32)
+	const auto& config = GetLayoutConfig();
+	if (!config.log && config.mode == LayoutMode::Off && config.valid) {
+		return;
+	}
+	const char* label   = name != nullptr ? name : "?";
+	const int   imposed = ApplyLayoutToCurrentThread(role, label);
+	if (!config.log || t_layout_slot != nullptr) {
+		return;
+	}
+	HANDLE handle = nullptr;
+	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+	                    THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION |
+	                        THREAD_SET_LIMITED_INFORMATION,
+	                    FALSE, 0) == 0) {
+		return;
+	}
+	for (auto& slot: LayoutSlots()) {
+		uint32_t expected = 0;
+		if (!slot.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+			continue;
+		}
+		std::snprintf(slot.name, sizeof(slot.name), "%s", label);
+		slot.role    = role;
+		slot.handle  = handle;
+		slot.imposed = imposed;
+		slot.processor.store(CurrentLogicalProcessor(), std::memory_order_relaxed);
+		slot.note_ms.store(GetTickCount64(), std::memory_order_relaxed);
+		slot.notes.store(0, std::memory_order_relaxed);
+		slot.generation.fetch_add(1, std::memory_order_relaxed);
+		slot.state.store(2, std::memory_order_release);
+		t_layout_slot = &slot;
+		static std::once_flag started;
+		std::call_once(started, [] { std::thread(LayoutLoggerRun).detach(); });
+		return;
+	}
+	CloseHandle(handle); // registry full
+#else
+	(void)name;
+	(void)role;
+#endif
+}
+
+void ThreadLayoutNoteCpu() {
+#if defined(_WIN32)
+	LayoutNote();
+#endif
+}
+
 bool PlacementSamplingEnabled() {
 	static const bool enabled = [] {
 		const auto* value = EnvValue("KYTY_CPU_PLACEMENT_SAMPLES");
@@ -1286,6 +1897,9 @@ uint32_t CoreOfLogicalProcessor(uint32_t logical) {
 }
 
 void SamplePlacement(ThreadRole role) {
+#if defined(_WIN32)
+	LayoutNote(); // KYTY_THREAD_LAYOUT_LOG: registered threads note where they run
+#endif
 	if (!PlacementSamplingEnabled()) {
 		return;
 	}

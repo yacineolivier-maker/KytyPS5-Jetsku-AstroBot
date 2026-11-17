@@ -571,7 +571,7 @@ uint64_t   g_both_since = 0;
 
 } // namespace
 
-Mode GetMode() {
+Mode GetModeSlow() {
 	static const Mode mode = [] {
 		const auto* value = std::getenv("KYTY_CP_PAR");
 		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
@@ -628,6 +628,8 @@ Mode GetMode() {
 		            value);
 		return Mode::Off;
 	}();
+	// Astro Bot PC (audit 17/11, lot C4): GetMode()'s cache (cpParallel.h).
+	g_mode_cache.store(static_cast<uint8_t>(static_cast<uint8_t>(mode) + 1u), std::memory_order_relaxed);
 	return mode;
 }
 
