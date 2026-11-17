@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cinttypes>
 #include <cstdlib>
 #include <climits>
@@ -29,6 +30,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -647,8 +649,22 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 //   <chemin sous /app0>  <balise>        max:<valeur>        plafond : le nombre qui suit la balise (jusqu'a '<')
 //                                                            est ramene a <valeur> s'il la depasse, ecrit sur la
 //                                                            meme largeur (ex. <DirShadowFar> max:20 : 35.0 -> 20.0)
+//   <chemin sous /app0>  <balise>        mul:<facteur>       le nombre qui suit la balise est multiplie
+//   <chemin sous /app0>  <ancre>         insert-after:<texte>   (Astro Bot PC 17/11) ajoute <texte> sur une
+//                                                            nouvelle ligne apres la ligne de la 1re occurrence de
+//                                                            <ancre> ; insert-before: la place avant cette ligne ;
+//                                                            add: comme insert-after:, mais seulement si la balise
+//                                                            ouvrante du texte (ex. <OverrideFarDistance>) est absente
+//                                                            du fichier. Dans <texte>, \n = fin de ligne (celle du
+//                                                            fichier), \t = tabulation, \\ = barre oblique inverse.
+//                                                            Taille constante : autant d'octets d'espacement sans effet
+//                                                            sur le XML sont retires au plus pres (indentation en debut
+//                                                            de ligne devant '<', puis '\r' des fins de ligne CRLF) ;
+//                                                            faute de place, rien n'est insere (message).
 // Un chemin finissant par '*' vaut pour tous les fichiers de ce dossier (ex. data/prein/spx/*).
 // Les occurrences a cheval sur deux lectures ne sont pas traitees (fichiers lus d'un bloc).
+// La taille servie ne change jamais : stat/fstat, lseek et la taille donnee par APR (libAmpr : les .spx/.lvx sont
+// lus par l'APR, chemins hote dans le journal) restent celles du fichier hote, sans rien modifier hors de ce fichier.
 struct App0Subst {
 	std::string path;
 	bool        wildcard = false;
@@ -658,7 +674,45 @@ struct App0Subst {
 	double      max    = 0.0;
 	bool        is_mul = false; // Astro Bot PC 13/11 : mul:<facteur>, le nombre est multiplie
 	double      mul    = 1.0;
+	// Astro Bot PC 17/11 : insert-after:/insert-before:/add:<texte> (from = ancre).
+	bool        is_insert        = false;
+	bool        insert_before    = false;
+	bool        insert_if_absent = false;
+	std::string insert_text; // echappements resolus ; '\n' = fin de ligne du fichier
+	std::string insert_tag;  // add: "<Nom" ; sa presence (suivie de '>', ' ', '/' ou tabulation) annule l'ajout
 };
+
+// \n -> fin de ligne, \t -> tabulation, \\ -> '\' ; le reste tel quel.
+static std::string App0SubstUnescape(const std::string& s) {
+	std::string out;
+	out.reserve(s.size());
+	for (size_t i = 0; i < s.size(); i++) {
+		if (s[i] == '\\' && i + 1 < s.size()) {
+			const char c = s[i + 1];
+			if (c == 'n' || c == 't' || c == '\\') {
+				out.push_back(c == 'n' ? '\n' : (c == 't' ? '\t' : '\\'));
+				i++;
+				continue;
+			}
+		}
+		out.push_back(s[i]);
+	}
+	return out;
+}
+
+// "<Nom" de la premiere balise ouvrante du texte, vide s'il n'y en a pas.
+static std::string App0SubstOpeningTag(const std::string& text) {
+	const auto lt = text.find('<');
+	if (lt == std::string::npos) {
+		return {};
+	}
+	size_t e = lt + 1;
+	while (e < text.size() && (std::isalnum(static_cast<unsigned char>(text[e])) != 0 || text[e] == '_' ||
+	                           text[e] == '-' || text[e] == '.' || text[e] == ':')) {
+		e++;
+	}
+	return e == lt + 1 ? std::string() : text.substr(lt, e - lt);
+}
 
 static const std::vector<App0Subst>& App0Substs() {
 	static const std::vector<App0Subst> rules = [] {
@@ -695,7 +749,26 @@ static const std::vector<App0Subst>& App0Substs() {
 				rule.wildcard = true;
 				rule.path.pop_back();
 			}
-			if (rule.to.rfind("max:", 0) == 0) {
+			const bool ins_after  = rule.to.rfind("insert-after:", 0) == 0;
+			const bool ins_before = rule.to.rfind("insert-before:", 0) == 0;
+			const bool ins_add    = rule.to.rfind("add:", 0) == 0;
+			if (ins_after || ins_before || ins_add) {
+				rule.is_insert        = true;
+				rule.insert_before    = ins_before;
+				rule.insert_if_absent = ins_add;
+				rule.insert_text      = App0SubstUnescape(rule.to.substr(rule.to.find(':') + 1));
+				if (rule.insert_text.empty()) {
+					::printf("App0Subst: ligne ignoree (texte a inserer vide) : %s\n", s.c_str());
+					continue;
+				}
+				if (ins_add) {
+					rule.insert_tag = App0SubstOpeningTag(rule.insert_text);
+					if (rule.insert_tag.empty()) {
+						::printf("App0Subst: ligne ignoree (add: sans balise ouvrante) : %s\n", s.c_str());
+						continue;
+					}
+				}
+			} else if (rule.to.rfind("max:", 0) == 0) {
 				rule.is_max = true;
 				rule.max    = std::strtod(rule.to.c_str() + 4, nullptr);
 			} else if (rule.to.rfind("mul:", 0) == 0) {
@@ -761,6 +834,124 @@ static bool App0SubstClamp(char* p, size_t width, double max, double mul = 0.0) 
 	return false;
 }
 
+enum class App0InsertResult { AnchorMissing, AlreadyPresent, NoRoom, Done };
+
+// Insertion a taille constante dans data[0..bytes) (voir l'en-tete des regles). *removed : octets d'espacement
+// retires pour compenser (= taille du texte insere). Rien n'est modifie si le resultat n'est pas Done.
+static App0InsertResult App0SubstInsert(char* data, size_t bytes, const App0Subst& rule, size_t* removed) {
+	*removed = 0;
+	const std::string_view sv(data, bytes);
+	const auto             anchor = sv.find(rule.from);
+	if (anchor == std::string_view::npos) {
+		return App0InsertResult::AnchorMissing;
+	}
+	if (rule.insert_if_absent) {
+		for (auto p = sv.find(rule.insert_tag); p != std::string_view::npos; p = sv.find(rule.insert_tag, p + 1)) {
+			const auto q = p + rule.insert_tag.size();
+			if (q < bytes && (data[q] == '>' || data[q] == ' ' || data[q] == '/' || data[q] == '\t')) {
+				return App0InsertResult::AlreadyPresent;
+			}
+		}
+	}
+	// Ligne de l'ancre et sa fin de ligne (celle du fichier si l'ancre est sur la derniere ligne).
+	const auto   nl_before  = anchor == 0 ? std::string_view::npos : sv.rfind('\n', anchor - 1);
+	const size_t line_start = nl_before == std::string_view::npos ? 0 : nl_before + 1;
+	const auto   line_end   = sv.find('\n', anchor);
+	const bool   crlf       = line_end != std::string_view::npos ? (line_end > anchor && data[line_end - 1] == '\r')
+	                                                             : sv.find("\r\n") != std::string_view::npos;
+	const std::string eol   = crlf ? "\r\n" : "\n";
+	std::string       ins;
+	size_t            pos = 0;
+	if (rule.insert_before) {
+		pos = line_start;
+	} else if (line_end != std::string_view::npos) {
+		pos = line_end + 1;
+	} else {
+		pos = bytes; // ancre sur la derniere ligne, sans fin de ligne : on en ouvre une
+		ins = eol;
+	}
+	for (const char c: rule.insert_text) {
+		if (c == '\n') {
+			ins += eol;
+		} else {
+			ins.push_back(c);
+		}
+	}
+	if (rule.insert_before || line_end != std::string_view::npos) {
+		ins += eol;
+	}
+	const size_t need = ins.size();
+	if (need >= bytes) {
+		return App0InsertResult::NoRoom;
+	}
+
+	// Octets retirables, au plus pres de pos : 1) indentation (espaces/tabulations entre un debut de ligne et '<'),
+	// apres pos puis avant ; 2) '\r' d'une fin de ligne CRLF, apres pos puis avant.
+	std::vector<size_t> rm;
+	rm.reserve(need);
+	auto indent_end = [&](size_t s) { // fin de l'indentation de la ligne commencant en s, s si elle n'en a pas
+		size_t k = s;
+		while (k < bytes && (data[k] == ' ' || data[k] == '\t')) {
+			k++;
+		}
+		return (k > s && k < bytes && data[k] == '<') ? k : s;
+	};
+	for (size_t s = pos; s < bytes && rm.size() < need;) { // pos est un debut de ligne
+		for (size_t i = s, k = indent_end(s); i < k && rm.size() < need; i++) {
+			rm.push_back(i);
+		}
+		const auto nl = sv.find('\n', s);
+		if (nl == std::string_view::npos) {
+			break;
+		}
+		s = nl + 1;
+	}
+	for (size_t e = pos; e > 0 && rm.size() < need;) { // e : debut de la derniere ligne vue
+		const auto   nl = e >= 2 ? sv.rfind('\n', e - 2) : std::string_view::npos;
+		const size_t s  = nl == std::string_view::npos ? 0 : nl + 1;
+		for (size_t i = s, k = indent_end(s); i < k && rm.size() < need; i++) {
+			rm.push_back(i);
+		}
+		e = s;
+	}
+	for (size_t i = pos; i + 1 < bytes && rm.size() < need; i++) {
+		if (data[i] == '\r' && data[i + 1] == '\n') {
+			rm.push_back(i);
+		}
+	}
+	for (size_t i = pos; i >= 2 && rm.size() < need; i--) {
+		if (data[i - 2] == '\r' && data[i - 1] == '\n') {
+			rm.push_back(i - 2);
+		}
+	}
+	if (rm.size() < need) {
+		return App0InsertResult::NoRoom;
+	}
+	std::sort(rm.begin(), rm.end());
+
+	std::string out;
+	out.reserve(bytes);
+	size_t from       = 0;
+	size_t r          = 0;
+	auto   copy_until = [&](size_t end) { // copie [from, end) sans les octets retires
+		while (r < rm.size() && rm[r] < end) {
+			out.append(data + from, rm[r] - from);
+			from = rm[r] + 1;
+			r++;
+		}
+		out.append(data + from, end - from);
+		from = end;
+	};
+	copy_until(pos);
+	out += ins;
+	copy_until(bytes);
+	if (out.size() != bytes) {
+		return App0InsertResult::NoRoom;
+	}
+	std::memcpy(data, out.data(), bytes);
+	*removed = rm.size();
+	return App0InsertResult::Done;
+}
 // Le chemin (invite /app0/... ou hote E:\...\data\...) doit finir par "/" + le chemin de la regle.
 void ApplyApp0Substs(const std::string& name, void* buf, uint64_t bytes) {
 	const auto& rules = App0Substs();
@@ -775,7 +966,32 @@ void ApplyApp0Substs(const std::string& name, void* buf, uint64_t bytes) {
 		if (!App0SubstPathMatches(rule, n)) {
 			continue;
 		}
-		uint32_t hits = 0;
+		if (rule.is_insert) {
+			size_t      removed = 0;
+			const auto  res     = App0SubstInsert(data, static_cast<size_t>(bytes), rule, &removed);
+			const char* what    = rule.insert_before ? "avant" : "apres";
+			switch (res) {
+				case App0InsertResult::Done:
+					::printf("App0Subst: %s : insertion %s \"%s\" de \"%s\" (%zu octet(s) d'espacement retire(s))\n",
+					         n.c_str(), what, rule.from.c_str(), rule.to.c_str(), removed);
+					break;
+				case App0InsertResult::NoRoom:
+					::printf("App0Subst: %s : insertion %s \"%s\" ABANDONNEE (pas assez d'espacement a retirer)\n",
+					         n.c_str(), what, rule.from.c_str());
+					break;
+				case App0InsertResult::AlreadyPresent:
+					if (!rule.wildcard) {
+						::printf("App0Subst: %s : %s deja present, rien ajoute\n", n.c_str(), rule.insert_tag.c_str());
+					}
+					break;
+				case App0InsertResult::AnchorMissing:
+					if (!rule.wildcard) {
+						::printf("App0Subst: %s : ancre \"%s\" absente, rien insere\n", n.c_str(), rule.from.c_str());
+					}
+					break;
+			}
+			continue;
+		}		uint32_t hits = 0;
 		for (char* p = data; p + rule.from.size() <= stop;) {
 			p = static_cast<char*>(std::memchr(p, rule.from[0], static_cast<size_t>(stop - p)));
 			if (p == nullptr || p + rule.from.size() > stop) {
