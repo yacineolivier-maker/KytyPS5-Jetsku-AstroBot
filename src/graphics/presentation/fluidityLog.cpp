@@ -625,6 +625,18 @@ void FluidityRecordFlip() noexcept {
 		s.tsc0          = Tsc();
 		s.raw           = ReadRaw();
 		s.box.reserve(BOX_BEFORE + BOX_MAX);
+		{ // reglages.txt: every KYTY_* setting of this session, to compare sessions place by place
+			std::string text;
+			if (char** env = _environ; env != nullptr) {
+				for (; *env != nullptr; ++env) {
+					if (std::strncmp(*env, "KYTY_", 5) == 0) {
+						text += *env;
+						text += "\r\n";
+					}
+				}
+			}
+			GetWriter().Push({SessionFile("reglages.txt"), std::vector<uint8_t>(text.begin(), text.end()), false, false});
+		}
 		AppendLine("journal.csv", JOURNAL_HEADER,
 		           "S;" + LocalTime("%H:%M:%S") + ";session;seuil " + Fixed(Config().threshold, 0) + " i/s, pic " +
 		               Fixed(Config().spike_ms, 0) + " ms;;;;;;;;;;;;;;;;" +
