@@ -12,6 +12,14 @@
 #include "libs/controller.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <thread>
+#include <vector>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -761,7 +769,214 @@ void HostInputDisconnectGamepad(int id) {
 	HostInputDisconnectGamepadTouchPad(id);
 }
 
+namespace {
+
+// Astro Bot PC (KYTY_PAD_FILE=<fichier>, off by default): internal pad driver for unattended tests. A thread
+// reads commands from the file and sets the host controller directly (Controller::SetAxis/SetButton), so the
+// character moves without window focus, SendInput or an unlocked Windows session. Commands, separated by ';'
+// or new lines: "maintenir <K>[+<K>...] <ms>" (hold), "touche <K>[+<K>...] [ms=120]" (press), "attendre <ms>",
+// "boucle" (what follows repeats until the file changes). Keys: W A S D (left stick), F H T G (right stick),
+// J=Cross K=Square I=Triangle L=Circle Q=L1 E=R1 Z=L2 C=R2 ENTREE=Options. The file is re-read when it
+// changes (a new script replaces the current one at once); an empty or missing file releases everything.
+class PadScript {
+public:
+	void Start() {
+		const char* path = std::getenv("KYTY_PAD_FILE");
+		if (path == nullptr || *path == '\0' || m_thread.joinable()) {
+			return;
+		}
+		m_path = path;
+		m_stop = false;
+		m_thread = std::thread([this] { Run(); });
+		std::printf("Kyty pilote interne : commandes lues dans %s (KYTY_PAD_FILE)\n", m_path.c_str());
+		std::fflush(stdout);
+	}
+	void Stop() {
+		if (m_thread.joinable()) {
+			m_stop = true;
+			m_thread.join();
+		}
+		ReleaseAll();
+	}
+
+private:
+	struct Step {
+		int      kind = 0; // 0 wait, 1 hold
+		uint32_t keys = 0; // bit per key index
+		uint32_t ms   = 0;
+	};
+
+	static constexpr const char* KEYS[] = {"W", "A", "S", "D", "F", "H", "T", "G", "J", "K", "I", "L",
+	                                       "Q", "E", "Z", "C", "ENTREE"};
+
+	static int KeyIndex(const std::string& k) {
+		for (int i = 0; i < static_cast<int>(std::size(KEYS)); i++) {
+			if (k == KEYS[i]) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	static void Apply(uint32_t keys) {
+		const auto on = [keys](int i) { return (keys >> i) & 1u; };
+		const auto axis = [](bool neg, bool pos) { return neg && !pos ? 0 : (pos && !neg ? 255 : 128); };
+		const int  id   = Controller::HOST_INPUT_CONTROLLER_ID;
+		Controller::SetAxis(id, Controller::Axis::LeftX, axis(on(1), on(3)));
+		Controller::SetAxis(id, Controller::Axis::LeftY, axis(on(0), on(2)));
+		Controller::SetAxis(id, Controller::Axis::RightX, axis(on(4), on(5)));
+		Controller::SetAxis(id, Controller::Axis::RightY, axis(on(6), on(7)));
+		static constexpr uint32_t BUTTONS[] = {Controller::PAD_BUTTON_CROSS,    Controller::PAD_BUTTON_SQUARE,
+		                                       Controller::PAD_BUTTON_TRIANGLE, Controller::PAD_BUTTON_CIRCLE,
+		                                       Controller::PAD_BUTTON_L1,       Controller::PAD_BUTTON_R1,
+		                                       Controller::PAD_BUTTON_L2,       Controller::PAD_BUTTON_R2,
+		                                       Controller::PAD_BUTTON_OPTIONS};
+		for (int b = 0; b < static_cast<int>(std::size(BUTTONS)); b++) {
+			Controller::SetButton(id, BUTTONS[b], on(8 + b) != 0);
+		}
+	}
+
+	void ReleaseAll() {
+		if (m_active) {
+			Apply(0);
+			m_active = false;
+		}
+	}
+
+	bool Changed() {
+		std::error_code ec;
+		const auto      t    = std::filesystem::last_write_time(m_path, ec);
+		const auto      size = ec ? uintmax_t {0} : std::filesystem::file_size(m_path, ec);
+		const auto      stamp = ec ? 0 : static_cast<int64_t>(t.time_since_epoch().count()) ^ static_cast<int64_t>(size);
+		if (stamp == m_stamp) {
+			return false;
+		}
+		m_stamp = stamp;
+		return true;
+	}
+
+	void Load() {
+		m_steps.clear();
+		m_loop = 0;
+		std::ifstream in(m_path, std::ios::binary);
+		std::string   text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+		for (auto& c : text) {
+			if (c == ';' || c == '\r' || c == '\n') {
+				c = '\n';
+			}
+		}
+		std::istringstream lines(text);
+		std::string        line;
+		while (std::getline(lines, line)) {
+			std::istringstream words(line);
+			std::string        verb, key;
+			words >> verb;
+			if (verb.empty()) {
+				continue;
+			}
+			std::transform(verb.begin(), verb.end(), verb.begin(), [](unsigned char c) { return std::tolower(c); });
+			if (verb == "boucle") {
+				m_loop = m_steps.size();
+				continue;
+			}
+			Step s;
+			uint32_t ms = 0;
+			if (verb == "attendre") {
+				words >> ms;
+				s.ms = ms;
+			} else if (verb == "maintenir" || verb == "touche") {
+				words >> key;
+				ms = verb == "touche" ? 120 : 0;
+				words >> ms;
+				std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::toupper(c); });
+				std::istringstream parts(key);
+				std::string        part;
+				while (std::getline(parts, part, '+')) {
+					const int i = KeyIndex(part);
+					if (i >= 0) {
+						s.keys |= 1u << i;
+					}
+				}
+				s.kind = 1;
+				s.ms   = ms;
+			} else {
+				continue;
+			}
+			m_steps.push_back(s);
+			if (s.kind == 1) {
+				m_steps.push_back(Step {0, 0, 30}); // short release between holds
+			}
+		}
+		std::printf("Kyty pilote interne : %zu etapes, boucle a partir de %zu\n", m_steps.size(), m_loop);
+		std::fflush(stdout);
+	}
+
+	// Waits `ms`, false if the file changed or the driver stops.
+	bool Sleep(uint32_t ms) {
+		const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+		while (std::chrono::steady_clock::now() < end) {
+			if (m_stop) {
+				return false;
+			}
+			if (Changed()) {
+				m_reload = true;
+				return false;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		}
+		return true;
+	}
+
+	void Run() {
+		m_stamp  = -1;
+		m_reload = Changed() || true;
+		while (!m_stop) {
+			if (m_reload) {
+				m_reload = false;
+				ReleaseAll();
+				Load();
+			}
+			if (m_steps.empty()) {
+				Sleep(200);
+				continue;
+			}
+			std::size_t i = 0;
+			while (!m_stop && !m_reload) {
+				if (i >= m_steps.size()) {
+					if (m_loop >= m_steps.size()) {
+						ReleaseAll();
+						m_steps.clear(); // finished, wait for a new script
+						break;
+					}
+					i = m_loop;
+				}
+				const auto& s = m_steps[i++];
+				Apply(s.kind == 1 ? s.keys : 0);
+				m_active = true;
+				if (!Sleep(s.ms)) {
+					break;
+				}
+			}
+		}
+		ReleaseAll();
+	}
+
+	std::string       m_path;
+	std::thread       m_thread;
+	std::atomic<bool> m_stop {false};
+	bool              m_reload = false;
+	bool              m_active = false;
+	int64_t           m_stamp  = -1;
+	std::vector<Step> m_steps;
+	std::size_t       m_loop = 0;
+};
+
+PadScript g_pad_script;
+
+} // namespace
+
 void HostInputInit(SDL_Window* window) {
+	g_pad_script.Start(); // KYTY_PAD_FILE
 	GetInputMap();
 	g_mouse_window = window;
 	if (const char* value = std::getenv("KYTY_HOST_INPUT_MIN_PRESS_MS")) {
@@ -778,6 +993,7 @@ void HostInputInit(SDL_Window* window) {
 }
 
 void HostInputShutdown() {
+	g_pad_script.Stop(); // KYTY_PAD_FILE
 	g_input_pulse.ReleaseAll(ApplyHostKey);
 	g_pad_trigger_pressed.clear();
 	HostInputSetTouchPadMode(false);
