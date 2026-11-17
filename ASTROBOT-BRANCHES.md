@@ -18,7 +18,7 @@ default**, and with the switch off the behaviour is the one of the base.
 | Branch | Kind | Switch | Status |
 |---|---|---|---|
 | `astrobot-pc` | the playable configuration (5 fixes below in one commit) | see below | compiled; tested in game on the Jetsku U59 base |
-| `astrobot-experiments` | archive of all experiments (108 commits) | many, all off by default | used in game for measurements; see below |
+| `astrobot-experiments` | archive of all experiments (125 commits) | many, all off by default | used in game for measurements; see below |
 | `fix/esc-exits-fullscreen` | fix | none (always on) | compiled; tested in game on the Jetsku U59 base (as part of `astrobot-pc`) |
 | `feature/app0-overlay-subst` | feature | `KYTY_APP0_OVERLAY`, `KYTY_APP0_SUBST` | compiled; tested in game on the Jetsku U59 base (as part of `astrobot-pc`) |
 | `fix/windows-thread-names` | fix | none (Windows only) | compiled; tested in game on the Jetsku U59 base (as part of `astrobot-pc`) |
@@ -27,6 +27,9 @@ default**, and with the switch off the behaviour is the one of the base.
 | `fix/kernel-sema-targeted-wake` | fix / speed | none (always on) | compiled; the same change was used in game on the Jetsku U59 base (experiments builds); no isolated measurement |
 | `diag/wait-graph` | diagnostic | `KYTY_WAIT_GRAPH=1` | compiled; the same instrumentation was used in game on the Jetsku U59 base (experiments build, 16 Nov 2026) |
 | `diag/frame-path` | diagnostic | `KYTY_FRAME_PATH=1` | compiled; the same instrumentation was used in game on the Jetsku U59 base (experiments build, 15-16 Nov 2026) |
+| `perf/host-mutex-srw` | speed | `KYTY_HOST_MUTEX_SRW=1` | measured in game in the working branch (+1.7 fps, 5% low 22 vs 16-20); cherry-picked cleanly here, not compiled on its own |
+| `fix/astro-cb-scale-01019` | fix (crash) | `KYTY_ASTRO_CB_SCALE` (x2 by default) | crash of the EU 1.019 build fixed in game in the working branch; cherry-picked cleanly here, not compiled on its own |
+| `fix/upload-last-reused` | fix | `KYTY_UPLOAD_LAST_REUSED=1` | real defect found by code reading (17 Nov 2026); compiled in the working branch; not yet measured in game |
 
 The single-fix branches carry the same code as in `astrobot-pc` / `astrobot-experiments`, with English comments and
 console messages (the console messages of `KYTY_APP0_SUBST` were translated; the reports of the two `diag/` switches
@@ -45,7 +48,7 @@ the game.
 
 ## `astrobot-experiments`
 
-- **Content**: the whole working branch (`cp-voies`), `744705ee` + 108 commits, kept as is (French commit messages).
+- **Content**: the whole working branch (`cp-voies`), `744705ee` + 125 commits, kept as is (French commit messages).
   Every switch is off by default. It includes, among others: per-pass GPU-thread timing (`KYTY_PASS_STATS`), a frame
   generation prototype with FSR 3 (`KYTY_FSR3_FG`), parallel command-list translation lanes (`KYTY_CP_PAR`,
   `KYTY_CP_PAR_CONCURRENT`, ...), game function hooks (`KYTY_GAME_HOOKS`), native rendering of selected passes
@@ -159,3 +162,32 @@ the game.
 - **Switch**: `KYTY_FRAME_PATH=1`.
 - **Status**: compiled; the same instrumentation was used in game on the Jetsku U59 base (experiments build); this
   isolated branch was not run on its own.
+
+## Added on 17 Nov 2026
+
+Measured on the test machine (i5-12400F, RTX 3060): the game is limited by its own main thread (about 16 ms of game
+code per frame plus task-scheduler waits), not by the GPU (60-70 % busy); lowering the resolution gives nothing. A
+"bimodal" behaviour was seen: with identical settings a run gives ~20 fps or ~24.8 fps.
+
+- `perf/host-mutex-srw`: host mutexes and condition variables on SRW locks. **Measured gain** (3 alternating pairs).
+- `fix/astro-cb-scale-01019`: the command buffer size patch extended to Astro Bot 01.019.000 (crash at guest pc
+  +0x4a0c3e). **Measured**: no cost; the crash was not seen again in the following test runs.
+- `fix/upload-last-reused`: see the commit message. Lost saving only, never a wrong image.
+- `astrobot-experiments` gained 17 commits, **not measured in game yet unless stated** (all off by default):
+  - `KYTY_HOST_MUTEX_SRW`, `KYTY_ASTRO_CB_SCALE` 01.019 (measured, as above);
+  - `KYTY_MAIN_CPU_SAMPLER`: sampling profiler of the guest main thread (frame cadence histogram, long frames,
+    callers of its sleeps and waits, Windows detail, SMT placement, top 10 of the guest libc module);
+  - `KYTY_FLUIDITE=1`: a frame-drop journal for long play sessions (episodes with probable cause, per-frame black
+    box, JPEG thumbnails of the game image, on-demand GPU frame reports, camera read through a pointer chain,
+    F9 / L3+R3 marks, a capped folder with rotation of the oldest captures);
+  - audit of 17 Nov: `KYTY_SEMA_HANDOFF` (direct hand-off of guest semaphore signals), `KYTY_COND_SUBMS` /
+    `KYTY_COND_STATS`, `KYTY_NO_THROTTLE`, `KYTY_THREAD_LAYOUT_LOG` / `KYTY_IDEAL_LAYOUT` (deterministic ideal
+    processors for the heavy threads, aimed at the bimodal behaviour), `KYTY_CP_BLOCKED_WAKE_GEN`,
+    `KYTY_DRAW_PREP_SPIN_ADAPT`, `KYTY_UPLOAD_LAST_REUSED`, `KYTY_PUSH_DELTA` (push descriptors re-encode only the
+    changed elements), `insert-after:` / `insert-before:` / `add:` rules for `KYTY_APP0_SUBST`; a few always-on
+    equivalent changes (per-thread condition variable for semaphore waits, pthread signal outside the lock, cached
+    QPC frequency, ...).
+  - Also measured without a gain and kept only as archive: `KYTY_MAIN_YIELD_SPIN`, `KYTY_MAIN_THREAD_CORE`,
+    `KYTY_MAIN_THREAD_PRIORITY`.
+- Not published here because they depend on earlier commits of the working branch: the sampler, the frame-drop
+  journal and the `KYTY_APP0_SUBST` insertion rules exist only in `astrobot-experiments`.
