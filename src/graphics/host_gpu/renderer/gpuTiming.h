@@ -46,6 +46,8 @@ void NoteCalibrationExtensionEnabled(const char* name);
 // Called once per completed guest flip, before Profiler::PublishFrameWork(). Aggregates the
 // samples collected since the previous flip and publishes them to HangTrace and Profiler.
 void OnGuestFlip();
+// Sum of the per-flip GPU busy time published so far (0 while timing is off). KYTY_FLUIDITE.
+[[nodiscard]] uint64_t TotalBusyNs() noexcept;
 
 } // namespace GpuTiming
 

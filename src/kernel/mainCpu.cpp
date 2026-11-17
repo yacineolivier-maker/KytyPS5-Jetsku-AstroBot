@@ -1,6 +1,7 @@
 #include "kernel/mainCpu.h"
 
 #include "common/common.h"
+#include "graphics/presentation/fluidityLog.h"
 
 #include <algorithm>
 #include <array>
@@ -818,6 +819,13 @@ void SetMainPriority() {
 
 void OnMainThreadStart() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (Libs::Graphics::FluidityEnabled()) {
+		HANDLE handle = nullptr;
+		if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+		                    THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0) != 0) {
+			Libs::Graphics::FluiditySetMainThread(handle);
+		}
+	}
 	PinMainThread();
 	SetMainPriority();
 	if (g_sampler_enabled) {

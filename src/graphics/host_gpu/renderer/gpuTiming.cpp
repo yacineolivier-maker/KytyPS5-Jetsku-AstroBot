@@ -184,6 +184,10 @@ bool CalibrationEnabled() {
 	return g_calibration_extension != nullptr;
 }
 
+uint64_t TotalBusyNs() noexcept {
+	return g_total_busy_ns.load(std::memory_order_relaxed);
+}
+
 void OnGuestFlip() {
 	if (!Enabled()) {
 		return;

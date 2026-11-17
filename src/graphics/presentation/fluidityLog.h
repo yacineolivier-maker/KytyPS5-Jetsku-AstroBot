@@ -2,20 +2,31 @@
 #define EMULATOR_SRC_GRAPHICS_PRESENTATION_FLUIDITYLOG_H_
 
 // KYTY_FLUIDITE=1 (Astro Bot PC): journal of the places where the frame rate drops, kept while the
-// player plays, for later reconstruction of each situation.
+// player plays (sessions of one to two hours), for later reconstruction of each situation.
 //
-// - Each main-bus guest flip is timed (one clock read, a few additions under no lock).
-// - An episode starts on a long frame (KYTY_FLUIDITE_PIC_MS, default 50) or when the frames of the
-//   last second fall under KYTY_FLUIDITE_SEUIL fps (default 28); it ends after 1.5 s back above.
-// - At the start of an episode (at most one every KYTY_FLUIDITE_ECART_S seconds, default 5, and one
-//   every 10 s during a long episode), the presenter reads back the next presented frame and saves
-//   a thumbnail (game image only: never the desktop or other windows).
-// - F9 on the keyboard or L3+R3 on the pad mark the current place by hand, with a thumbnail.
-// - Recent guest file opens (level data) and, when KYTY_FLUIDITE_CAMERA describes where the game
-//   keeps it, the camera, are written with each line.
-// - Files go to KYTY_FLUIDITE_DIR (default: _Fluidite next to the emulator), one folder per session:
-//   journal.csv (episodes and marks), minutes.csv (one line per minute), img-<n>.png.
-//   Disk writes are done on a worker thread, never on the flip or present threads.
+// Per guest flip (main bus), on the video-out thread: one clock read, one QueryThreadCycleTime of the
+// guest main thread, a dozen relaxed counter loads (Common::DebugCounters, collected even with the
+// overlay hidden) and the GPU busy total (GpuTiming, when KYTY_GPU_TIMING=1). Kept in a ring: the
+// "black box".
+//
+// Episode: a frame >= KYTY_FLUIDITE_PIC_MS (50) or the last second under KYTY_FLUIDITE_SEUIL fps (28);
+// it ends after 1.5 s back above. For each episode:
+// - journal.csv: time, duration, frames, worst frame, min fps, probable cause (shaders, disque, gpu,
+//   cpu-jeu, attente-gpu, mixte) with the means behind it, thumbnails, GPU report, recent app0 file
+//   opens (level), camera (KYTY_FLUIDITE_CAMERA, see fluidityLog.cpp);
+// - boite-noire.csv: one line per frame from 1 s before the start to the end (at most 300);
+// - a thumbnail (JPEG 640 wide, game image read back by the presenter, never the desktop): at most
+//   one every KYTY_FLUIDITE_ECART_S s (5), one every 10 s in a long episode, KYTY_FLUIDITE_IMAGES
+//   per session (500);
+// - after 2 s under the threshold, a GPU frame report (KYTY_GPU_OP_PROFILE=demande, gpuOpProfiler.h):
+//   at most KYTY_FLUIDITE_RAPPORTS per session (6), 3 min apart.
+// F9 or L3+R3: manual mark (thumbnail, and a report if allowed). minutes.csv: one line per minute.
+//
+// Files: KYTY_FLUIDITE_DIR (default _Fluidite next to the emulator)\<date-time>\. Place budget:
+// KYTY_FLUIDITE_QUOTA_MO (1024) for the whole _Fluidite folder. Over it, the oldest captures
+// (img-*, rapport-gpu\gpuops-<n>.csv) of all sessions are deleted, oldest first (porteur's rule,
+// 17/11/2026); text journals are never deleted, and if they alone exceed the budget no capture is
+// taken any more. All disk work runs on one worker thread.
 
 #include <cstdint>
 #include <string>
@@ -37,16 +48,20 @@ void FluidityNotePadButton(int id, bool left_stick, bool down) noexcept;
 // A guest file open (any thread); only app0 data paths are kept.
 void FluidityNoteOpen(const char* path) noexcept;
 
-// Present thread: true once when a thumbnail is wanted; returns its number.
-[[nodiscard]] bool FluidityTakeCaptureRequest(uint32_t* number) noexcept;
-
-// Path of the thumbnail number (in the session folder).
-[[nodiscard]] std::string FluidityImagePath(uint32_t number);
+// Guest main thread handle (THREAD_QUERY_LIMITED_INFORMATION), from its start.
+void FluiditySetMainThread(void* handle) noexcept;
 
 // Load address of the game executable, for "eboot+<offset>" in KYTY_FLUIDITE_CAMERA.
 void FluiditySetEbootBase(uint64_t base) noexcept;
 
-// Hands a finished file to the worker thread (written there).
+// Present thread: true once when a thumbnail is wanted; returns its number.
+[[nodiscard]] bool FluidityTakeCaptureRequest(uint32_t* number) noexcept;
+
+// The session folder, and the path of thumbnail <number> in it.
+[[nodiscard]] std::string FluiditySessionDir();
+[[nodiscard]] std::string FluidityImagePath(uint32_t number);
+
+// Hands a finished capture file to the worker thread (written there, counted in the budget).
 void FluidityWriteFile(std::string path, std::vector<uint8_t> bytes);
 
 } // namespace Libs::Graphics

@@ -1742,7 +1742,7 @@ void Presenter::Impl::DumpFrame(Frame& frame, uint64_t number) {
 }
 
 // KYTY_FLUIDITE: the frame is copied here (present thread); shrinking and PNG encoding run on a
-// short-lived thread, the file is written by the journal's worker.
+// short-lived thread (JPEG, 640 wide), the file is written by the journal's worker.
 void Presenter::Impl::CaptureThumbnail(Frame& frame, uint32_t number) {
 	const uint32_t       width  = frame.image.extent.width;
 	const uint32_t       height = frame.image.extent.height;
@@ -1759,8 +1759,8 @@ void Presenter::Impl::CaptureThumbnail(Frame& frame, uint32_t number) {
 		auto           rgb  = ConvertToRgb(raw.data(), width, height, bpp, format, step, &ow, &oh);
 		raw                 = {};
 		std::vector<uint8_t> png;
-		if (stbi_write_png_to_func(&PngWrite, &png, static_cast<int>(ow), static_cast<int>(oh), 3, rgb.data(),
-		                           static_cast<int>(ow * 3u)) != 0) {
+		if (stbi_write_jpg_to_func(&PngWrite, &png, static_cast<int>(ow), static_cast<int>(oh), 3, rgb.data(),
+		                           80) != 0) {
 			FluidityWriteFile(FluidityImagePath(number), std::move(png));
 		}
 	}).detach();

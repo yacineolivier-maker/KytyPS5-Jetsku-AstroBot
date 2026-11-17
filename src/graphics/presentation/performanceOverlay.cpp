@@ -119,7 +119,7 @@ void SamplerThread(const std::stop_token& stop) {
 	uint64_t                                sampled_generation = 0;
 	std::unique_lock                        lock(g_host_mutex);
 	while (!stop.stop_requested()) {
-		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::Enabled(); });
+		g_sampler_wait.wait(lock, stop, [] { return Common::DebugCounters::OverlayEnabled(); });
 		if (stop.stop_requested()) {
 			break;
 		}
@@ -133,11 +133,11 @@ void SamplerThread(const std::stop_token& stop) {
 		lock.lock();
 		g_host_stats      = std::move(stats);
 		g_host_generation = generation;
-		if (Common::DebugCounters::Enabled() && GuestStalled(Clock::now())) {
+		if (Common::DebugCounters::OverlayEnabled() && GuestStalled(Clock::now())) {
 			g_revision.fetch_add(1, std::memory_order_acq_rel);
 		}
 		g_sampler_wait.wait_for(lock, stop, REFRESH_INTERVAL, [generation] {
-			return !Common::DebugCounters::Enabled() ||
+			return !Common::DebugCounters::OverlayEnabled() ||
 			       generation != g_generation.load(std::memory_order_acquire);
 		});
 	}
@@ -594,7 +594,7 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 } // namespace
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
-	if (!Common::DebugCounters::Enabled()) {
+	if (!Common::DebugCounters::OverlayEnabled()) {
 		return;
 	}
 	std::scoped_lock lock(g_frame_mutex);
@@ -617,16 +617,16 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 }
 
 bool PerformanceOverlayEnabled() noexcept {
-	return Common::DebugCounters::Enabled();
+	return Common::DebugCounters::OverlayEnabled();
 }
 
 void TogglePerformanceOverlay() noexcept {
-	SetOverlayEnabled(!Common::DebugCounters::Enabled());
+	SetOverlayEnabled(!Common::DebugCounters::OverlayEnabled());
 	g_revision.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void TogglePerformanceOverlayDetails() noexcept {
-	if (Common::DebugCounters::Enabled()) {
+	if (Common::DebugCounters::OverlayEnabled()) {
 		g_details.store(!g_details.load(std::memory_order_acquire), std::memory_order_release);
 	} else {
 		g_details.store(true, std::memory_order_release);

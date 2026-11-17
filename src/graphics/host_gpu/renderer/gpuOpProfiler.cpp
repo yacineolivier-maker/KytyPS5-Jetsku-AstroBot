@@ -4,6 +4,7 @@
 #include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/fluidityLog.h"
 
 #include <algorithm>
 #include <array>
@@ -77,6 +78,7 @@ enum class StampMode : uint8_t { Ops, Passes, Alternate };
 struct Config {
 	bool      counters     = false; // publish per-flip counters
 	bool      capture      = false; // sampled timestamp captures
+	bool      on_demand    = false; // KYTY_GPU_OP_PROFILE=demande: only on RequestCapture()
 	double    period_s     = 0.0;
 	uint64_t  max_captures = 0;
 	uint32_t  queries      = 262144;
@@ -93,7 +95,11 @@ const Config& GetConfig() {
 		Config c;
 		if (const auto* value = std::getenv("KYTY_GPU_OP_PROFILE"); value != nullptr) {
 			const double seconds = std::strtod(value, nullptr);
-			if (std::isfinite(seconds) && seconds > 0.0) {
+			if (std::strcmp(value, "demande") == 0) {
+				c.capture   = true;
+				c.on_demand = true;
+				c.period_s  = 1e9;
+			} else if (std::isfinite(seconds) && seconds > 0.0) {
 				c.capture  = true;
 				c.period_s = seconds;
 			}
@@ -558,6 +564,9 @@ void Record(VkCommandBuffer cb, OpKind kind, uintptr_t caller) {
 // Output
 
 std::filesystem::path ResolveOutputDirectory() {
+	if (FluidityEnabled()) { // KYTY_FLUIDITE: frame reports go with the session's journal
+		return std::filesystem::path(FluiditySessionDir()) / "rapport-gpu";
+	}
 	if (auto dir = HangTrace::OutputDirectory(); !dir.empty()) {
 		return std::filesystem::path(dir);
 	}
@@ -578,6 +587,8 @@ std::filesystem::path ResolveOutputDirectory() {
 	std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm_v);
 	return std::filesystem::path("_Profiling") / fmt::format("gpuops-{}-pid{}", stamp, pid);
 }
+
+std::atomic<bool> g_capture_requested {false}; // KYTY_GPU_OP_PROFILE=demande
 
 uintptr_t ModuleBase() {
 #ifdef _WIN32
@@ -1959,6 +1970,12 @@ bool Enabled() {
 	return config.capture || config.counters;
 }
 
+void RequestCapture() noexcept {
+	if (GetConfig().on_demand) {
+		g_capture_requested.store(true, std::memory_order_release);
+	}
+}
+
 bool CaptureEnabled() {
 	return GetConfig().capture;
 }
@@ -2046,8 +2063,14 @@ void OnBeginCommand(GraphicContext& graphics, vk::CommandBuffer buffer, uint64_t
 			}
 			s.seen_flip = flip;
 			const auto max = GetConfig().max_captures;
-			if (NowNs() < s.next_ns || (max != 0 && s.captures >= max) ||
-			    !EnsurePool(graphics)) {
+			if (GetConfig().on_demand) {
+				if (!g_capture_requested.load(std::memory_order_acquire) || (max != 0 && s.captures >= max) ||
+				    !EnsurePool(graphics)) {
+					return;
+				}
+				g_capture_requested.store(false, std::memory_order_release);
+			} else if (NowNs() < s.next_ns || (max != 0 && s.captures >= max) ||
+			           !EnsurePool(graphics)) {
 				return;
 			}
 			StartCapture(cb, current_tick, flip);

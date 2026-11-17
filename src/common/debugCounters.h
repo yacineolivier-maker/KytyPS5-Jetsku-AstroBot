@@ -54,12 +54,23 @@ enum class Peak { ShaderCompileNs, PipelineCreateNs, Count };
 
 namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
+inline std::atomic<bool>     g_collect {false}; // KYTY_FLUIDITE: count without the overlay
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 } // namespace Detail
 
+// Counting is on (the performance overlay, or the fluidity journal).
 [[nodiscard]] inline bool Enabled() noexcept {
+	return Detail::g_enabled.load(std::memory_order_relaxed) || Detail::g_collect.load(std::memory_order_relaxed);
+}
+
+// The performance overlay is shown.
+[[nodiscard]] inline bool OverlayEnabled() noexcept {
 	return Detail::g_enabled.load(std::memory_order_relaxed);
+}
+
+inline void SetCollect(bool collect) noexcept {
+	Detail::g_collect.store(collect, std::memory_order_relaxed);
 }
 
 inline void SetEnabled(bool enabled) noexcept {

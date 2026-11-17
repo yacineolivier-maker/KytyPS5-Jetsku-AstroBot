@@ -38,7 +38,9 @@
 //   gpuops-README.txt     column descriptions and the caveats above
 //
 // Environment
-//   KYTY_GPU_OP_PROFILE=<seconds>      capture period (fractional allowed); unset/0 = off
+//   KYTY_GPU_OP_PROFILE=<seconds>      capture period (fractional allowed); unset/0 = off;
+//                                      "demande": only when RequestCapture() is called
+//                                      (KYTY_FLUIDITE), files in <session>/rapport-gpu
 //   KYTY_GPU_OP_PROFILE_MAX=<n>        stop after n captures (default 0 = unlimited)
 //   KYTY_GPU_OP_PROFILE_QUERIES=<n>    timestamp query capacity per capture (default 262144)
 //   KYTY_GPU_OP_PROFILE_DIR=<dir>      output directory when the hang trace is off
@@ -156,6 +158,8 @@ private:
 // Environment-derived, evaluated once.
 [[nodiscard]] bool Enabled();        // counters or capture requested
 [[nodiscard]] bool CaptureEnabled(); // KYTY_GPU_OP_PROFILE > 0
+// KYTY_GPU_OP_PROFILE=demande: capture the next guest frame (the fluidity journal asks).
+void RequestCapture() noexcept;
 
 // Directly after VULKAN_HPP_DEFAULT_DISPATCHER.init(device). No-op unless Enabled().
 void InstallHooks(GraphicContext& graphics);
