@@ -14,6 +14,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
@@ -686,8 +687,10 @@ char* KYTY_SYSV_ABI strrchr(const char* s, int c) {
 }
 
 char* KYTY_SYSV_ABI strstr(const char* haystack, const char* needle) {
-	static int log_count = 0;
-	if (log_count++ < 8) {
+	// Astro Bot PC (audit 17/11): atomic and read-only once the cap is reached (was a plain static
+	// int incremented on every call by every thread).
+	static std::atomic<int> log_count {0};
+	if (log_count.load(std::memory_order_relaxed) < 8 && log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
 		LOGF("LibcInternal::strstr(\"%s\", \"%s\")\n", (haystack != nullptr ? haystack : "<null>"),
 		     (needle != nullptr ? needle : "<null>"));
 	}
@@ -695,16 +698,16 @@ char* KYTY_SYSV_ABI strstr(const char* haystack, const char* needle) {
 }
 
 long KYTY_SYSV_ABI strtol(const char* str, char** endptr, int base) {
-	static int log_count = 0;
-	if (log_count++ < 16) {
+	static std::atomic<int> log_count {0}; // atomic, read-only once capped (see strstr)
+	if (log_count.load(std::memory_order_relaxed) < 16 && log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
 		LOGF("LibcInternal::strtol(\"%s\", base=%d)\n", (str != nullptr ? str : "<null>"), base);
 	}
 	return ::strtol(str, endptr, base);
 }
 
 unsigned long KYTY_SYSV_ABI strtoul(const char* str, char** endptr, int base) {
-	static int log_count = 0;
-	if (log_count++ < 16) {
+	static std::atomic<int> log_count {0}; // atomic, read-only once capped (see strstr)
+	if (log_count.load(std::memory_order_relaxed) < 16 && log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
 		LOGF("LibcInternal::strtoul(\"%s\", base=%d)\n", (str != nullptr ? str : "<null>"), base);
 	}
 	return ::strtoul(str, endptr, base);

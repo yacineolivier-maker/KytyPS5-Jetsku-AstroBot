@@ -24,6 +24,14 @@ void RaiseCurrentThreadPriority();
 void RaiseServiceThreadPriority();
 [[nodiscard]] int ServiceThreadPriorityLevel();
 
+// Astro Bot PC (KYTY_NO_THROTTLE=1, default off, read once; Windows only, no-op otherwise): turns
+// Windows power throttling off. The first call (the guest main thread, at start-up) sets the
+// process state (ProcessPowerThrottling: execution speed and timer resolution controlled, both
+// off: no EcoQoS, timer-resolution requests honoured even when the window is hidden or occluded);
+// every call sets the calling thread's (ThreadPowerThrottling, execution speed off). Called by
+// each guest thread when it starts.
+void DisablePowerThrottlingForGuestThread();
+
 // sched_yield: gives the processor to another thread that is ready to run on this CPU and
 // returns at once when there is none (FreeBSD sched_relinquish). True when another thread ran.
 bool YieldToReadyThread();

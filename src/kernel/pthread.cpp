@@ -476,7 +476,9 @@ struct PthreadPrivate {
 	uintptr_t             guest_host_rbx;
 	uintptr_t             guest_host_rsp;
 	uintptr_t             guest_host_rbp;
-	uint64_t              cond_sequence = 0;
+	// Bumped (under the condition's lock) by the signal that serves this thread's condition wait.
+	// Atomic so that a KYTY_COND_SUBMS spin can read it without the lock.
+	std::atomic<uint64_t> cond_sequence {0};
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -550,25 +552,29 @@ static void CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	std::erase(cond->waiters, thread);
 }
 
-static void CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
+// cond->m held: serves the waiter (the front one when thread is null) and returns it; the caller
+// notifies its cond_cv after releasing cond->m (Astro Bot PC, audit 17/11: the woken waiter no
+// longer runs into the lock still held by the signaller). Safe: a PthreadPrivate is never freed
+// (PthreadPool reuses it), so a late notify is at worst a spurious wake-up of a later wait on the
+// same thread, and every wait on cond_cv loops on its own sequence.
+static Pthread CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 
 	if (thread == nullptr) {
 		if (cond->waiters.empty()) {
-			return;
+			return nullptr;
 		}
 		thread = cond->waiters.front();
 	}
 
 	auto it = std::find(cond->waiters.begin(), cond->waiters.end(), thread);
 	if (it == cond->waiters.end()) {
-		return;
+		return nullptr;
 	}
 
 	cond->waiters.erase(it);
-	thread->cond_sequence++;
-	// Notify while holding cond->m so the selected waiter cannot exit and be freed first.
-	thread->cond_cv.notify_one();
+	thread->cond_sequence.fetch_add(1, std::memory_order_release);
+	return thread;
 }
 
 void PthreadWakeForSignal(Pthread thread) {
@@ -587,12 +593,28 @@ void KernelDispatchPendingSignalForCurrentThread();
 // slice) and a short yield loop. Off: one condition-variable wait per poll, as before.
 static Live::Switch g_precise_cond_waits("KYTY_PRECISE_COND_WAITS", Live::ParseDefaultOff);
 
+// KYTY_COND_SUBMS / KYTY_COND_STATS: see common/condWaitUntil.h. ready() reads the atomic
+// cond_sequence, so it may be spun on without the lock.
 template <class Lock, class Ready>
 static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& ready,
                           std::chrono::steady_clock::time_point deadline) {
+	if (Common::CondStatsOn()) {
+		const auto left = deadline - std::chrono::steady_clock::now();
+		Common::CondStatsRecordWait(
+		    left.count() <= 0
+		        ? 0
+		        : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(left).count()));
+	}
 	Common::CondWaitUntil(lock, cv, ready, deadline, SIGNAL_APC_POLL_MICROS,
 	                      g_precise_cond_waits.On(),
-	                      [] { KernelDispatchPendingSignalForCurrentThread(); });
+	                      [] { KernelDispatchPendingSignalForCurrentThread(); }, Common::CondSubMs());
+	if (Common::CondStatsOn() && !ready()) {
+		const auto late = std::chrono::steady_clock::now() - deadline;
+		Common::CondStatsRecordTimeout(
+		    late.count() <= 0
+		        ? 0
+		        : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(late).count()));
+	}
 }
 
 // sched_yield (FreeBSD sched_relinquish): another thread that is ready on this CPU runs first;
@@ -1238,6 +1260,7 @@ void PthreadInitSelfForMainThread() {
 #endif
 
 	g_pthread_self = new PthreadPrivate {};
+	Common::DisablePowerThrottlingForGuestThread(); // Astro Bot PC (KYTY_NO_THROTTLE): also the process
 	PthreadAttrInit(&g_pthread_self->attr);
 	UpdateCurrentThreadStackAttr(&g_pthread_self->attr);
 	g_pthread_self->p               = pthread_self();
@@ -1579,7 +1602,9 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state.previous);
 		cancel_state.active = true;
 	}
-	const auto wait_start = std::chrono::steady_clock::now();
+	// Astro Bot PC (audit 17/11): the clock is read only by a lock that has to wait (blocked is
+	// set exactly when the loops below run: same state, same lock); unchanged otherwise.
+	const auto wait_start = blocked ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	bool       starving   = false;
 	if (timeout_us == nullptr) {
 		while (!MutexMayTake(mutex, self)) {
@@ -3062,7 +3087,7 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 
 	std::lock_guard lock((*cond)->m);
 	for (auto* thread: (*cond)->waiters) {
-		thread->cond_sequence++;
+		thread->cond_sequence.fetch_add(1, std::memory_order_release);
 		thread->cond_cv.notify_one();
 	}
 	(*cond)->waiters.clear();
@@ -3151,8 +3176,14 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	std::lock_guard lock((*cond)->m);
-	CondWakeWaiter(*cond, nullptr);
+	Pthread woken = nullptr;
+	{
+		std::lock_guard lock((*cond)->m);
+		woken = CondWakeWaiter(*cond, nullptr);
+	}
+	if (woken != nullptr) {
+		woken->cond_cv.notify_one(); // after the unlock (see CondWakeWaiter)
+	}
 	return OK;
 }
 
@@ -3171,8 +3202,14 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	std::lock_guard lock((*cond)->m);
-	CondWakeWaiter(*cond, thread);
+	Pthread woken = nullptr;
+	{
+		std::lock_guard lock((*cond)->m);
+		woken = CondWakeWaiter(*cond, thread);
+	}
+	if (woken != nullptr) {
+		woken->cond_cv.notify_one(); // after the unlock (see CondWakeWaiter)
+	}
 	return OK;
 }
 
@@ -3209,7 +3246,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	                         reinterpret_cast<uint64_t>(mutex_value));
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
-	const auto       thread_sequence = thread->cond_sequence;
+	const auto       thread_sequence = thread->cond_sequence.load(std::memory_order_relaxed);
 	CondAddWaiter(cond_value, thread);
 
 	uint32_t recurse = 0;
@@ -3220,7 +3257,9 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	}
 
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
-	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	auto ready = [thread, thread_sequence] {
+		return thread->cond_sequence.load(std::memory_order_acquire) != thread_sequence;
+	};
 
 	if (usec == 0) {
 		result = ETIMEDOUT;
@@ -3282,7 +3321,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	                         reinterpret_cast<uint64_t>(mutex_value));
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
-	const auto       thread_sequence = thread->cond_sequence;
+	const auto       thread_sequence = thread->cond_sequence.load(std::memory_order_relaxed);
 	CondAddWaiter(cond_value, thread);
 
 	uint32_t recurse = 0;
@@ -3292,7 +3331,9 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
-	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	auto ready = [thread, thread_sequence] {
+		return thread->cond_sequence.load(std::memory_order_acquire) != thread_sequence;
+	};
 
 	CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 	result = (ready() ? OK : ETIMEDOUT);
@@ -3345,7 +3386,7 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	                         reinterpret_cast<uint64_t>(mutex_value));
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
-	const auto       thread_sequence = thread->cond_sequence;
+	const auto       thread_sequence = thread->cond_sequence.load(std::memory_order_relaxed);
 	CondAddWaiter(cond_value, thread);
 
 	uint32_t recurse = 0;
@@ -3355,7 +3396,9 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
-	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	auto ready = [thread, thread_sequence] {
+		return thread->cond_sequence.load(std::memory_order_acquire) != thread_sequence;
+	};
 
 	while (!ready()) {
 		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
@@ -3529,6 +3572,7 @@ static void* RunThread(void* arg) {
 
 	g_pthread_self = thread;
 	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), thread->name);
+	Common::DisablePowerThrottlingForGuestThread(); // Astro Bot PC (KYTY_NO_THROTTLE)
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

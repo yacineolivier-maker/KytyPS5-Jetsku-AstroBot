@@ -1,6 +1,7 @@
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
+#include "common/condWaitUntil.h" // Astro Bot PC (KYTY_COND_SUBMS, KYTY_COND_STATS)
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -108,6 +109,135 @@ static uint32_t GuestSemaSpinUs() {
 	return us;
 }
 
+// Astro Bot PC (KYTY_SEMA_HANDOFF, default 0 = off, read once, Windows only; audit 17/11): direct
+// hand-off of a kernel semaphore's count to its waiters. The game makes ~2,000 mostly blocking
+// signals per frame; before, the signaller marked the waiter ready and woke it under the lock,
+// and the woken waiter took the lock twice more (back from its condition wait, then to remove
+// itself). With the hand-off the signaller, under the lock, takes the count for the waiter,
+// writes its result, removes it from the list and flips its parking word to "served"; it calls
+// WakeByAddressSingle after unlocking and only if the waiter was asleep. The served waiter
+// returns without taking the lock again. Each waiter first spins briefly on its word when the
+// semaphore's recent service delay (moving average, measured by the signaller) is below 20 us,
+// then sleeps on it (WaitOnAddress) by slices of at most 10 ms (pending guest signals are
+// dispatched between slices, and the word is checked again: safety net). Same rules as before:
+// waiter order (FIFO or priority by attribute), need counts served as before (any waiter whose
+// need fits, in list order), timeouts, cancel, delete, poll. 1: adaptive spin; 2: no spin.
+// KYTY_GUEST_SEMA_SPIN_US is ignored in this mode. KYTY_COND_STATS=1 prints counters every 10 s:
+// "Kyty semaphores remise directe 10 s : ...".
+static int SemaHandoffMode() {
+	static const int mode = [] {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const char* value = std::getenv("KYTY_SEMA_HANDOFF");
+		int         m     = 0;
+		if (value != nullptr && std::strcmp(value, "1") == 0) {
+			m = 1;
+		} else if (value != nullptr && std::strcmp(value, "2") == 0) {
+			m = 2;
+		}
+		if (m != 0) {
+			std::printf("Kyty semaphores invites : remise directe du signal%s (KYTY_SEMA_HANDOFF)\n",
+			            m == 1 ? ", attente active adaptative" : ", sans attente active");
+			std::fflush(stdout);
+		}
+		return m;
+#else
+		return 0;
+#endif
+	}();
+	return mode;
+}
+
+// KYTY_SEMA_HANDOFF: a waiter's parking word.
+constexpr uint32_t PARK_ACTIVE   = 0; // registered, running (spinning, checking, dispatching)
+constexpr uint32_t PARK_SLEEPING = 1; // registered, asleep on the word (WaitOnAddress)
+constexpr uint32_t PARK_SERVED   = 2; // served by a signaller, cancel or delete (result written)
+constexpr uint32_t PARK_LEAVING  = 3; // timed out: no longer served, removes itself under the lock
+
+// KYTY_SEMA_HANDOFF adaptive spin: spin while the recent service delay is below this.
+constexpr uint64_t HANDOFF_SPIN_THRESHOLD_NS = 20'000;
+constexpr uint64_t HANDOFF_SPIN_MAX_NS       = 30'000;
+constexpr uint64_t HANDOFF_SPIN_MIN_NS       = 2'000;
+
+namespace {
+std::atomic<uint64_t> g_ho_spin_served {0};  // served while spinning (no sleep, no wake-up call)
+std::atomic<uint64_t> g_ho_sleep_served {0}; // served while asleep or between slices
+std::atomic<uint64_t> g_ho_wake_calls {0};   // WakeByAddressSingle calls by signallers
+std::atomic<uint64_t> g_ho_timeouts {0};
+std::atomic<uint64_t> g_ho_leaving_skips {0}; // signaller found the waiter already timing out
+std::atomic<uint64_t> g_ho_spin_ns {0};
+std::atomic<uint64_t> g_ho_delay_ns {0}; // sum of service delays (registration -> served)
+std::atomic<uint64_t> g_ho_delays {0};
+std::atomic<uint64_t> g_ho_report_ns {0};
+
+void HandoffReport(uint64_t now) {
+	auto last = g_ho_report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_ho_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ull ||
+	    !g_ho_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const double seconds = static_cast<double>(now - last) / 1e9;
+	const auto   delays  = g_ho_delays.exchange(0, std::memory_order_relaxed);
+	const auto   delay   = g_ho_delay_ns.exchange(0, std::memory_order_relaxed);
+	std::printf("Kyty semaphores remise directe 10 s : %.0f/s servies en attente active, %.0f/s servies "
+	            "endormies (%.0f/s reveils), %.0f/s echeances (%.0f/s au moment du service), delai de "
+	            "service moyen %.1f us, %.1f ms/s d'attente active\n",
+	            static_cast<double>(g_ho_spin_served.exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_ho_sleep_served.exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_ho_wake_calls.exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_ho_timeouts.exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_ho_leaving_skips.exchange(0, std::memory_order_relaxed)) / seconds,
+	            delays != 0 ? static_cast<double>(delay) / 1e3 / static_cast<double>(delays) : 0.0,
+	            static_cast<double>(g_ho_spin_ns.exchange(0, std::memory_order_relaxed)) / 1e6 / seconds);
+	std::fflush(stdout);
+}
+
+// KYTY_SEMA_HANDOFF: parking words to wake once the semaphore's lock is released. Only the
+// addresses are kept: WakeByAddressSingle never reads the memory, so waking a waiter that has
+// already seen its word and returned (its stack word reused) is at worst a spurious wake-up, which
+// every WaitOnAddress caller tolerates.
+struct HandoffWakeList {
+	static constexpr int N = 8;
+	void*                addr[N] {};
+	int                  n = 0;
+	void                 Add(void* a) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (n < N) {
+			addr[n++] = a;
+		} else {
+			WakeByAddressSingle(a); // more than N sleepers served at once: wake under the lock
+		}
+#else
+		(void)a;
+#endif
+	}
+	void Flush() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		for (int i = 0; i < n; i++) {
+			WakeByAddressSingle(addr[i]);
+		}
+#endif
+		if (n != 0) {
+			g_ho_wake_calls.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+		}
+		n = 0;
+	}
+};
+
+// Audit 17/11: one condition variable per host thread, reused by all its classic semaphore waits
+// (WaitingThread used to own one: an allocation and a free per blocking wait). A thread waits on
+// one semaphore at a time; a guest signal handler that waits again on this thread while an outer
+// wait is registered shares it, which at worst gives one of them a spurious wake-up: both re-check
+// their own `ready` flag under their semaphore's lock before sleeping again.
+Common::CondVar& ThreadSemaCond() {
+	thread_local Common::CondVar cond;
+	return cond;
+}
+} // namespace
+
 namespace {
 std::atomic<uint64_t> g_spin_served {0};  // waits served while spinning (no sleep, no wake-up call)
 std::atomic<uint64_t> g_spin_slept {0};   // waits that spun, then slept
@@ -208,11 +338,18 @@ private:
 		bool   ready      = false;
 		// Astro Bot PC (13/11) : chaque fil en attente a sa variable de condition ; un signal ne reveille que les
 		// fils servis (avant : SignalAll a chaque Signal, tous les fils reveilles se disputaient le verrou).
-		Common::CondVar cond;
+		// Audit 17/11 : celle du fil, reutilisee (ThreadSemaCond), plus d'allocation par attente.
+		Common::CondVar* cond = nullptr;
 		// KYTY_GUEST_SEMA_LIGHT: the word this waiter parks on (1 once served), and when it was
-		// served (verify).
+		// served (verify). Also set by Wake in the classic mode (KYTY_COND_SUBMS spins on it).
 		std::atomic<uint32_t> word {0};
 		uint64_t              served_ns = 0;
+		// KYTY_SEMA_HANDOFF: the parking word (PARK_*), whether the server removed the waiter from
+		// the list (false only for delete: the destructor waits for its waiters to leave), and when
+		// it was registered (service delay, steady clock ns).
+		std::atomic<uint32_t> park {PARK_ACTIVE};
+		bool                  removed = false;
+		uint64_t              enq_ns  = 0;
 	};
 
 	// The semaphore's lock (KYTY_GUEST_SEMA_LIGHT: SRW; otherwise the critical section).
@@ -257,11 +394,22 @@ private:
 			return;
 		}
 #endif
-		waiter->cond.Signal();
+		waiter->word.store(1, std::memory_order_release); // KYTY_COND_SUBMS spin
+		waiter->cond->Signal();
 	}
 	// Lock held: parks until woken, `micros` at most (ms granularity, as the condition variable);
 	// returns with the lock held.
 	void Park(WaitingThread* waiter, uint32_t micros) {
+		if (micros < 1000 && Common::CondSubMs()) {
+			// KYTY_COND_SUBMS: less than 1 ms left (the caller passes the time left of a timed
+			// wait; untimed waits pass 10 ms): spin on the word Wake sets, lock released.
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
+			Unlock();
+			(void)Common::SpinUntilPrecise(
+			    [waiter] { return waiter->word.load(std::memory_order_acquire) != 0; }, deadline);
+			Lock();
+			return;
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (m_mode != SemaMode::Classic) {
 			Unlock();
@@ -272,7 +420,7 @@ private:
 			return;
 		}
 #endif
-		waiter->cond.WaitFor(&m_mutex, micros);
+		waiter->cond->WaitFor(&m_mutex, micros);
 	}
 	// KYTY_GUEST_SEMA_LIGHT=verify, lock held.
 	void Check() {
@@ -297,6 +445,82 @@ private:
 	void AddWaiter(WaitingThread* waiter);
 	void RemoveWaiter(WaitingThread* waiter);
 	void WakeWaiters();
+
+	// KYTY_SEMA_HANDOFF (see SemaHandoffMode).
+	Result WaitHandoff(int need_count, uint32_t* ptr_micros);
+	// Lock held: serves `waiter` with `result` unless it is already leaving (timed out) or served.
+	// Everything the waiter reads is written before its word turns PARK_SERVED; once it has, the
+	// waiter may return at any moment and its WaitingThread (on its stack) must not be touched
+	// again: only the word's address is kept, for a wake-up after the unlock if it was asleep.
+	bool HandoffClaim(WaitingThread* waiter, Result result, bool remove, HandoffWakeList* wake) {
+		auto* const word = &waiter->park;
+		uint32_t    prev = word->load(std::memory_order_relaxed);
+		// Only a signaller (under this lock) makes a word PARK_SERVED; the waiter itself moves it
+		// between ACTIVE, SLEEPING and LEAVING only.
+		if (prev == PARK_SERVED) {
+			return false;
+		}
+		waiter->result  = result;
+		waiter->removed = remove;
+		waiter->ready   = true;
+		if (m_mode == SemaMode::Verify) {
+			waiter->served_ns = SemaNowNs();
+		}
+		for (;;) {
+			if (prev == PARK_LEAVING) {
+				// Timed out first: it is still registered and removes itself under this lock, so
+				// it is alive; it reports a timeout and reads none of the fields above.
+				waiter->ready = false;
+				g_ho_leaving_skips.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			if (word->compare_exchange_weak(prev, PARK_SERVED, std::memory_order_acq_rel,
+			                                std::memory_order_relaxed)) {
+				break;
+			}
+		}
+		// `waiter` may be gone from here on.
+		if (prev == PARK_SLEEPING) {
+			wake->Add(static_cast<void*>(word));
+		}
+		return true;
+	}
+	// Lock held: serves the waiters whose need fits, in list order (as WakeWaiters), removing them.
+	void HandoffServe(HandoffWakeList* wake) {
+		uint64_t now = 0;
+		auto     out = m_waiting_threads.begin();
+		for (auto it = m_waiting_threads.begin(); it != m_waiting_threads.end(); ++it) {
+			auto* waiter = *it;
+			if (!waiter->ready && waiter->need_count <= m_count) {
+				const int      need   = waiter->need_count; // read before the claim
+				const uint64_t enq_ns = waiter->enq_ns;
+				if (HandoffClaim(waiter, Result::Ok, true, wake)) {
+					m_count -= need;
+					if (now == 0) {
+						now = SemaNowNs();
+					}
+					const uint64_t delay = now > enq_ns ? now - enq_ns : 0;
+					// Moving average (1/8) of the service delay, read by the next waiters.
+					m_ho_avg_ns = m_ho_avg_ns - m_ho_avg_ns / 8 + std::min<uint64_t>(delay, 10'000'000) / 8;
+					if (Common::CondStatsOn()) {
+						g_ho_delay_ns.fetch_add(delay, std::memory_order_relaxed);
+						g_ho_delays.fetch_add(1, std::memory_order_relaxed);
+					}
+					continue; // removed
+				}
+			}
+			*out++ = waiter;
+		}
+		m_waiting_threads.erase(out, m_waiting_threads.end());
+	}
+	// Lock held: how long a new waiter spins before sleeping (adaptive, KYTY_SEMA_HANDOFF=1).
+	[[nodiscard]] uint64_t HandoffSpinNs() const {
+		if (SemaHandoffMode() != 1 || m_ho_avg_ns >= HANDOFF_SPIN_THRESHOLD_NS) {
+			return 0;
+		}
+		return std::clamp<uint64_t>(2 * m_ho_avg_ns + 1'000, HANDOFF_SPIN_MIN_NS, HANDOFF_SPIN_MAX_NS);
+	}
+	uint64_t m_ho_avg_ns = 0; // KYTY_SEMA_HANDOFF: service delay moving average (lock held)
 
 	Common::Mutex               m_mutex;
 	Common::CondVar             m_cond_var;
@@ -332,11 +556,24 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 	m_status = Status::Deleted;
 	m_deleted_hint.store(true, std::memory_order_release); // KYTY_GUEST_SEMA_SPIN_US
 
-	for (auto* waiter: m_waiting_threads) {
-		if (!waiter->ready) {
-			waiter->result = Result::Deleted;
-			waiter->ready  = true;
-			Wake(waiter);
+	if (SemaHandoffMode() != 0) {
+		// Served but left in the list: each waiter removes itself under the lock, and the loop
+		// below waits for the list to empty before the semaphore is freed. Leaving (timed-out)
+		// waiters are skipped and remove themselves too.
+		HandoffWakeList wake;
+		for (auto* waiter: m_waiting_threads) {
+			if (!waiter->ready) {
+				(void)HandoffClaim(waiter, Result::Deleted, false, &wake);
+			}
+		}
+		wake.Flush();
+	} else {
+		for (auto* waiter: m_waiting_threads) {
+			if (!waiter->ready) {
+				waiter->result = Result::Deleted;
+				waiter->ready  = true;
+				Wake(waiter);
+			}
 		}
 	}
 
@@ -367,6 +604,25 @@ KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_wait
 	m_count = (set_count < 0 ? m_init_count : set_count);
 	PublishCount();
 
+	if (SemaHandoffMode() != 0) {
+		// Served and removed (a canceled waiter never touches the semaphore again); leaving ones
+		// stay and time out. Woken under the lock here (cancel is rare; the wake-up reads no
+		// memory, so it is safe even if the waiter has already returned).
+		HandoffWakeList wake;
+		auto            out = m_waiting_threads.begin();
+		for (auto it = m_waiting_threads.begin(); it != m_waiting_threads.end(); ++it) {
+			auto* waiter = *it;
+			if (!waiter->ready && HandoffClaim(waiter, Result::Canceled, true, &wake)) {
+				continue;
+			}
+			*out++ = waiter;
+		}
+		m_waiting_threads.erase(out, m_waiting_threads.end());
+		wake.Flush();
+		Check();
+		return Result::Ok;
+	}
+
 	for (auto* waiter: m_waiting_threads) {
 		if (!waiter->ready) {
 			waiter->result = Result::Canceled;
@@ -383,6 +639,29 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 	if (m_mode == SemaMode::Verify) {
 		g_sema_signals.fetch_add(1, std::memory_order_relaxed);
 		SemaVerifyReport();
+	}
+	if (SemaHandoffMode() != 0) {
+		HandoffWakeList wake;
+		{
+			Guard lock(*this);
+			if (m_status == Status::Deleted) {
+				return Result::Deleted;
+			}
+			if (m_count + signal_count > m_max_count) {
+				return Result::InvalCount;
+			}
+			m_count += signal_count;
+			if (!m_waiting_threads.empty()) {
+				HandoffServe(&wake);
+			}
+			PublishCount();
+			Check();
+		}
+		wake.Flush(); // after the unlock: the woken waiter does not run into the lock
+		if (Common::CondStatsOn()) {
+			HandoffReport(SemaNowNs());
+		}
+		return Result::Ok;
 	}
 	Guard lock(*this);
 
@@ -435,6 +714,9 @@ void KernelSemaPrivate::WakeWaiters() {
 }
 
 KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_micros) {
+	if (SemaHandoffMode() != 0) {
+		return WaitHandoff(need_count, ptr_micros);
+	}
 	if (m_mode == SemaMode::Verify) {
 		g_sema_waits.fetch_add(1, std::memory_order_relaxed);
 	}
@@ -563,12 +845,17 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	waiter.id         = id;
 	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
 	waiter.need_count = need_count;
+	waiter.cond       = &ThreadSemaCond();
 	AddWaiter(&waiter);
+	if (!infinitely) {
+		Common::CondStatsRecordWait(micros); // KYTY_COND_STATS
+	}
 
 	while (!waiter.ready) {
 		if ((elapsed >= micros && !infinitely)) {
 			RemoveWaiter(&waiter);
 			*ptr_micros = 0;
+			Common::CondStatsRecordTimeout(static_cast<uint64_t>(elapsed - micros) * 1000u);
 			return Result::TimedOut;
 		}
 
@@ -599,6 +886,207 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	}
 
 	return waiter.result;
+}
+
+// KYTY_SEMA_HANDOFF (see SemaHandoffMode). The races, all decided by the waiter's parking word:
+// - served while running or asleep: the signaller (under the lock) writes the result, removes the
+//   waiter and CASes ACTIVE/SLEEPING -> SERVED; it wakes the address after the unlock only if it
+//   saw SLEEPING. The waiter only sleeps after CASing ACTIVE -> SLEEPING, and WaitOnAddress
+//   returns at once when the word is no longer SLEEPING: no lost wake-up. A missed wake-up would
+//   still be caught at the end of the slice (10 ms at most).
+// - timeout at the moment of service: the waiter CASes ACTIVE -> LEAVING before it takes the
+//   lock to remove itself. If that fails the word is SERVED: the wait succeeded (its count was
+//   taken). If it succeeds the signaller, which only serves ACTIVE/SLEEPING words, skips it and
+//   gives the count to the next waiter whose need fits (or keeps it).
+// - delete: the waiters are served with Deleted but left in the list; each one takes the lock to
+//   remove itself, and the destructor waits for the list to empty. Cancel removes them (they do
+//   not touch the semaphore again, so a delete right after a cancel is safe).
+// - a served waiter touches neither the semaphore nor its lock: the semaphore may be deleted as
+//   soon as the signal returns. Only the signaller updates the service-delay average.
+KernelSemaPrivate::Result KernelSemaPrivate::WaitHandoff(int need_count, uint32_t* ptr_micros) {
+	if (m_mode == SemaMode::Verify) {
+		g_sema_waits.fetch_add(1, std::memory_order_relaxed);
+	}
+	Lock();
+
+	if (need_count < 1 || need_count > m_max_count) {
+		Unlock();
+		return Result::InvalCount;
+	}
+	if (m_status == Status::Deleted) {
+		Unlock();
+		return Result::Deleted;
+	}
+
+	uint32_t   micros     = (ptr_micros != nullptr ? *ptr_micros : 0);
+	const bool infinitely = (ptr_micros == nullptr);
+
+	if (m_count >= need_count) {
+		m_count -= need_count;
+		PublishCount();
+		Check();
+		Unlock();
+		return Result::Ok; // *ptr_micros unchanged
+	}
+	if (!infinitely && micros == 0) {
+		Unlock();
+		return Result::TimedOut;
+	}
+
+	if (m_mode == SemaMode::Verify) {
+		g_sema_blocking.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	const auto start    = std::chrono::steady_clock::now();
+	const auto deadline = start + std::chrono::microseconds(micros);
+
+	HangWatchdog::Scope wait("guest-semaphore", reinterpret_cast<uint64_t>(this), need_count, m_count, 0,
+	                         micros);
+	WaitingThread waiter {};
+	waiter.id         = Common::Thread::GetThreadIdUnique();
+	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
+	waiter.need_count = need_count;
+	waiter.enq_ns     = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count());
+	AddWaiter(&waiter);
+	const uint64_t spin_ns = HandoffSpinNs();
+	Unlock();
+	// From here on the semaphore is touched only while `waiter` is still in its list (not served,
+	// or served by delete).
+
+	if (!infinitely) {
+		Common::CondStatsRecordWait(micros); // KYTY_COND_STATS
+	}
+	const bool stats  = Common::CondStatsOn();
+	bool       served = false;
+	auto       is_served = [&waiter] { return waiter.park.load(std::memory_order_acquire) == PARK_SERVED; };
+
+	if (spin_ns != 0) {
+		auto spin_end = start + std::chrono::nanoseconds(spin_ns);
+		if (!infinitely && spin_end > deadline) {
+			spin_end = deadline;
+		}
+		for (;;) {
+			if (is_served()) {
+				served = true;
+				break;
+			}
+			for (int i = 0; i < 8; i++) {
+#if defined(_M_X64) || defined(__x86_64__)
+				_mm_pause();
+#else
+				std::this_thread::yield();
+#endif
+			}
+			if (std::chrono::steady_clock::now() >= spin_end) {
+				served = is_served();
+				break;
+			}
+		}
+		if (stats) {
+			g_ho_spin_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                 std::chrono::steady_clock::now() - start)
+			                                                 .count()),
+			                       std::memory_order_relaxed);
+			if (served) {
+				g_ho_spin_served.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
+
+	if (!served) {
+		const bool subms = Common::CondSubMs();
+		for (;;) {
+			if (is_served()) {
+				served = true;
+				break;
+			}
+			const auto now = std::chrono::steady_clock::now();
+			if (!infinitely && now >= deadline) {
+				uint32_t expected = PARK_ACTIVE;
+				if (waiter.park.compare_exchange_strong(expected, PARK_LEAVING, std::memory_order_acq_rel)) {
+					// Still registered: remove it under the lock (the destructor waits for it).
+					Lock();
+					RemoveWaiter(&waiter);
+					Check();
+					Unlock();
+					if (stats) {
+						g_ho_timeouts.fetch_add(1, std::memory_order_relaxed);
+						Common::CondStatsRecordTimeout(static_cast<uint64_t>(
+						    std::chrono::duration_cast<std::chrono::nanoseconds>(now - deadline).count()));
+					}
+					*ptr_micros = 0;
+					return Result::TimedOut;
+				}
+				served = true; // expected == PARK_SERVED: served just before the deadline
+				break;
+			}
+			uint64_t left_us = SIGNAL_APC_POLL_MICROS;
+			if (!infinitely) {
+				left_us = std::min<uint64_t>(
+				    left_us, static_cast<uint64_t>(
+				                 std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count()));
+				if (subms && left_us < 1000) {
+					// KYTY_COND_SUBMS: the last part of a timed wait, spun precisely.
+					(void)Common::SpinUntilPrecise(is_served, deadline);
+					continue;
+				}
+			}
+			// Sleep slice: never longer than 10 ms (the pending-signal poll and the safety net).
+			// KYTY_COND_SUBMS: wakes about 1 ms before the deadline, the rest is spun.
+			auto ms = static_cast<uint32_t>(left_us / 1000);
+			if (subms && !infinitely && left_us < SIGNAL_APC_POLL_MICROS) {
+				ms = static_cast<uint32_t>((left_us - 1000) / 1000);
+			}
+			ms = std::max<uint32_t>(ms, 1);
+			uint32_t expected = PARK_ACTIVE;
+			if (!waiter.park.compare_exchange_strong(expected, PARK_SLEEPING, std::memory_order_acq_rel)) {
+				served = true; // only a signaller changes an ACTIVE word: PARK_SERVED
+				break;
+			}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			uint32_t sleeping = PARK_SLEEPING;
+			(void)WaitOnAddress(static_cast<volatile void*>(&waiter.park), &sleeping, sizeof(sleeping), ms);
+#endif
+			expected = PARK_SLEEPING;
+			if (!waiter.park.compare_exchange_strong(expected, PARK_ACTIVE, std::memory_order_acq_rel)) {
+				served = true; // PARK_SERVED
+				break;
+			}
+			// Not served (slice over or spurious wake-up): pending guest signals, then check again.
+			LibKernel::KernelDispatchPendingSignalForCurrentThread();
+		}
+		if (stats) {
+			g_ho_sleep_served.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+
+	// Served (the word is PARK_SERVED, read with acquire: the result is visible).
+	const Result result = waiter.result;
+	if (m_mode == SemaMode::Verify && waiter.served_ns != 0) {
+		const auto delay_us = (SemaNowNs() - waiter.served_ns) / 1000u;
+		if (delay_us > 15'000) {
+			g_sema_late_wakes.fetch_add(1, std::memory_order_relaxed);
+		}
+		auto worst = g_sema_max_wake_us.load(std::memory_order_relaxed);
+		while (delay_us > worst &&
+		       !g_sema_max_wake_us.compare_exchange_weak(worst, delay_us, std::memory_order_relaxed)) {
+		}
+	}
+	if (!waiter.removed) {
+		// Delete: still in the list, the destructor waits for it.
+		Lock();
+		RemoveWaiter(&waiter);
+		Unlock();
+	}
+	// The old path dispatched pending guest signals after every wake-up, served or not.
+	LibKernel::KernelDispatchPendingSignalForCurrentThread();
+	if (ptr_micros != nullptr) {
+		const auto elapsed_us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+		*ptr_micros = (elapsed_us >= micros ? 0 : micros - static_cast<uint32_t>(elapsed_us));
+	}
+	return result;
 }
 
 int KYTY_SYSV_ABI KernelCreateSema(KernelSema* sem, const char* name, uint32_t attr, int init,

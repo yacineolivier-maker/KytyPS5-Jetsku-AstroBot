@@ -370,6 +370,42 @@ void RaiseServiceThreadPriority() {
 #endif
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+#endif
+
+void DisablePowerThrottlingForGuestThread() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_NO_THROTTLE");
+		const bool  r     = value != nullptr && std::strcmp(value, "1") == 0;
+		if (r) {
+			PROCESS_POWER_THROTTLING_STATE state {};
+			state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+			state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+			                    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+			state.StateMask = 0;
+			const BOOL ok   = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state,
+			                                        sizeof(state));
+			std::printf("Kyty bridage d'energie Windows coupe (processus %s, fils invites) (KYTY_NO_THROTTLE)\n",
+			            ok != 0 ? "ok" : "refuse");
+			std::fflush(stdout);
+		}
+		return r;
+	}();
+	if (!on) {
+		return;
+	}
+	THREAD_POWER_THROTTLING_STATE throttling {};
+	throttling.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+	throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+	throttling.StateMask   = 0;
+	(void)SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling, sizeof(throttling));
+#endif
+}
+
 bool YieldToReadyThread() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return SwitchToThread() != 0;
