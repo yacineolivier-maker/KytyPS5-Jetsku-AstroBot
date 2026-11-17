@@ -1,6 +1,7 @@
 ﻿#include "graphics/presentation/window.h"
 
 #include "common/assert.h"
+#include "graphics/presentation/fluidityLog.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -523,6 +524,11 @@ void WindowContext::ProcessEvent(double time_s) {
 			case SDLK_F7:
 				if (pressed) {
 					HostInputToggleMouseToJoystick();
+				}
+				return;
+			case SDLK_F9:
+				if (pressed) {
+					FluidityMark();
 				}
 				return;
 			case SDLK_F8:

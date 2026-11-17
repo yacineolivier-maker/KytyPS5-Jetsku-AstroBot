@@ -2,6 +2,7 @@
 
 #include "common/archive.h"
 #include "common/assert.h"
+#include "graphics/presentation/fluidityLog.h"
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/debugCounters.h"
@@ -438,6 +439,8 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+
+	Libs::Graphics::FluidityNoteOpen(path);
 
 	auto flags_u = static_cast<uint32_t>(flags);
 

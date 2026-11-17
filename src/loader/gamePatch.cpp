@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
+#include "graphics/presentation/fluidityLog.h"
 #include "loader/elf.h"
 #include "loader/gamePatchFilter.h"
 #include "loader/runtimeLinker.h"
@@ -345,6 +346,7 @@ void ApplyBuiltin(Program* main_program) {
 	if (main_program == nullptr || main_program->elf == nullptr || main_program->elf->IsShared()) {
 		return;
 	}
+	Libs::Graphics::FluiditySetEbootBase(main_program->base_vaddr); // KYTY_FLUIDITE camera
 	// KYTY_ASTRO_CB_SCALE=<1-4> (default 2; 1 = off): Astro Bot (PPSA21567 01.018.000) sizes its
 	// five draw threads' command buffers {7, 7, 4, 4, 6} MiB (table at 0x8491510, read by
 	// sub_4A38C0); running out is its "too many objects/batches in this scene" assert (Bug C). In

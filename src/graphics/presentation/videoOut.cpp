@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "graphics/presentation/fluidityLog.h"
 #include "common/common.h"
 #include "common/cpuPlacement.h"
 #include "common/debugCounters.h"
@@ -1417,6 +1418,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	if (due) {
 		if (requests[0].cfg->bus == 0) {
 			Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
+			Graphics::FluidityRecordFlip();
 		}
 		if (present_unlocked) {
 			for (size_t i = count; i != 0; i--) {

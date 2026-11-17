@@ -5,6 +5,7 @@
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
+#include "graphics/presentation/fluidityLog.h"
 #include "common/emulatorConfig.h"
 #include "common/hostInputTrace.h"
 #include "common/logging/log.h"
@@ -726,6 +727,9 @@ int PollGamepadTouchPad(uint64_t now_ms) {
 } // namespace
 
 void HostInputPadButton(int id, int button, bool down) {
+	if (button == SDL_GAMEPAD_BUTTON_LEFT_STICK || button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) {
+		FluidityNotePadButton(id, button == SDL_GAMEPAD_BUTTON_LEFT_STICK, down);
+	}
 	const auto  source = InputMap::SourceFromButton(button);
 	const auto& map    = GetInputMap();
 	ApplyPadControl(id, map.PadControl(source), source, down);
