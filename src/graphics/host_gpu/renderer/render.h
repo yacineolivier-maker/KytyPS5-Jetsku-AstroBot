@@ -373,6 +373,11 @@ public:
 	// buffer (a descriptor refers to an upload made for this command, KYTY_PUSH_SHADOW_FRESH_SKIP):
 	// recorded without the comparison and without keeping a copy for the next one.
 	static constexpr int32_t PushMissFresh = -4;
+	// Astro Bot PC (KYTY_PUSH_DELTA=1, default off): every update is compared, per binding and array
+	// element, with the descriptors still in effect (pushed earlier in this command buffer with the
+	// same layout, nothing disturbing them since), and only the differing elements are recorded
+	// (contiguous runs, one write each). `known_miss` is then ignored. Vulkan: a pushed descriptor
+	// stays in effect "until the descriptor is overwritten, or else until the set is disturbed".
 	int32_t PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
 	                        uint32_t count, const vk::WriteDescriptorSet* writes,
 	                        bool known_miss = false);
@@ -490,7 +495,23 @@ private:
 		std::vector<vk::WriteDescriptorSet> writes;
 		std::vector<vk::DescriptorBufferInfo> buffers;
 		std::vector<vk::DescriptorImageInfo> images;
+		// Astro Bot PC (KYTY_PUSH_DELTA=1): the descriptors in effect at the bind point since the
+		// first push with `delta_layout`, per binding and array element (an element is known when
+		// its binding has `delta_generation` and its flag is set). Null layout: nothing is known.
+		struct DeltaBinding {
+			uint64_t                              generation = 0;
+			vk::DescriptorType                    type {};
+			std::vector<vk::DescriptorBufferInfo> buffers;
+			std::vector<vk::DescriptorImageInfo>  images;
+			std::vector<uint8_t>                  known;
+		};
+		vk::PipelineLayout                  delta_layout     = nullptr;
+		uint64_t                            delta_generation = 0;
+		std::vector<DeltaBinding>           delta_bindings;
+		std::vector<vk::WriteDescriptorSet> delta_writes;
 	};
+	int32_t PushDescriptorsDelta(vk::PipelineBindPoint point, vk::PipelineLayout layout,
+	                             uint32_t set, uint32_t count, const vk::WriteDescriptorSet* writes);
 	std::array<DescriptorState, 2> m_descriptor_states;
 	std::array<uint64_t, 2>        m_descriptor_epochs {};
 	struct PushConstantShadow {

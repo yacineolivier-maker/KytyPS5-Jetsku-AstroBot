@@ -1249,6 +1249,11 @@ enum class FrameEvent : uint32_t {
 	VariantPlanSkips,
 	// KYTY_BDA_STORE_LOG: stores a BDA-writing dispatch logged for pages without a cache buffer.
 	BdaLoggedStores,
+	// Astro Bot PC (KYTY_PUSH_DELTA): descriptors (buffer/image/sampler infos) recorded by
+	// push-descriptor updates in delta mode, and those left out because the same descriptor was
+	// still in effect.
+	DescriptorPushDeltaInfos,
+	DescriptorPushDeltaInfosAvoided,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

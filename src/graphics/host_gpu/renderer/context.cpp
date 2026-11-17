@@ -138,6 +138,13 @@ bool PushConstantShadowEnabled() {
 	return enabled;
 }
 
+// Astro Bot PC (KYTY_PUSH_DELTA=1, default off): push only the descriptors that differ from those
+// still in effect (CommandBuffer::PushDescriptorsDelta).
+static bool PushDeltaEnabled() {
+	static const bool enabled = EnvSwitch("KYTY_PUSH_DELTA", false);
+	return enabled;
+}
+
 bool DescriptorSetReuseEnabled() {
 	static const bool enabled = EnvSwitch("KYTY_DESCRIPTOR_SET_REUSE", true);
 	return enabled;
@@ -702,8 +709,9 @@ void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	m_bound_pipelines = {};
 	for (auto& state: m_descriptor_states) {
-		state.layout    = nullptr;
-		state.bound_set = nullptr;
+		state.layout       = nullptr;
+		state.bound_set    = nullptr;
+		state.delta_layout = nullptr; // KYTY_PUSH_DELTA: push descriptors are undefined here
 	}
 	for (auto& epoch: m_descriptor_epochs) {
 		epoch++;
@@ -763,9 +771,10 @@ void CommandBuffer::BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipel
 }
 
 void CommandBuffer::InvalidateDescriptors(vk::PipelineBindPoint point) {
-	auto& state     = m_descriptor_states[BindingPointIndex(point)];
-	state.layout    = nullptr;
-	state.bound_set = nullptr;
+	auto& state        = m_descriptor_states[BindingPointIndex(point)];
+	state.layout       = nullptr;
+	state.bound_set    = nullptr;
+	state.delta_layout = nullptr;
 	m_descriptor_epochs[BindingPointIndex(point)]++;
 }
 
@@ -782,6 +791,8 @@ void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineL
 	}
 	StateSink().bindDescriptorSets(point, layout, 0, 1, &set, 0, nullptr);
 	m_descriptor_epochs[BindingPointIndex(point)]++;
+	// KYTY_PUSH_DELTA: the bound set replaces the pushed descriptors.
+	state.delta_layout = nullptr;
 	state.layout    = DescriptorSetReuseEnabled() ? layout : nullptr;
 	state.bound_set = DescriptorSetReuseEnabled() ? set : nullptr;
 	state.writes.clear();
@@ -814,6 +825,9 @@ void CommandBuffer::PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlag
 int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout,
                                        uint32_t set, uint32_t count,
                                        const vk::WriteDescriptorSet* writes, bool known_miss) {
+	if (PushDeltaEnabled()) {
+		return PushDescriptorsDelta(point, layout, set, count, writes);
+	}
 	auto& state = m_descriptor_states[BindingPointIndex(point)];
 	if (known_miss) {
 		// The comparison below could only miss. No copy is kept for the next update either: one
@@ -895,6 +909,140 @@ int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::Pipeline
 		write.pImageInfo = nullptr;
 	}
 	state.layout = layout;
+	return result;
+}
+
+// KYTY_PUSH_DELTA: the update records only the elements that differ from the descriptors in
+// effect. Those are known per binding and element since the first push with this layout at the bind
+// point: Begin(), InvalidateDescriptors() and BindDescriptorSet() forget them (every descriptor
+// command goes through this class), and a push with another layout starts over (push descriptors
+// with another set layout make all of them undefined; layouts are interned, so equal pipeline
+// layouts have equal set layouts, and different ones are treated as different). Binding a pipeline
+// disturbs no descriptor. Handles are compared: objects a descriptor refers to are destroyed only
+// after the tick that could use them completes, so within a command buffer equal handles denote
+// the same objects (as for the whole-update comparison above).
+int32_t CommandBuffer::PushDescriptorsDelta(vk::PipelineBindPoint point, vk::PipelineLayout layout,
+                                            uint32_t set, uint32_t count,
+                                            const vk::WriteDescriptorSet* writes) {
+	const auto index = BindingPointIndex(point);
+	auto&      state = m_descriptor_states[index];
+	const auto is_buffer_type = [](vk::DescriptorType type) {
+		return type == vk::DescriptorType::eStorageBuffer || type == vk::DescriptorType::eUniformBuffer;
+	};
+	const auto is_image_type = [](vk::DescriptorType type) {
+		return type == vk::DescriptorType::eSampler || type == vk::DescriptorType::eSampledImage ||
+		       type == vk::DescriptorType::eStorageImage ||
+		       type == vk::DescriptorType::eCombinedImageSampler;
+	};
+	bool supported = set == 0;
+	for (uint32_t i = 0; supported && i < count; ++i) {
+		const auto& write = writes[i];
+		supported = write.pNext == nullptr && write.pTexelBufferView == nullptr &&
+		            write.dstBinding < 4096u && write.dstArrayElement < 65536u &&
+		            write.descriptorCount < 65536u &&
+		            (write.descriptorCount == 0 ||
+		             (is_buffer_type(write.descriptorType) && write.pBufferInfo != nullptr) ||
+		             (is_image_type(write.descriptorType) && write.pImageInfo != nullptr));
+	}
+	// The whole-update shadow is not used in this mode; after a push, no set is bound at set 0.
+	state.layout    = nullptr;
+	state.bound_set = nullptr;
+	if (!supported) {
+		StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
+		m_descriptor_epochs[index]++;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
+		state.delta_layout = nullptr;
+		return PushMissState;
+	}
+	const bool comparable = state.delta_layout != nullptr && state.delta_layout == layout;
+	if (!comparable) {
+		state.delta_generation++;
+		state.delta_layout = layout;
+	}
+	const auto generation = state.delta_generation;
+	auto&      delta      = state.delta_writes;
+	delta.clear();
+	int32_t  result = comparable ? PushAvoided : PushMissState;
+	uint64_t total  = 0;
+	uint64_t pushed = 0;
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto& write = writes[i];
+		if (write.descriptorCount == 0) {
+			continue;
+		}
+		if (state.delta_bindings.size() <= write.dstBinding) {
+			state.delta_bindings.resize(write.dstBinding + 1u);
+		}
+		auto&      binding = state.delta_bindings[write.dstBinding];
+		const bool buffer  = is_buffer_type(write.descriptorType);
+		const auto end     = write.dstArrayElement + write.descriptorCount;
+		if (binding.generation != generation || binding.type != write.descriptorType) {
+			binding.generation = generation;
+			binding.type       = write.descriptorType;
+			binding.known.assign(end, 0);
+		} else if (binding.known.size() < end) {
+			binding.known.resize(end, 0);
+		}
+		if (buffer && binding.buffers.size() < end) {
+			binding.buffers.resize(end);
+		} else if (!buffer && binding.images.size() < end) {
+			binding.images.resize(end);
+		}
+		total += write.descriptorCount;
+		bool     differs_any = false;
+		uint32_t run_start   = UINT32_MAX;
+		for (uint32_t j = 0; j <= write.descriptorCount; ++j) {
+			bool differs = false;
+			if (j < write.descriptorCount) {
+				const auto element = write.dstArrayElement + j;
+				if (buffer) {
+					differs = binding.known[element] == 0 ||
+					          !(binding.buffers[element] == write.pBufferInfo[j]);
+					if (differs) binding.buffers[element] = write.pBufferInfo[j];
+				} else {
+					differs = binding.known[element] == 0 ||
+					          !(binding.images[element] == write.pImageInfo[j]);
+					if (differs) binding.images[element] = write.pImageInfo[j];
+				}
+				binding.known[element] = 1;
+			}
+			if (differs && run_start == UINT32_MAX) {
+				run_start = j;
+			} else if (!differs && run_start != UINT32_MAX) {
+				auto run            = write;
+				run.dstArrayElement = write.dstArrayElement + run_start;
+				run.descriptorCount = j - run_start;
+				if (buffer) {
+					run.pImageInfo  = nullptr;
+					run.pBufferInfo = write.pBufferInfo + run_start;
+				} else {
+					run.pBufferInfo = nullptr;
+					run.pImageInfo  = write.pImageInfo + run_start;
+				}
+				delta.push_back(run);
+				pushed += run.descriptorCount;
+				run_start   = UINT32_MAX;
+				differs_any = true;
+			}
+		}
+		if (differs_any && result == PushAvoided) {
+			result = static_cast<int32_t>(i);
+		}
+	}
+	if (delta.empty()) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushesAvoided);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushDeltaInfosAvoided, total);
+		return PushAvoided;
+	}
+	StateSink().pushDescriptorSetKHR(point, layout, set, static_cast<uint32_t>(delta.size()),
+	                                 delta.data());
+	m_descriptor_epochs[index]++;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushDeltaInfos, pushed);
+	if (total > pushed) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushDeltaInfosAvoided,
+		                          total - pushed);
+	}
 	return result;
 }
 
