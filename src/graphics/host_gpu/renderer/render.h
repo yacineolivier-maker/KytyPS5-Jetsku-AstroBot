@@ -1510,6 +1510,7 @@ private:
 		const void*       vertex_program   = nullptr;
 		const void*       pixel_program    = nullptr;
 		bool              ps_active        = false;
+		bool              mesh             = false; // KYTY_DRAW_RUN_MESH: a mesh program's record
 		uint32_t          color_count      = 0;
 		uint32_t          color_slots      = 0;
 		RenderState       rendering;
@@ -1676,6 +1677,10 @@ private:
 	uint32_t      m_mrt_filter         = ~0u;
 	bool          m_mrt_split_allowed  = false;
 	uint32_t      m_mrt_split_slots    = 0;
+	// Astro Bot PC - KYTY_MRT_SPLIT_REUSE (renderDraw.cpp): the second pass keeps the first pass's
+	// program preparation (set only around that pass), and the first pass's pixel-shader activity.
+	bool          m_mrt_reuse_programs = false;
+	bool          m_mrt_reuse_ps       = false;
 
 	friend class CommandProcessor;
 	friend class DrawPrep::Engine;

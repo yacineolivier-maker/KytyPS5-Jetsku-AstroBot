@@ -253,6 +253,22 @@ extern Live::Switch g_pipeswap;      // KYTY_DRAW_RUN_PIPESWAP
 // which used to take the whole serial path and end the run for the draw after it.
 // KYTY_DRAW_RUN_INDIRECT=0: an indirect draw is never a commit and ends the run.
 [[nodiscard]] bool IndirectRunsEnabled();
+// Astro Bot PC - KYTY_DRAW_RUN_MESH=1 (read once at start-up, default 0 = off; with KYTY_DRAW_RUN=1
+// or verify): a direct mesh-shader draw (not indirect, not KYTY_NATIVE_INDIRECT_MESH) may seed and
+// continue a run like a vertex draw. Pirate Island issues 330-410 mesh draws per frame, 80-160 of
+// them right after a mesh draw of the same pipeline in the same pass; every one used to take the
+// whole start path (Inelig::Mesh, renderDraw.cpp record eligibility). What a continuation skips
+// (targets, textures, samplers, views, acquisition, transitions, dynamic state) is a function of the
+// structure key, the run certificate and the image state, as for a vertex draw; everything a mesh
+// draw does per draw still runs on both paths: the dispatch segments (counts, primitive restart),
+// the index range's registration for the shader's address reads, the bindings and BDA, the pipeline
+// lookup, the draw dwords and the dispatches. Guards: a record remembers whether its program is a
+// mesh program and is continued (plainly, by recall or by a pipeline swap) only by a draw of the same
+// kind; a mesh indirect draw that would continue a run (its argument conversion ends the rendering
+// instance) falls back late to the normal path. Verify mode (KYTY_DRAW_RUN=verify) compares
+// would-be mesh continuations like any other. One console line every 10 s while on:
+// "DrawRun mesh 10s: ...". Unset or 0: mesh draws never form runs (the behaviour before it).
+[[nodiscard]] bool MeshRunsEnabled();
 // KYTY_DRAW_RUN_QUIET_SYNTHETIC (live, default on; needs KYTY_DRAW_RUN_QUIET_OPS): with
 // KYTY_GPU_OCCLUSION=0 an occlusion dump is a CPU write of an always-visible result (and
 // NoteCpWrite), which is what a quiet CPU WRITE_DATA does, so it does not end a run either. Ape
@@ -313,6 +329,12 @@ struct Totals {
 	std::atomic<uint64_t> verify_checks {0};
 	std::atomic<uint64_t> verify_mismatches {0};
 	std::atomic<uint64_t> misses[static_cast<uint32_t>(Miss::Count)] {};
+	// KYTY_DRAW_RUN_MESH (Astro Bot PC): mesh draws recorded, mesh continuations (verify: would-be),
+	// mesh indirect draws that would have continued and fell back, candidates of the other kind.
+	std::atomic<uint64_t> mesh_records {0};
+	std::atomic<uint64_t> mesh_continued {0};
+	std::atomic<uint64_t> mesh_indirect_fallbacks {0};
+	std::atomic<uint64_t> mesh_kind_refused {0};
 };
 [[nodiscard]] Totals& GetTotals();
 

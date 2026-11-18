@@ -158,6 +158,14 @@ bool IndirectRunsEnabled() {
 	return enabled;
 }
 
+bool MeshRunsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_RUN_MESH");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 uint64_t ActivityEpoch() noexcept {
 	return g_activity.load(std::memory_order_relaxed);
 }
@@ -555,6 +563,21 @@ void PrintSummary() {
 	            delta[9], delta[10], delta[11], delta[12], delta[13], delta[14], delta[15], delta[16],
 	            delta[17], delta[18], delta[19], delta[20], delta[21], delta[22], delta[23], delta[24],
 	            delta[25], delta[26]);
+	if (MeshRunsEnabled()) {
+		// Astro Bot PC (KYTY_DRAW_RUN_MESH): its own line, so the line above stays as it was.
+		static std::array<uint64_t, 4> mesh_last {};
+		const std::array<uint64_t, 4>  mesh_values {
+            g_totals.mesh_records.load(std::memory_order_relaxed),
+            g_totals.mesh_continued.load(std::memory_order_relaxed),
+            g_totals.mesh_indirect_fallbacks.load(std::memory_order_relaxed),
+            g_totals.mesh_kind_refused.load(std::memory_order_relaxed)};
+		std::printf("DrawRun mesh %.0fs: %" PRIu64 " records, %" PRIu64 " continued, %" PRIu64
+		            " indirect fallbacks, %" PRIu64 " other-kind candidates refused\n",
+		            static_cast<double>(now - last_ns) * 1e-9, mesh_values[0] - mesh_last[0],
+		            mesh_values[1] - mesh_last[1], mesh_values[2] - mesh_last[2],
+		            mesh_values[3] - mesh_last[3]);
+		mesh_last = mesh_values;
+	}
 	std::fflush(stdout);
 	if (KeyDiagEnabled()) {
 		PrintKeyDiag(static_cast<double>(now - last_ns) * 1e-9);

@@ -2068,13 +2068,121 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	    state.stage_preps);
 }
 
+// Astro Bot PC - KYTY_MRT_SPLIT_REUSE (read once at start-up; default 0 = off; 1 on; verify). The
+// second pass of an MRT split draw (KYTY_MRT_SPLIT, DrawIndex/DrawAuto) is the same guest draw: the
+// same registers, programs and resource words, nothing else ran on the command processor in between.
+// Its RefreshShaders found no preparation left (the first pass took it) and prepared both programs
+// again on the serial path (GetGraphicsPrograms: program keys, SRT materialization, permutations),
+// a function of those registers and of guest memory the first pass already read for this draw. With
+// the switch the second pass keeps the first pass's programs, stage runtimes and resource snapshots
+// (still in the draw state: the first pass's execution only reads them) when the first pass prepared
+// a single vertex stage and the pixel shader's activity is the same; everything else of the second
+// pass (targets of its slots, bindings, uploads, pipeline, acquisition, descriptors, the draw) is
+// unchanged. Its preparation stays "not validated" (no run record), as before. verify: the serial
+// preparation runs anyway and its programs, permutations and resource words must be the kept ones
+// (differences counted and the first 16 logged; the serial result is used).
+static int MrtSplitReuseMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_MRT_SPLIT_REUSE");
+		if (value == nullptr) {
+			return 0;
+		}
+		if (std::strcmp(value, "1") == 0) {
+			return 1;
+		}
+		return std::strcmp(value, "verify") == 0 ? 2 : 0;
+	}();
+	return mode;
+}
+
+static std::atomic<uint64_t> g_mrt_reuse_kept {0};       // second passes that kept the programs
+static std::atomic<uint64_t> g_mrt_reuse_checks {0};     // verify: comparisons
+static std::atomic<uint64_t> g_mrt_reuse_mismatches {0}; // verify: differences
+
+// KYTY_MRT_SPLIT_REUSE=verify: the kept preparation against the serial one just computed.
+struct MrtReuseSnapshot {
+	const void*                                       vertex_program = nullptr;
+	const void*                                       pixel_program  = nullptr;
+	const void*                                       vertex_perm    = nullptr;
+	const void*                                       pixel_perm     = nullptr;
+	std::array<ShaderRecompiler::IR::ResourceSnapshot, 2> resources;
+};
+
+static void MrtReuseSave(const DrawRenderState& state, MrtReuseSnapshot& saved) {
+	saved.vertex_program = state.vertex_info[0].stage.program;
+	saved.pixel_program  = state.ps_active ? state.ps_input_info.stage.program : nullptr;
+	saved.vertex_perm    = state.stage_preps.vertex[0].permutation;
+	saved.pixel_perm     = state.ps_active ? state.stage_preps.pixel.permutation : nullptr;
+	if (state.vertex_info[0].stage.resources != nullptr) {
+		saved.resources[0] = *state.vertex_info[0].stage.resources;
+	}
+	if (state.ps_active && state.ps_input_info.stage.resources != nullptr) {
+		saved.resources[1] = *state.ps_input_info.stage.resources;
+	}
+}
+
+static void MrtReuseCompare(const DrawRenderState& state, const MrtReuseSnapshot& saved) {
+	g_mrt_reuse_checks.fetch_add(1, std::memory_order_relaxed);
+	const auto same_snapshot = [](const ShaderRecompiler::IR::ResourceSnapshot* a,
+	                              const ShaderRecompiler::IR::ResourceSnapshot& b) {
+		if (a == nullptr) {
+			return b.buffers.empty() && b.images.empty() && b.samplers.empty() &&
+			       b.flattened_srt.empty() && b.user_data.empty();
+		}
+		return std::ranges::equal(a->buffers, b.buffers) && std::ranges::equal(a->images, b.images) &&
+		       std::ranges::equal(a->samplers, b.samplers) && a->flattened_srt == b.flattened_srt &&
+		       a->user_data == b.user_data;
+	};
+	const char* what = nullptr;
+	if (state.vertex_info[0].stage.program != saved.vertex_program ||
+	    (state.ps_active ? state.ps_input_info.stage.program : nullptr) != saved.pixel_program) {
+		what = "program";
+	} else if (state.stage_preps.vertex[0].permutation != saved.vertex_perm ||
+	           (state.ps_active ? state.stage_preps.pixel.permutation : nullptr) != saved.pixel_perm) {
+		what = "permutation";
+	} else if (state.vertex_stages_written != 1u ||
+	           !same_snapshot(state.vertex_info[0].stage.resources, saved.resources[0]) ||
+	           (state.ps_active && !same_snapshot(state.ps_input_info.stage.resources, saved.resources[1]))) {
+		what = "resource words";
+	}
+	if (what != nullptr) {
+		const auto n = g_mrt_reuse_mismatches.fetch_add(1, std::memory_order_relaxed);
+		if (n < 16) {
+			std::printf("MrtSplitReuseVerify: the second pass's serial preparation differs from the kept "
+			            "one (%s; %" PRIu64 " so far)\n",
+			            what, n + 1);
+			std::fflush(stdout);
+		}
+	}
+}
+
+// KYTY_MRT_SPLIT_REUSE: whether the first pass left a preparation the second pass may keep (a single
+// vertex stage with its runtime, and the pixel stage's when it was active).
+static bool MrtSplitReuseCandidate(const DrawRenderState& state) {
+	return MrtSplitReuseMode() != 0 && state.vertex_stages_written == 1u && state.programs.vertex[0] &&
+	       !state.programs.vertex[1] && static_cast<bool>(state.vertex_info[0].stage) &&
+	       (!state.ps_active || (state.programs.pixel && static_cast<bool>(state.ps_input_info.stage)));
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	state.ps_active = DrawHasActivePixelShader(buffer);
 	CommitStats::StepMark(CommitStats::Step::PsActive);
-	{
+	// KYTY_MRT_SPLIT_REUSE: an MRT split's second pass with the first pass's preparation in `state`.
+	const bool reuse_programs = m_mrt_reuse_programs && state.ps_active == m_mrt_reuse_ps;
+	if (reuse_programs && MrtSplitReuseMode() == 1) {
+		g_mrt_reuse_kept.fetch_add(1, std::memory_order_relaxed);
+	} else if (reuse_programs) {
+		auto saved = std::make_unique<MrtReuseSnapshot>();
+		MrtReuseSave(state, *saved);
+		{
+			KYTY_PROFILER_DETAIL_BLOCK("Draw::RefreshShaders");
+			RefreshShaders(buffer, draw, state);
+		}
+		MrtReuseCompare(state, *saved);
+	} else {
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::RefreshShaders");
 		RefreshShaders(buffer, draw, state);
 	}
@@ -2221,6 +2329,15 @@ static void NoteMrtSplit(uint32_t slots) {
 		std::printf("MRT split: draw #%llu runs a second pass for colour slots 0x%x (one surface bound "
 		            "to several slots)\n",
 		            static_cast<unsigned long long>(n), slots);
+		if (MrtSplitReuseMode() != 0) {
+			// Astro Bot PC (KYTY_MRT_SPLIT_REUSE): counts so far (before this draw's second pass).
+			std::printf("MRT split reuse: %llu second passes kept the programs, verify %llu checks, "
+			            "%llu mismatches\n",
+			            static_cast<unsigned long long>(g_mrt_reuse_kept.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(g_mrt_reuse_checks.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(
+			                g_mrt_reuse_mismatches.load(std::memory_order_relaxed)));
+		}
 	}
 }
 // The draw's colour and depth target resolution (PrepareDrawRenderState; a KYTY_DRAW_RUN
@@ -2902,6 +3019,13 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 		DrawRun::CountMiss(Miss::Programs);
 		return false;
 	}
+	// KYTY_DRAW_RUN_MESH: a mesh record is continued only by a mesh draw, a vertex record only by a
+	// vertex draw (a pipeline swap could otherwise cross the two kinds).
+	if (DrawRun::MeshRunsEnabled() &&
+	    (state.vertex_info[0].stage.program->stage == ShaderType::Mesh) != m_run.mesh) {
+		OwnedCounters::Add(totals.mesh_kind_refused, 1);
+		return false;
+	}
 	bool swap_writes = false;
 	if (pipeswap) {
 		const auto* recorded = static_cast<const ShaderRecompiler::IR::CompiledShaderInfo*>(
@@ -3065,6 +3189,12 @@ bool RenderExecutor::DrawRunRecallCandidate(const CommandBuffer& buffer, DrawRen
 	    state.vertex_stages_written != 1 ||
 	    state.vertex_info[0].stage.program != record.vertex_program || pixel != record.pixel_program ||
 	    (state.ps_active && !m_graphics_bindings.pixel.has_value())) {
+		return false;
+	}
+	// KYTY_DRAW_RUN_MESH: only a record of the draw's own kind (same program, so this is a safeguard).
+	if (DrawRun::MeshRunsEnabled() &&
+	    (state.vertex_info[0].stage.program->stage == ShaderType::Mesh) != record.mesh) {
+		OwnedCounters::Add(totals.mesh_kind_refused, 1);
 		return false;
 	}
 	const auto vertex_textures = std::span(record.recall_textures).first(record.recall_vertex_textures);
@@ -3274,6 +3404,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 			run.vertex_program = state.vertex_info[0].stage.program;
 			run.push_valid     = pipeline.uses_push_descriptors;
 			run.push_layout    = pipeline.pipeline_layout;
+			run.mesh           = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 		}
 		run.valid = true;
 		return;
@@ -3284,6 +3415,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	run.vertex_program = state.vertex_info[0].stage.program;
 	run.pixel_program  = state.ps_active ? state.ps_input_info.stage.program : nullptr;
 	run.ps_active      = state.ps_active;
+	run.mesh           = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	run.color_count    = state.color_count;
 	run.color_slots    = state.color_slots_written;
 	run.rendering      = rendering;
@@ -5346,8 +5478,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// bindings, which are made again after it (their reservations follow the image identities).
 	// KYTY_DRAW_RUN_INDIRECT: an indirect continuation also needs the argument barrier of this
 	// rendering instance (recording one ends rendering, which a continuation never does).
+	// KYTY_DRAW_RUN_MESH: a mesh indirect draw's argument conversion (below) ends the rendering
+	// instance, which a continuation never does: it takes the normal path (as for the barrier).
+	const bool run_mesh_indirect = mesh_indirect && DrawRun::MeshRunsEnabled();
+	if (run_mesh_indirect && m_run_active) {
+		OwnedCounters::Add(DrawRun::GetTotals().mesh_indirect_fallbacks, 1);
+	}
 	const bool run_indirect_barrier =
-	    indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering;
+	    (indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering) ||
+	    run_mesh_indirect;
 	// KYTY_DRAW_RUN_TARGETS: kept targets whose attachments changed during the buffer work are
 	// resolved now, with the same repeated binding work as a continuation's fallback.
 	const bool targets_late = m_run_targets_kept &&
@@ -6005,8 +6144,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		};
 		// KYTY_DRAW_RUN_WRITES: buffer writes (shader_write_stages only ever holds those) may seed a run.
 		const bool writes_ok = DrawRun::WritesEnabled();
+		// KYTY_DRAW_RUN_MESH: a direct mesh draw (no indirect arguments, no argument conversion).
+		const bool mesh_ok = !mesh_active || (DrawRun::MeshRunsEnabled() && indirect == nullptr &&
+		                                      !mesh_indirect);
 		bool eligible = m_in_engine_commit && m_prepared_validated && m_run_key != 0 &&
-		                !mesh_active &&
+		                mesh_ok &&
 		                (indirect == nullptr || DrawRun::IndirectRunsEnabled()) &&
 		                vertex_stages.size() == 1 &&
 		                (!shader_write_stages || writes_ok) && !feedback_aspects &&
@@ -6065,7 +6207,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				reason = !m_in_engine_commit                                          ? Inelig::NotEngine
 				         : !m_prepared_validated                                      ? Inelig::NotValidated
 				         : m_run_key == 0                                             ? Inelig::NoKey
-				         : mesh_active                                                ? Inelig::Mesh
+				         : !mesh_ok                                                   ? Inelig::Mesh
 				         : (indirect != nullptr && !DrawRun::IndirectRunsEnabled())   ? Inelig::Indirect
 				         : vertex_stages.size() != 1                                  ? Inelig::VertexStages
 				         : (shader_write_stages && !writes_ok)                        ? Inelig::Writes
@@ -6122,6 +6264,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				OwnedCounters::Add(DrawRun::GetTotals().write_records, 1);
 			}
 			const bool continued = m_run_active;
+			if (mesh_active) {
+				// KYTY_DRAW_RUN_MESH (only then does a mesh draw get here).
+				OwnedCounters::Add(DrawRun::GetTotals().mesh_records, 1);
+				if (continued || m_run_verify) {
+					OwnedCounters::Add(DrawRun::GetTotals().mesh_continued, 1);
+				}
+			}
 			DrawRunRecordDraw(buffer, state, m_run_slice_offset, rendering, stages,
 			                  bounded ? &written : nullptr, pipeline);
 			// A continuation keeps its record's programs (DrawRunCandidate), so the flag holds.
@@ -6387,12 +6536,21 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		NoteMrtSplit(split);
 		m_run.valid = false;
 		BeginDrawRun();
+		// KYTY_MRT_SPLIT_REUSE: the first pass's preparation stays in `state` (Reset keeps it).
+		const bool reuse    = MrtSplitReuseCandidate(state);
+		const bool reuse_ps = state.ps_active;
 		state.Reset();
+		if (reuse) {
+			state.vertex_stages_written = 1u; // RefreshShaders' value for a single vertex stage
+			m_mrt_reuse_programs        = true;
+			m_mrt_reuse_ps              = reuse_ps;
+		}
 		m_mrt_filter = split;
 		if (PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 			ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 			                    primitive_restart);
 		}
+		m_mrt_reuse_programs = false;
 		m_mrt_filter = ~0u;
 		ResetBindings();
 		m_run.valid = false;
@@ -6547,11 +6705,20 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		NoteMrtSplit(split);
 		m_run.valid = false;
 		BeginDrawRun();
+		// KYTY_MRT_SPLIT_REUSE: the first pass's preparation stays in `state` (Reset keeps it).
+		const bool reuse    = MrtSplitReuseCandidate(state);
+		const bool reuse_ps = state.ps_active;
 		state.Reset();
+		if (reuse) {
+			state.vertex_stages_written = 1u; // RefreshShaders' value for a single vertex stage
+			m_mrt_reuse_programs        = true;
+			m_mrt_reuse_ps              = reuse_ps;
+		}
 		m_mrt_filter = split;
 		if (PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 			ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
 		}
+		m_mrt_reuse_programs = false;
 		m_mrt_filter = ~0u;
 		ResetBindings();
 		m_run.valid = false;
