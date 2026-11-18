@@ -778,6 +778,11 @@ namespace {
 // "boucle" (what follows repeats until the file changes). Keys: W A S D (left stick), F H T G (right stick),
 // J=Cross K=Square I=Triangle L=Circle Q=L1 E=R1 Z=L2 C=R2 ENTREE=Options. The file is re-read when it
 // changes (a new script replaces the current one at once); an empty or missing file releases everything.
+// v2 (18/11): "aller <x> <z> [tolerance=0.05] [max_ms=20000]" steers the left stick toward the camera
+// position (x, z), read from KYTY_FLUIDITE_CAMERA (FluidityCamera), until the camera is within
+// `tolerance`: a return to a recorded place that does not depend on the timing of a replay. The camera
+// trails the character, so the target is a camera position as recorded in trace.csv / journal.csv.
+// "tenir <ms>" then stays on that target. A script without "boucle" now runs once (v1 restarted it).
 class PadScript {
 public:
 	void Start() {
@@ -801,10 +806,113 @@ public:
 
 private:
 	struct Step {
-		int      kind = 0; // 0 wait, 1 hold
+		int      kind = 0; // 0 wait, 1 hold, 2 go to a camera position
 		uint32_t keys = 0; // bit per key index
 		uint32_t ms   = 0;
+		float    x = 0, z = 0, tolerance = 0.05f;
 	};
+
+	static void ApplyStick(float side, float forward) {
+		const int  id    = Controller::HOST_INPUT_CONTROLLER_ID;
+		const auto clamp = [](float v) { return std::clamp(static_cast<int>(128.0f + v * 127.0f), 0, 255); };
+		Controller::SetAxis(id, Controller::Axis::LeftX, clamp(side));
+		Controller::SetAxis(id, Controller::Axis::LeftY, clamp(-forward)); // up = 0
+	}
+
+	// "aller": false if the file changed or the driver stops (true also on timeout, logged).
+	bool Go(const Step& s) {
+		m_target     = s;
+		m_has_target = true;
+		float pos[3] {}, dir[3] {};
+		if (!Libs::Graphics::FluidityCamera(pos, dir)) {
+			std::printf("Kyty pilote interne : aller %.3f %.3f impossible (camera non lue, KYTY_FLUIDITE_CAMERA)\n", s.x, s.z);
+			std::fflush(stdout);
+			return true;
+		}
+		m_active = true;
+		if (m_side == 0) {
+			// The stick's right is -(-fz, fx) in the camera's frame for Astro Bot (18/11: arrived at 0.051 30.214 for
+			// 0.05 30 with -1; a push-right calibration gave -1 then +1 and was dropped). KYTY_PAD_SIDE=1 flips it.
+			const char* side = std::getenv("KYTY_PAD_SIDE");
+			m_side           = side != nullptr && std::atoi(side) > 0 ? 1 : -1;
+		}
+		const auto start = std::chrono::steady_clock::now();
+		for (;;) {
+			if (!Libs::Graphics::FluidityCamera(pos, dir)) {
+				ApplyStick(0, 0);
+				return Sleep(50);
+			}
+			const float dx = s.x - pos[0], dz = s.z - pos[2];
+			const float dist = std::sqrt(dx * dx + dz * dz);
+			if (dist <= s.tolerance) {
+				break;
+			}
+			if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(s.ms)) {
+				std::printf("Kyty pilote interne : aller %.3f %.3f : delai depasse a %.3f\n", s.x, s.z, dist);
+				std::fflush(stdout);
+				break;
+			}
+			float fx = dir[0], fz = dir[2];
+			const float fl = std::sqrt(fx * fx + fz * fz);
+			if (fl < 1e-4f) {
+				fx = 0;
+				fz = 1;
+			} else {
+				fx /= fl;
+				fz /= fl;
+			}
+			const float nx = dx / dist, nz = dz / dist;
+			const float forward = nx * fx + nz * fz;
+			const float side    = static_cast<float>(m_side) * (-nx * fz + nz * fx);
+			// Slow down over the last 3 units (18/11: at full speed Astro ran past 0.05 30 and slid down to z 11).
+			const float speed = std::clamp(dist / 3.0f, 0.3f, 1.0f);
+			ApplyStick(side * speed, forward * speed);
+			if (!Sleep(50)) {
+				return false;
+			}
+		}
+		ApplyStick(0, 0);
+		float p2[3] {}, d2[3] {};
+		if (!m_quiet && Libs::Graphics::FluidityCamera(p2, d2)) {
+			std::printf("Kyty pilote interne : arrive a %.3f %.3f %.3f (cible %.3f %.3f)\n", p2[0], p2[1], p2[2], s.x, s.z);
+			std::fflush(stdout);
+		}
+		return true;
+	}
+
+	// "tenir <ms>": stays on the last "aller" target, steering back when the camera drifts past twice the
+	// tolerance (slopes, pushes); without a target, a plain wait.
+	bool Hold(uint32_t ms) {
+		if (!m_has_target) {
+			return Sleep(ms);
+		}
+		const auto end   = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+		uint32_t   backs = 0;
+		while (std::chrono::steady_clock::now() < end) {
+			float pos[3] {}, dir[3] {};
+			if (Libs::Graphics::FluidityCamera(pos, dir)) {
+				const float dx = m_target.x - pos[0], dz = m_target.z - pos[2];
+				if (std::sqrt(dx * dx + dz * dz) > 2.0f * m_target.tolerance) {
+					Step back = m_target;
+					back.ms   = 5000;
+					m_quiet   = true;
+					const bool ok = Go(back);
+					m_quiet       = false;
+					backs++;
+					if (!ok) {
+						return false;
+					}
+					continue;
+				}
+			}
+			if (!Sleep(100)) {
+				return false;
+			}
+		}
+		std::printf("Kyty pilote interne : tenir %u ms, %u retours sur la cible\n", ms, backs);
+		std::fflush(stdout);
+		return true;
+	}
 
 	static constexpr const char* KEYS[] = {"W", "A", "S", "D", "F", "H", "T", "G", "J", "K", "I", "L",
 	                                       "Q", "E", "Z", "C", "ENTREE"};
@@ -857,7 +965,7 @@ private:
 
 	void Load() {
 		m_steps.clear();
-		m_loop = 0;
+		m_loop = SIZE_MAX; // no "boucle": run once
 		std::ifstream in(m_path, std::ios::binary);
 		std::string   text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 		for (auto& c : text) {
@@ -899,6 +1007,26 @@ private:
 				}
 				s.kind = 1;
 				s.ms   = ms;
+			} else if (verb == "tenir") {
+				words >> ms;
+				s.kind = 3;
+				s.ms   = ms;
+				m_steps.push_back(s);
+				continue;
+			} else if (verb == "aller") {
+				float    x = 0, z = 0, tolerance = 0.05f;
+				uint32_t max_ms = 20000;
+				if (!(words >> x >> z)) {
+					continue;
+				}
+				words >> tolerance >> max_ms;
+				s.kind      = 2;
+				s.x         = x;
+				s.z         = z;
+				s.tolerance = tolerance > 0 ? tolerance : 0.05f;
+				s.ms        = max_ms;
+				m_steps.push_back(s);
+				continue;
 			} else {
 				continue;
 			}
@@ -907,7 +1035,8 @@ private:
 				m_steps.push_back(Step {0, 0, 30}); // short release between holds
 			}
 		}
-		std::printf("Kyty pilote interne : %zu etapes, boucle a partir de %zu\n", m_steps.size(), m_loop);
+		std::printf("Kyty pilote interne : %zu etapes, boucle a partir de %zd\n", m_steps.size(),
+		            m_loop == SIZE_MAX ? static_cast<ptrdiff_t>(-1) : static_cast<ptrdiff_t>(m_loop));
 		std::fflush(stdout);
 	}
 
@@ -951,6 +1080,12 @@ private:
 					i = m_loop;
 				}
 				const auto& s = m_steps[i++];
+				if (s.kind == 2 || s.kind == 3) {
+					if (!(s.kind == 2 ? Go(s) : Hold(s.ms))) {
+						break;
+					}
+					continue;
+				}
 				Apply(s.kind == 1 ? s.keys : 0);
 				m_active = true;
 				if (!Sleep(s.ms)) {
@@ -969,6 +1104,10 @@ private:
 	int64_t           m_stamp  = -1;
 	std::vector<Step> m_steps;
 	std::size_t       m_loop = 0;
+	int               m_side = 0; // "aller": stick side, -1 (KYTY_PAD_SIDE=1: +1)
+	Step              m_target {};
+	bool              m_has_target = false;
+	bool              m_quiet      = false;
 };
 
 PadScript g_pad_script;

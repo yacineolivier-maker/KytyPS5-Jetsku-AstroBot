@@ -1,5 +1,6 @@
 #include "graphics/presentation/fluidityLog.h"
 
+#include "common/cpuPlacement.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
@@ -31,6 +32,8 @@
 #endif
 #include <intrin.h>
 #include <windows.h>
+// windows.h first
+#include <tlhelp32.h>
 #endif
 
 // See fluidityLog.h. Nothing here runs unless KYTY_FLUIDITE=1.
@@ -76,6 +79,8 @@ struct Settings {
 	uint64_t    quota      = 1024ull << 20u;
 	bool        gpu_report = false; // KYTY_GPU_OP_PROFILE=demande
 	std::string camera;             // KYTY_FLUIDITE_CAMERA, see ReadCamera
+	std::string sampler;            // KYTY_FLUIDITE_ECHANT: echantillonneur.exe (v2, automatic stacks)
+	uint32_t    stacks = 6;         // KYTY_FLUIDITE_PILES: stack captures per session
 	std::string base;               // _Fluidite
 	std::string dir;                // _Fluidite\<date-time>
 };
@@ -97,6 +102,10 @@ const Settings& Config() {
 		if (const char* cam = std::getenv("KYTY_FLUIDITE_CAMERA"); cam != nullptr) {
 			s.camera = cam;
 		}
+		if (const char* sampler = std::getenv("KYTY_FLUIDITE_ECHANT"); sampler != nullptr) {
+			s.sampler = sampler;
+		}
+		s.stacks = static_cast<uint32_t>(EnvNumber("KYTY_FLUIDITE_PILES", 6.0));
 		fs::path base;
 		if (const char* dir = std::getenv("KYTY_FLUIDITE_DIR"); dir != nullptr && dir[0] != 0) {
 			base = dir;
@@ -311,13 +320,14 @@ bool ReadOwn(uint64_t address, void* out, size_t size) {
 #endif
 }
 
-std::string ReadCamera() {
+// The camera floats: "" on success, else the reason ("?", "?base", "?spec").
+const char* ReadCameraFloats(std::array<float, 32>& values, size_t& floats) {
 	const auto& spec = Config().camera;
+	floats           = 16;
 	if (spec.empty()) {
-		return {};
+		return "?off";
 	}
 	std::vector<uint64_t> chain;
-	size_t                floats = 16;
 	const char*           p      = spec.c_str();
 	uint64_t              base   = 0;
 	if (std::strncmp(p, "eboot+", 6) == 0) {
@@ -354,9 +364,20 @@ std::string ReadCamera() {
 		}
 		address = pointer + chain[i];
 	}
-	std::array<float, 32> values {};
 	if (!ReadOwn(address, values.data(), floats * sizeof(float))) {
 		return "?";
+	}
+	return "";
+}
+
+std::string ReadCamera() {
+	if (Config().camera.empty()) {
+		return {};
+	}
+	std::array<float, 32> values {};
+	size_t                floats = 0;
+	if (const char* error = ReadCameraFloats(values, floats); *error != 0) {
+		return error;
 	}
 	std::string text;
 	char        number[32];
@@ -365,6 +386,185 @@ std::string ReadCamera() {
 		text += number;
 	}
 	return text;
+}
+
+// ---- Host threads and machine, once a second (v2, 18/11) ------------------------------------------
+// A monitor thread reads the cycle time of every named thread of the process (QueryThreadCycleTime,
+// TSC units) and the system and process CPU times. Published: the load of Thread_Gpu (CP
+// translation) and of the guest main thread in % of one core, the top threads, the CPU the other
+// processes use (in cores) and the share of the machine in use.
+
+struct Load {
+	float       cp_pct     = -1; // Thread_Gpu, -1 unknown
+	float       main_pct   = -1; // Thread_Main / MainThread
+	float       others     = -1; // cores used by other processes
+	float       system_pct = -1; // whole machine, % of all logical processors
+	std::string top;             // "Thread_Gpu=96 Thread_Main=71 ..."
+};
+
+std::mutex g_load_mutex;
+Load       g_load;
+
+Load CurrentLoad() {
+	std::scoped_lock lock(g_load_mutex);
+	return g_load;
+}
+
+#if defined(_WIN32)
+uint64_t FileTime(const FILETIME& t) {
+	return (static_cast<uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime;
+}
+
+void MonitorLoop() {
+	struct Info {
+		HANDLE      handle = nullptr;
+		std::string name;
+		ULONG64     cycles = 0;
+		bool        seen   = false;
+	};
+	std::vector<std::pair<DWORD, Info>> threads;
+	const DWORD                         pid = GetCurrentProcessId();
+	SYSTEM_INFO                         si {};
+	GetSystemInfo(&si);
+	const double cpus      = std::max<DWORD>(1, si.dwNumberOfProcessors);
+	uint64_t     last_tsc  = __rdtsc();
+	auto         last_time = Clock::now();
+	FILETIME     idle {}, kernel {}, user {}, c {}, e {}, pk {}, pu {};
+	GetSystemTimes(&idle, &kernel, &user);
+	GetProcessTimes(GetCurrentProcess(), &c, &e, &pk, &pu);
+	uint64_t last_busy = FileTime(kernel) + FileTime(user) - FileTime(idle);
+	uint64_t last_proc = FileTime(pk) + FileTime(pu);
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		const uint64_t tsc   = __rdtsc();
+		const auto     now   = Clock::now();
+		const double   d_tsc = static_cast<double>(tsc - last_tsc);
+		const double   d_s   = std::chrono::duration<double>(now - last_time).count();
+		last_tsc             = tsc;
+		last_time            = now;
+		for (auto& t: threads) {
+			t.second.seen = false;
+		}
+		struct Row {
+			std::string name;
+			double      pct;
+		};
+		std::vector<Row> rows;
+		if (HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snap != INVALID_HANDLE_VALUE) {
+			THREADENTRY32 te {};
+			te.dwSize = sizeof(te);
+			for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+				if (te.th32OwnerProcessID != pid) {
+					continue;
+				}
+				auto it = std::find_if(threads.begin(), threads.end(), [&](const auto& p) { return p.first == te.th32ThreadID; });
+				if (it == threads.end()) {
+					Info info;
+					info.handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+					if (info.handle == nullptr) {
+						continue;
+					}
+					PWSTR text = nullptr;
+					if (SUCCEEDED(GetThreadDescription(info.handle, &text)) && text != nullptr) {
+						for (const wchar_t* w = text; *w != 0; w++) {
+							info.name += *w < 128 ? static_cast<char>(*w) : '?';
+						}
+						LocalFree(text);
+					}
+					QueryThreadCycleTime(info.handle, &info.cycles);
+					info.seen = true;
+					threads.emplace_back(te.th32ThreadID, std::move(info));
+					continue;
+				}
+				auto&   info   = it->second;
+				ULONG64 cycles = 0;
+				info.seen      = true;
+				if (QueryThreadCycleTime(info.handle, &cycles) == 0) {
+					continue;
+				}
+				const double pct = d_tsc > 0 ? 100.0 * static_cast<double>(cycles - info.cycles) / d_tsc : 0.0;
+				info.cycles      = cycles;
+				if (!info.name.empty() && pct >= 1.0) {
+					rows.push_back({info.name, pct});
+				}
+			}
+			CloseHandle(snap);
+		}
+		std::erase_if(threads, [](auto& p) {
+			if (!p.second.seen) {
+				CloseHandle(p.second.handle);
+				return true;
+			}
+			return false;
+		});
+		std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.pct > b.pct; });
+		Load load;
+		for (const auto& r: rows) {
+			if (r.name == "Thread_Gpu") {
+				load.cp_pct = std::max(load.cp_pct, static_cast<float>(r.pct));
+			} else if (r.name == "Thread_Main" || r.name == "MainThread") {
+				load.main_pct = std::max(load.main_pct, static_cast<float>(r.pct));
+			}
+		}
+		for (size_t i = 0; i < rows.size() && i < 6; i++) {
+			load.top += (i == 0 ? "" : " ") + rows[i].name + "=" + std::to_string(static_cast<int>(rows[i].pct + 0.5));
+		}
+		GetSystemTimes(&idle, &kernel, &user);
+		GetProcessTimes(GetCurrentProcess(), &c, &e, &pk, &pu);
+		const uint64_t s_busy = FileTime(kernel) + FileTime(user) - FileTime(idle);
+		const uint64_t p_time = FileTime(pk) + FileTime(pu);
+		const double   window = d_s * 1e7; // 100 ns units
+		if (window > 0) {
+			const double busy  = static_cast<double>(s_busy - last_busy);
+			const double proc  = static_cast<double>(p_time - last_proc);
+			load.system_pct    = static_cast<float>(100.0 * busy / (window * cpus));
+			load.others        = static_cast<float>(std::max(0.0, busy - proc) / window);
+		}
+		last_busy = s_busy;
+		last_proc = p_time;
+		std::scoped_lock lock(g_load_mutex);
+		g_load = std::move(load);
+	}
+}
+#endif
+
+void StartMonitor() {
+#if defined(_WIN32)
+	std::thread([] {
+		SetThreadDescription(GetCurrentThread(), L"Kyty fluidite fils");
+		Common::PlaceCurrentThreadCold();
+		MonitorLoop();
+	}).detach();
+#endif
+}
+
+// ---- Automatic stacks (v2, KYTY_FLUIDITE_ECHANT) -------------------------------------------------
+// After 3 s of a sustained drop, the external sampler (Developpement\outils\echantillonneur) samples
+// the guest main thread and the CP translation thread for 5 s: pile-<episode>-<thread>.txt in the
+// session folder. Each launch runs on its own short thread (CreateProcess off the video-out thread).
+
+void LaunchStacks(uint32_t episode) {
+#if defined(_WIN32)
+	const std::string sampler = Config().sampler;
+	const std::string dir     = Config().dir;
+	const DWORD       pid     = GetCurrentProcessId();
+	std::thread([=] {
+		for (const char* thread: {"Thread_Main", "Thread_Gpu"}) {
+			const std::string out = (fs::path(dir) / ("pile-" + std::to_string(episode) + "-" + thread + ".txt")).string();
+			std::string cmd = "\"" + sampler + "\" " + std::to_string(pid) + " \"" + thread + "\" 5 1 \"" + out + "\"";
+			STARTUPINFOA        si {};
+			PROCESS_INFORMATION pi {};
+			si.cb = sizeof(si);
+			if (CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi) !=
+			    0) {
+				CloseHandle(pi.hThread);
+				CloseHandle(pi.hProcess);
+			}
+		}
+	}).detach();
+#else
+	(void)episode;
+#endif
 }
 
 // ---- Black box -----------------------------------------------------------------------------------
@@ -383,6 +583,10 @@ struct Sample {
 	float    wait_ms    = 0; // CPU blocked on the GPU
 	uint32_t upload_kb  = 0;
 	uint32_t read_kb    = 0; // guest file reads
+	float    cp_pct     = -1; // Thread_Gpu load (monitor, last second), -1 unknown
+	float    main_pct   = -1; // guest main thread load (monitor)
+	float    others     = -1; // cores used by other processes (monitor)
+	float    system_pct = -1; // machine in use, % (monitor)
 };
 
 struct Raw {
@@ -435,32 +639,58 @@ struct Means {
 	double   frame = 0, cpu = 0, gpu = 0, wait = 0, shader_ms = 0;
 	uint64_t shaders = 0, read_kb = 0, upload_kb = 0, draws = 0;
 	size_t   n = 0;
+	double   cp = -1, main = -1, others = -1, system = -1; // monitor means, -1 unknown
 };
 
-Means Average(const std::vector<Sample>& box, size_t from) {
-	Means m;
-	for (size_t i = from; i < box.size(); i++) {
-		const auto& s = box[i];
-		m.frame += s.frame_ms;
-		m.cpu += s.cpu_ms;
-		m.gpu += s.gpu_ms;
-		m.wait += s.wait_ms;
-		m.shader_ms += s.shader_ms;
-		m.shaders += s.shaders;
-		m.read_kb += s.read_kb;
-		m.upload_kb += s.upload_kb;
-		m.draws += s.draws;
-		m.n++;
+// Running sums over any number of frames (episode, tranche, trace line): the black box keeps only
+// the first BOX_MAX frames of an episode, so v1 means covered its first ~10 s only.
+struct Accum {
+	Means  m;
+	double cp = 0, main = 0, others = 0, system = 0, worst = 0;
+	size_t n_cp = 0, n_main = 0, n_others = 0, n_system = 0;
+	void   Add(const Sample& s) {
+        m.frame += s.frame_ms;
+        m.cpu += s.cpu_ms;
+        m.gpu += s.gpu_ms;
+        m.wait += s.wait_ms;
+        m.shader_ms += s.shader_ms;
+        m.shaders += s.shaders;
+        m.read_kb += s.read_kb;
+        m.upload_kb += s.upload_kb;
+        m.draws += s.draws;
+        m.n++;
+        worst = std::max(worst, static_cast<double>(s.frame_ms));
+        auto add = [](double& sum, size_t& n, float v) {
+            if (v >= 0) {
+                sum += v;
+                n++;
+            }
+        };
+        add(cp, n_cp, s.cp_pct);
+        add(main, n_main, s.main_pct);
+        add(others, n_others, s.others);
+        add(system, n_system, s.system_pct);
 	}
-	if (m.n != 0) {
-		const auto n = static_cast<double>(m.n);
-		m.frame /= n;
-		m.cpu /= n;
-		m.gpu /= n;
-		m.wait /= n;
-		m.draws /= m.n;
+	[[nodiscard]] Means Get() const {
+		Means r = m;
+		if (r.n != 0) {
+			const auto n = static_cast<double>(r.n);
+			r.frame /= n;
+			r.cpu /= n;
+			r.gpu /= n;
+			r.wait /= n;
+			r.draws /= r.n;
+		}
+		r.cp     = n_cp != 0 ? cp / static_cast<double>(n_cp) : -1.0;
+		r.main   = n_main != 0 ? main / static_cast<double>(n_main) : -1.0;
+		r.others = n_others != 0 ? others / static_cast<double>(n_others) : -1.0;
+		r.system = n_system != 0 ? system / static_cast<double>(n_system) : -1.0;
+		return r;
 	}
-	return m;
+};
+
+std::string Opt(double value, int digits) {
+	return value < 0 ? std::string("-") : Fixed(value, digits);
 }
 
 // The probable cause, from the episode's own frames.
@@ -474,14 +704,22 @@ const char* Cause(const Means& m, double seconds, double worst_ms, bool gpu_time
 	if (m.read_kb >= 20u * 1024u && worst_ms >= 100.0) {
 		return "disque";
 	}
-	if (gpu_timed && m.gpu >= 0.85 * m.frame) {
-		return "gpu";
+	// v2 (18/11): the stage that takes the largest share of the frame. Measured on Pirate Island at
+	// 13-16 fps: no stage at 100 % (Thread_Gpu 70-86 % of the time, GPU 28 of 71 ms, game 14 ms): the
+	// stages run one after the other. The old "attente-gpu" (GpuWaitNs, host completion waits
+	// included) mostly meant the CP translation.
+	if (m.others >= 6.0) {
+		return "machine"; // other processes use 6+ cores (baseline here: 2.5-4, window and driver included)
 	}
-	if (cpu_timed && m.cpu >= 0.85 * m.frame) {
-		return "cpu-jeu";
+	const double cp_share   = m.cp >= 0 ? m.cp / 100.0 : 0.0;
+	const double game_share = cpu_timed && m.frame > 0 ? m.cpu / m.frame : 0.0;
+	const double gpu_share  = gpu_timed && m.frame > 0 ? m.gpu / m.frame : 0.0;
+	const double top        = std::max({cp_share, game_share, gpu_share});
+	if (top >= 0.6) {
+		return top == cp_share ? "traduction-cp" : (top == game_share ? "cpu-jeu" : "gpu");
 	}
 	if (m.wait >= 0.3 * m.frame) {
-		return "attente-gpu";
+		return "attente";
 	}
 	return "mixte";
 }
@@ -525,7 +763,22 @@ struct State {
 	uint32_t          minute_slow   = 0; // frames longer than 1000 / threshold ms
 	double            minute_cpu    = 0.0;
 	double            minute_gpu    = 0.0;
+
+	// v2 (18/11): whole-episode sums, a "tranche" line every TRANCHE of an episode, trace.csv.
+	Accum             episode_acc;
+	Accum             tranche_acc;
+	Clock::time_point tranche_start {};
+	double            tranche_min_fps = 1000.0;
+	Accum             trace_acc;
+	Clock::time_point trace_start {};
+	std::string       top; // busiest threads (monitor)
+	uint32_t          stacks_done = 0;
+	bool              stacks      = false; // taken in this episode
+	Clock::time_point last_stacks {};
 };
+
+constexpr auto TRANCHE = std::chrono::seconds(5);
+constexpr auto TRACE   = std::chrono::milliseconds(500);
 
 State                  g_state; // video-out thread only
 std::atomic<uint32_t>  g_capture_request {0};
@@ -562,23 +815,64 @@ bool RequestReport(State& s, Clock::time_point now, std::chrono::seconds gap) {
 
 const char* JOURNAL_HEADER = "n;heure;type;duree_s;images;ips_min_1s;pire_image_ms;cause;image_ms_moy;"
                              "cpu_jeu_ms_moy;gpu_ms_moy;attente_gpu_ms_moy;dessins_moy;shaders_crees;shaders_ms;"
-                             "lecture_ko;envoi_gpu_ko;vignettes;rapport_gpu;fichiers_recents;camera";
+                             "lecture_ko;envoi_gpu_ko;vignettes;rapport_gpu;fichiers_recents;camera;"
+                             "fil_cp_pct;fil_jeu_pct;autres_coeurs;machine_pct;fils;t_s";
+const char* TRACE_HEADER   = "t_s;heure;ips;pire_image_ms;image_ms_moy;cpu_jeu_ms;gpu_ms;attente_ms;dessins_image;"
+                             "fil_cp_pct;fil_jeu_pct;autres_coeurs;machine_pct;episode;camera";
+
+// One journal line (v1 columns, then the v2 ones).
+std::string JournalLine(const State& s, const std::string& id, const char* kind, double seconds, uint32_t frames,
+                        double min_fps, double worst_ms, const Means& m, const char* cause, const std::string& images,
+                        bool report, double t_s) {
+	return id + ";" + LocalTime("%H:%M:%S") + ";" + kind + ";" + Fixed(seconds, 1) + ";" + std::to_string(frames) + ";" +
+	       (min_fps >= 1000.0 ? std::string("-") : Fixed(min_fps, 1)) + ";" + Fixed(worst_ms, 0) + ";" + cause + ";" +
+	       Fixed(m.frame, 1) + ";" + (s.cpu_timed ? Fixed(m.cpu, 1) : std::string("-")) + ";" +
+	       (s.gpu_timed ? Fixed(m.gpu, 1) : std::string("-")) + ";" + Fixed(m.wait, 1) + ";" + std::to_string(m.draws) +
+	       ";" + std::to_string(m.shaders) + ";" + Fixed(m.shader_ms, 0) + ";" + std::to_string(m.read_kb) + ";" +
+	       std::to_string(m.upload_kb) + ";" + images + ";" + (report ? "oui" : "") + ";" + RecentOpens() + ";" +
+	       ReadCamera() + ";" + Opt(m.cp, 0) + ";" + Opt(m.main, 0) + ";" + Opt(m.others, 1) + ";" + Opt(m.system, 0) +
+	       ";" + s.top + ";" + Fixed(t_s, 1);
+}
+
+double SessionSeconds(const State& s, Clock::time_point t) {
+	return std::chrono::duration<double>(t - s.session_start).count();
+}
+
+// Start of an episode: written at once, with the camera where the drop begins.
+void WriteEpisodeStart(State& s, const Sample& first) {
+	Accum a;
+	a.Add(first);
+	AppendLine("journal.csv", JOURNAL_HEADER,
+	           JournalLine(s, std::to_string(s.episode_id), "debut", 0.0, 1, 1000.0, first.frame_ms, a.Get(), "", s.images,
+	                       false, SessionSeconds(s, s.start)));
+}
+
+// Every TRANCHE of an episode: what these seconds were, and where (a long drop crosses places; an
+// episode still open when the game closes is no longer lost).
+void WriteTranche(State& s, Clock::time_point now) {
+	const double seconds = std::chrono::duration<double>(now - s.tranche_start).count();
+	const Means  m       = s.tranche_acc.Get();
+	AppendLine("journal.csv", JOURNAL_HEADER,
+	           JournalLine(s, std::to_string(s.episode_id), "tranche", seconds, static_cast<uint32_t>(m.n),
+	                       s.tranche_min_fps, s.tranche_acc.worst, m,
+	                       Cause(m, seconds, s.tranche_acc.worst, s.gpu_timed, s.cpu_timed), "", false,
+	                       SessionSeconds(s, now)));
+	s.tranche_acc     = {};
+	s.tranche_start   = now;
+	s.tranche_min_fps = 1000.0;
+}
 const char* BOX_HEADER     = "n;t_s;image_ms;cpu_jeu_ms;gpu_ms;attente_gpu_ms;dessins;calculs;shaders_crees;"
                              "shaders_ms;envoi_gpu_ko;lecture_ko;dans_episode";
 
 void WriteEpisode(State& s, Clock::time_point end) {
 	const double seconds = std::chrono::duration<double>(end - s.start).count();
 	const char*  kind    = s.worst_ms >= 1000.0 ? "arret" : (s.min_fps >= 1000.0 ? "pic" : "baisse");
-	const Means  m       = Average(s.box, s.box_start);
+	const Means  m       = s.episode_acc.Get(); // v2: every frame of the episode, not the first BOX_MAX
 	const char*  cause   = Cause(m, seconds, s.worst_ms, s.gpu_timed, s.cpu_timed);
-	std::string  line =
-	    std::to_string(s.episode_id) + ";" + s.clock + ";" + kind + ";" + Fixed(seconds, 1) + ";" +
-	    std::to_string(s.frames) + ";" + (s.min_fps >= 1000.0 ? std::string("-") : Fixed(s.min_fps, 1)) + ";" +
-	    Fixed(s.worst_ms, 0) + ";" + cause + ";" + Fixed(m.frame, 1) + ";" +
-	    (s.cpu_timed ? Fixed(m.cpu, 1) : std::string("-")) + ";" + (s.gpu_timed ? Fixed(m.gpu, 1) : std::string("-")) +
-	    ";" + Fixed(m.wait, 1) + ";" + std::to_string(m.draws) + ";" + std::to_string(m.shaders) + ";" +
-	    Fixed(m.shader_ms, 0) + ";" + std::to_string(m.read_kb) + ";" + std::to_string(m.upload_kb) + ";" + s.images +
-	    ";" + (s.report ? "oui" : "") + ";" + RecentOpens() + ";" + ReadCamera();
+	// The summary keeps the episode's start time in "heure" (v1); its camera is the end's.
+	std::string line = JournalLine(s, std::to_string(s.episode_id), kind, seconds, s.frames, s.min_fps, s.worst_ms, m,
+	                               cause, s.images, s.report, SessionSeconds(s, end));
+	line.replace(line.find(';') + 1, 8, s.clock);
 	AppendLine("journal.csv", JOURNAL_HEADER, line);
 
 	std::string box;
@@ -612,6 +906,19 @@ bool FluidityEnabled() noexcept {
 	return Config().enabled;
 }
 
+bool FluidityCamera(float* position, float* direction) noexcept {
+	std::array<float, 32> values {};
+	size_t                floats = 0;
+	if (*ReadCameraFloats(values, floats) != 0 || floats < 7) {
+		return false;
+	}
+	for (int i = 0; i < 3; i++) {
+		position[i]  = values[i];
+		direction[i] = values[4 + i];
+	}
+	return !(position[0] == 0.0f && position[1] == 0.0f && position[2] == 0.0f); // not read yet (menus)
+}
+
 void FluidityRecordFlip() noexcept {
 	if (!Config().enabled) {
 		return;
@@ -625,6 +932,8 @@ void FluidityRecordFlip() noexcept {
 		s.tsc0          = Tsc();
 		s.raw           = ReadRaw();
 		s.box.reserve(BOX_BEFORE + BOX_MAX);
+		s.trace_start = now;
+		StartMonitor();
 		{ // reglages.txt: every KYTY_* setting of this session, to compare sessions place by place
 			std::string text;
 			if (char** env = _environ; env != nullptr) {
@@ -664,6 +973,14 @@ void FluidityRecordFlip() noexcept {
 	sample.wait_ms    = static_cast<float>(static_cast<double>(raw.wait_ns - s.raw.wait_ns) * 1e-6);
 	sample.upload_kb  = static_cast<uint32_t>((raw.upload - s.raw.upload) >> 10u);
 	sample.read_kb    = static_cast<uint32_t>((raw.read - s.raw.read) >> 10u);
+	{
+		Load load         = CurrentLoad();
+		sample.cp_pct     = load.cp_pct;
+		sample.main_pct   = load.main_pct;
+		sample.others     = load.others;
+		sample.system_pct = load.system_pct;
+		s.top             = std::move(load.top);
+	}
 	s.cpu_timed       = s.cpu_timed || raw.cycles != 0;
 	s.gpu_timed       = s.gpu_timed || raw.gpu != 0;
 	s.raw             = raw;
@@ -712,6 +1029,23 @@ void FluidityRecordFlip() noexcept {
 		s.minute_gpu    = 0.0;
 	}
 
+	// trace.csv: every TRACE, in or out of an episode: the base of place-by-place comparisons.
+	s.trace_acc.Add(sample);
+	if (now - s.trace_start >= TRACE) {
+		const double seconds = std::chrono::duration<double>(now - s.trace_start).count();
+		const Means  m       = s.trace_acc.Get();
+		AppendLine("trace.csv", TRACE_HEADER,
+		           Fixed(SessionSeconds(s, now), 1) + ";" + LocalTime("%H:%M:%S") + ";" +
+		               Fixed(static_cast<double>(m.n) / seconds, 1) + ";" + Fixed(s.trace_acc.worst, 0) + ";" +
+		               Fixed(m.frame, 1) + ";" + (s.cpu_timed ? Fixed(m.cpu, 1) : std::string("-")) + ";" +
+		               (s.gpu_timed ? Fixed(m.gpu, 1) : std::string("-")) + ";" + Fixed(m.wait, 1) + ";" +
+		               std::to_string(m.draws) + ";" + Opt(m.cp, 0) + ";" + Opt(m.main, 0) + ";" + Opt(m.others, 1) + ";" +
+		               Opt(m.system, 0) + ";" + (s.active ? std::to_string(s.episode_id) : std::string()) + ";" +
+		               ReadCamera());
+		s.trace_acc   = {};
+		s.trace_start = now;
+	}
+
 	const bool spike = dt_ms >= Config().spike_ms;
 	const bool low   = warm && fps < Config().threshold;
 	if (!s.active) {
@@ -742,8 +1076,22 @@ void FluidityRecordFlip() noexcept {
 			s.last_episode_capture = now;
 			s.images               = RequestCapture(s);
 		}
+		s.stacks          = false;
+		s.episode_acc     = {};
+		s.tranche_acc     = {};
+		s.tranche_start   = now;
+		s.tranche_min_fps = 1000.0;
+		WriteEpisodeStart(s, sample);
 	}
 	s.frames++;
+	s.episode_acc.Add(sample);
+	s.tranche_acc.Add(sample);
+	if (low) {
+		s.tranche_min_fps = std::min(s.tranche_min_fps, fps);
+	}
+	if (now - s.tranche_start >= TRANCHE) {
+		WriteTranche(s, now);
+	}
 	s.worst_ms = std::max(s.worst_ms, dt_ms);
 	if (s.box.size() < BOX_BEFORE + BOX_MAX) {
 		s.box.push_back(sample);
@@ -752,6 +1100,15 @@ void FluidityRecordFlip() noexcept {
 		s.min_fps = std::min(s.min_fps, fps);
 		if (s.low_since == Clock::time_point {}) {
 			s.low_since = now;
+		}
+		// v2: automatic stacks, once per episode, 60 s apart.
+		if (!s.stacks && !Config().sampler.empty() && s.stacks_done < Config().stacks &&
+		    now - s.low_since >= std::chrono::seconds(3) && dt_ms < 1000.0 &&
+		    (s.last_stacks == Clock::time_point {} || now - s.last_stacks >= std::chrono::seconds(60))) {
+			s.stacks      = true;
+			s.last_stacks = now;
+			s.stacks_done++;
+			LaunchStacks(s.episode_id);
 		}
 		// A sustained drop (not a hitch nor a loading stop): one GPU frame report.
 		if (!s.report && now - s.low_since >= std::chrono::seconds(2) && dt_ms < 1000.0) {

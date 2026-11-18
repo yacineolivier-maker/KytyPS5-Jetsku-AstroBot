@@ -36,6 +36,10 @@ namespace Libs::Graphics {
 
 [[nodiscard]] bool FluidityEnabled() noexcept;
 
+// Camera position (x y z) and direction (x y z), from KYTY_FLUIDITE_CAMERA (works even when the
+// journal is off); false when unset or not read yet. Any thread (internal pad driver "aller").
+[[nodiscard]] bool FluidityCamera(float* position, float* direction) noexcept;
+
 // Called for each main-bus guest flip (video-out thread).
 void FluidityRecordFlip() noexcept;
 

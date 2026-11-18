@@ -10,6 +10,7 @@
 #include "kernel/waitGraph.h"              // Astro Bot PC (KYTY_WAIT_GRAPH)
 #include "kernel/mainCpu.h"                // Astro Bot PC (KYTY_MAIN_CPU_SAMPLER)
 #include "common/cpuPlacement.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
@@ -3810,6 +3811,7 @@ static void AttachDrawRegisters(Op& op, Args args, DrawPrep::Engine* engine,
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws); // KYTY_FLUIDITE: dessins par image
 	CpSeq::DrawIndexOp op;
 	op.flags                      = m_native_op_tag; // Astro Bot PC (KYTY_NATIVE n2), 0 otherwise
 	op.index_addr                 = reinterpret_cast<uint64_t>(args.index_addr);
@@ -4264,6 +4266,7 @@ static CpSeq::DrawIndexOp CpuIndirectIndexDraw(uint64_t index_addr, uint32_t ind
 void CommandProcessor::DrawIndirect(uint32_t data_offset,
                                     [[maybe_unused]] IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws); // KYTY_FLUIDITE: dessins par image
 	// KYTY_DRAW_PREP_INDIRECT (drawPrep.h): the draw's programs are prepared in a window slot.
 	auto*      engine  = EmitPrep();
 	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
@@ -4364,6 +4367,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          [[maybe_unused]] IndirectDrawRegisters registers,
                                          uint32_t draw_initiator, bool indexed,
                                          int32_t draw_index_sgpr) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws); // KYTY_FLUIDITE: dessins par image
 	auto op               = IndirectDrawOp(data_offset, draw_initiator, indexed);
 	op.count_addr         = reinterpret_cast<uint64_t>(count_addr);
 	op.max_count_or_count = max_count_or_count;
@@ -4640,6 +4644,7 @@ void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint3
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws); // KYTY_FLUIDITE: dessins par image
 	CpSeq::DrawAutoOp op;
 	op.flags                      = m_native_op_tag; // Astro Bot PC (KYTY_NATIVE n2), 0 otherwise
 	op.vertex_count               = args.vertex_count;
