@@ -359,7 +359,7 @@ void ApplyBuiltin(Program* main_program) {
 	if (const auto* value = std::getenv("KYTY_ASTRO_CB_SCALE"); value != nullptr) {
 		scale = std::clamp(std::atoi(value), 1, 4);
 	}
-	if (scale == 1) {
+	if (scale == 1 && std::getenv("KYTY_ASTRO_CB_MIB") == nullptr) {
 		return;
 	}
 	std::string title_id;
@@ -424,6 +424,22 @@ void ApplyBuiltin(Program* main_program) {
 	uint32_t scaled[5] {};
 	for (int i = 0; i < 5; i++) {
 		scaled[i] = kSizes[i] * static_cast<uint32_t>(scale);
+	}
+	// Astro Bot PC (17/11, KYTY_ASTRO_CB_MIB=a,b,c,d,e): explicit size of each buffer in MiB (1-32),
+	// overriding the scale. x2 still overflows now and then (Aerial Garden: a 14 MiB buffer, Sky Aztec
+	// loading: an 8 MiB one), but x3 for all five runs the game out of its fixed Garlic graphics heap
+	// (Mana Tree, pc +0x4a7e0a "Out of graphics memory [Garlic]"): grow only what overflows.
+	if (const auto* list = std::getenv("KYTY_ASTRO_CB_MIB"); list != nullptr) {
+		const char* p = list;
+		for (int i = 0; i < 5 && *p != '\0'; i++) {
+			char*      end = nullptr;
+			const long mib = std::strtol(p, &end, 10);
+			if (end == p) {
+				break;
+			}
+			scaled[i] = static_cast<uint32_t>(std::clamp(mib, 1L, 32L));
+			p         = *end == ',' ? end + 1 : end;
+		}
 	}
 	std::memcpy(reinterpret_cast<void*>(address), scaled, sizeof(scaled));
 	::printf("Game patch: Astro Bot draw-thread command buffers x%d (%u, %u, %u, %u, %u MiB; "
