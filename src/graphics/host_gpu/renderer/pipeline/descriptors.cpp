@@ -1640,7 +1640,55 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 	auto&      texture_cache = m_context.GetTextureCache();
 	const bool xframe_verify = xframe && XFrameReuse::VerifyMode();
 	const bool verify        = DrawSequenceVerifyMode() != 0 || xframe_verify;
-	if (!m_texture_memo.TryRepeatResolve(texture_cache, prepared.images, !verify)) {
+	const bool repeated = m_texture_memo.TryRepeatResolve(texture_cache, prepared.images, !verify);
+	// Astro Bot PC (18/11, KYTY_TEX_REPEAT_REASONS=1): why repeated texture sets fail revalidation.
+	// Reasons as RepeatResolveFailure: 0 none found (the check raced), 1 DCC state, 2 memo entry
+	// replaced, 3 image gone/unregistered/depth/rebind, 4 residency, 5 page version, 6 partner,
+	// 7 DCC pages. Printed every 65536 attempts with the binding count of the failing sets.
+	static const bool reasons_enabled = [] {
+		const char* v = std::getenv("KYTY_TEX_REPEAT_REASONS");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (reasons_enabled) {
+		static std::atomic<uint64_t> attempts {0};
+		static std::atomic<uint64_t> ok {0};
+		static std::atomic<uint64_t> reasons[8] {};
+		static std::atomic<uint64_t> fail_bindings {0};
+		static std::atomic<uint64_t> memo_split[4] {}; // tag 0 sampled, tag 0 storage, tag replaced, image differs
+		if (repeated) {
+			ok.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			for (const auto& b: prepared.images) {
+				if (b.memo_tag == 0) {
+					memo_split[b.desc.type == TextureCache::BindingType::Storage ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+					break;
+				}
+			}
+			reasons[m_texture_memo.RepeatResolveFailure(texture_cache, prepared.images) & 7u].fetch_add(
+			    1, std::memory_order_relaxed);
+			fail_bindings.fetch_add(prepared.images.size(), std::memory_order_relaxed);
+		}
+		if (((attempts.fetch_add(1, std::memory_order_relaxed) + 1) & 0xffffu) == 0) {
+			std::printf("TexRepeat reasons: ok %llu | race %llu dcc %llu memo %llu image %llu resid %llu page %llu "
+			            "partner %llu dccpages %llu | bindings/fail %.1f\n",
+			            static_cast<unsigned long long>(ok.load()), static_cast<unsigned long long>(reasons[0].load()),
+			            static_cast<unsigned long long>(reasons[1].load()), static_cast<unsigned long long>(reasons[2].load()),
+			            static_cast<unsigned long long>(reasons[3].load()), static_cast<unsigned long long>(reasons[4].load()),
+			            static_cast<unsigned long long>(reasons[5].load()), static_cast<unsigned long long>(reasons[6].load()),
+			            static_cast<unsigned long long>(reasons[7].load()),
+			            static_cast<double>(fail_bindings.load()) /
+			                static_cast<double>(std::max<uint64_t>(1, attempts.load() - ok.load())));
+			extern std::atomic<uint64_t> g_memo_rejects[8];
+			std::printf("TexRepeat memo: sets with an unmemoized sampled %llu storage %llu | Record rejects: rebased %llu "
+			            "image %llu dcc %llu null %llu mode %llu gone %llu range %llu backing %llu\n",
+			            static_cast<unsigned long long>(memo_split[0].load()), static_cast<unsigned long long>(memo_split[1].load()),
+			            static_cast<unsigned long long>(g_memo_rejects[0].load()), static_cast<unsigned long long>(g_memo_rejects[1].load()),
+			            static_cast<unsigned long long>(g_memo_rejects[2].load()), static_cast<unsigned long long>(g_memo_rejects[3].load()),
+			            static_cast<unsigned long long>(g_memo_rejects[4].load()), static_cast<unsigned long long>(g_memo_rejects[5].load()),
+			            static_cast<unsigned long long>(g_memo_rejects[6].load()), static_cast<unsigned long long>(g_memo_rejects[7].load()));
+		}
+	}
+	if (!repeated) {
 		totals.texture_misses++;
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureMisses);
 		if (xframe && XFrameReuse::StatsEnabled()) {

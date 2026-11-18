@@ -42,6 +42,13 @@ struct TextureBindingMemo::Entry {
 	// DCC decision (MaterializeDccClear's MetadataNoop); false for every other entry.
 	bool                       dcc = false;
 	TextureCache::MetadataNoop dcc_noop;
+	// Astro Bot PC (19/11, KYTY_TEXTURE_MEMO_OVERLAP): an answer FindImage gave through
+	// ResolveOverlap (no image with the description's exact backing: a same-address image of a
+	// compatible format or more resources answered). Its candidates are the owners of every page
+	// of the description's range, so the entry holds while none of those pages changed version.
+	uint32_t                overlap_first = 0;
+	uint32_t                overlap_pages = 0; // 0: a first-page answer
+	std::array<uint64_t, 16> overlap_versions {};
 	// FindHint's view of `key` and `tag` (P4b-2): Record makes `seq` odd, stores the packed key
 	// and the tag, and makes it even again (release); a reader that sees the same even value
 	// before and after its loads read a pair Record wrote together.
@@ -51,6 +58,20 @@ struct TextureBindingMemo::Entry {
 };
 
 namespace {
+
+// KYTY_TEXTURE_MEMO_OVERLAP=1|verify (default off): also record ResolveOverlap answers (see
+// Entry::overlap_pages). verify: such hits only through TryResolve, each followed by the full
+// resolution (as KYTY_TEXTURE_MEMO_REVALIDATE_VERIFY), mismatches counted and printed.
+int OverlapMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_TEXTURE_MEMO_OVERLAP");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "verify") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
 
 // KYTY_TEXTURE_MEMO_REVALIDATE (default on; =0 off): an entry whose first page changed its owner
 // list (the page version moved: an image registered or unregistered there, often a transient
@@ -99,7 +120,17 @@ bool TextureBindingMemo::HasPartner(const TextureCache& cache, uint64_t page, Im
 }
 
 bool TextureBindingMemo::RevalidateVerify() {
-	return RevalidateVerifyMode() != 0;
+	return RevalidateVerifyMode() != 0 || OverlapMode() == 2;
+}
+
+// The pages of an overlap answer's range still have the versions it was recorded with.
+bool TextureBindingMemo::OverlapPagesHold(const TextureCache& cache, const Entry& entry) {
+	for (uint32_t i = 0; i < entry.overlap_pages; i++) {
+		if (cache.PageVersion(entry.overlap_first + i) != entry.overlap_versions[i]) {
+			return false;
+		}
+	}
+	return true;
 }
 
 void TextureBindingMemo::ReportRevalidateMismatch() {
@@ -248,7 +279,8 @@ Image* TextureBindingMemo::HitImage(TextureCache& cache, const Entry& entry) {
 	if (image == nullptr || !image->registered || image->depth_id ||
 	    image->Binding().needs_rebind || entry.requested_first < image->resident_first ||
 	    cache.PageVersion(entry.page) != entry.page_version ||
-	    (entry.has_partner && !image->alias_owner && !image->info.HasStencil())) {
+	    (entry.has_partner && !image->alias_owner && !image->info.HasStencil()) ||
+	    (entry.overlap_pages != 0 && (OverlapMode() == 2 || !OverlapPagesHold(cache, entry)))) {
 		return nullptr;
 	}
 	return image;
@@ -359,8 +391,11 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		}
 		// A structural change on the description's first page may alter what FindImage returns:
 		// redo its lookup and the partner scan for the new owner list (RevalidateEnabled).
+		if (entry.overlap_pages != 0 && !OverlapPagesHold(cache, entry)) {
+			return stale();
+		}
 		if (const auto version = cache.PageVersion(entry.page); entry.page_version != version) {
-			if (!RevalidateEnabled() ||
+			if (!RevalidateEnabled() || entry.overlap_pages != 0 ||
 			    cache.FindImageWithSameBacking(entry.desc.info, entry.exact_format) !=
 			        entry.image) {
 				return stale();
@@ -373,6 +408,9 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		}
 		if (entry.has_partner && !image->alias_owner && !image->info.HasStencil()) {
 			return stale();
+		}
+		if (entry.overlap_pages != 0 && OverlapMode() == 2) {
+			revalidated = true; // checked by ResolveTexture (RevalidateVerify)
 		}
 		// FindImage's access bookkeeping for the returned image.
 		image->tick_accessed_last = cache.m_scheduler.CurrentTick();
@@ -387,6 +425,23 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 	return true;
 }
 
+// Astro Bot PC (18/11, KYTY_TEX_REPEAT_REASONS=1): why Record refuses an answer. 0 rebased view,
+// 1 image differs from the lookup, 2 DCC unprovable, 3 null image check, 4 not first-page lookup
+// mode, 5 image gone/unregistered/depth, 6 page range, 7 FindImageWithSameBacking differs.
+std::atomic<uint64_t> g_memo_rejects[8] {};
+static bool MemoRejectStats() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_TEX_REPEAT_REASONS");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+static void NoteMemoReject(uint32_t why) {
+	if (MemoRejectStats()) {
+		g_memo_rejects[why & 7u].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t hash,
                                 TextureBinding& binding, ImageId found, bool exact_format,
                                 bool view_rebased, const TextureCache::MetadataNoop* dcc) {
@@ -396,6 +451,7 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	const bool dcc_desc = desc.info.metadata.kind == ImageMetadataKind::Dcc;
 	if (view_rebased || binding.image_id != found ||
 	    (dcc_desc && (dcc == nullptr || !dcc->provable))) {
+		NoteMemoReject(view_rebased ? 0u : (binding.image_id != found ? 1u : 2u));
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRejects);
 		return;
 	}
@@ -404,6 +460,9 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	uint64_t   page            = 0;
 	uint64_t   page_version    = 0;
 	uint32_t   requested_first = 0;
+	uint32_t   overlap_first   = 0;
+	uint32_t   overlap_pages   = 0;
+	std::array<uint64_t, 16> overlap_versions {};
 	{
 		// One critical section: the checks below and the page version describe the same state.
 		std::scoped_lock lock {cache.m_lock};
@@ -411,6 +470,7 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 		if (null_image) {
 			// FindImage returned the null image of this format; it is never registered or freed.
 			if (image == nullptr || image->registered || !image->info.data.Empty()) {
+				NoteMemoReject(3);
 				Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRejects);
 				return;
 			}
@@ -419,11 +479,59 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 			// while the owner list of the description's first page is unchanged (SameBacking
 			// requires the same start address, so `found` starts on that page too).
 			TextureCache::ImagePageTable::PageRange pages {};
+			TextureCache::ImagePageTable::PageRange region {};
+			// Astro Bot PC (KYTY_TEXTURE_MEMO_OVERLAP): an overlap answer (often a depth target sampled
+			// as R32F) for a non-depth description, with
+			// a description range of at most 16 pages; DCC descriptions never get here (no record).
+			const bool overlap_ok =
+			    OverlapMode() != 0 && image != nullptr && !desc.info.IsDepth() && !dcc_desc &&
+			    TextureCache::ImagePageTable::TryGetPageRange(desc.info.data.address, desc.info.data.size,
+			                                                  region) &&
+			    region.last_exclusive - region.first <= 16;
+			const bool same_backing =
+			    image != nullptr && cache.FindImageWithSameBacking(desc.info, exact_format) == found;
 			if (cache.m_image_lookup_mode != TextureCache::ImageLookupMode::FirstPage ||
 			    image == nullptr || !image->registered || image->depth_id ||
 			    !TextureCache::ImagePageTable::TryGetPageRange(image->info.data.address,
 			                                                   image->info.data.size, pages) ||
-			    cache.FindImageWithSameBacking(desc.info, exact_format) != found) {
+			    (!same_backing && !overlap_ok)) {
+				NoteMemoReject(cache.m_image_lookup_mode != TextureCache::ImageLookupMode::FirstPage ? 4u
+				               : (image == nullptr || !image->registered || image->depth_id)       ? 5u
+				               : !TextureCache::ImagePageTable::TryGetPageRange(image->info.data.address,
+				                                                                image->info.data.size, pages)
+				                   ? 6u
+				                   : 7u);
+				if (MemoRejectStats() && image != nullptr && !same_backing) {
+					// Why an overlap answer was refused: depth image, DCC, range, pages 9-16, 17-64, >64.
+					static std::atomic<uint64_t> why[6] {};
+					const auto n_pages = TextureCache::ImagePageTable::TryGetPageRange(
+					                         desc.info.data.address, desc.info.data.size, region)
+					                         ? region.last_exclusive - region.first
+					                         : 0;
+					const uint32_t k = image->info.IsDepth() ? 0u
+					                   : dcc_desc            ? 1u
+					                   : n_pages == 0        ? 2u
+					                   : n_pages <= 16       ? 3u
+					                   : n_pages <= 64       ? 4u
+					                                         : 5u;
+					why[k].fetch_add(1, std::memory_order_relaxed);
+					static std::atomic<uint64_t> total {0};
+					if (((total.fetch_add(1, std::memory_order_relaxed) + 1) & 0x3ffffu) == 0) {
+						std::printf("TexOverlap refusals: depth %llu dcc %llu range %llu pages9-16 %llu "
+						            "pages17-64 %llu more %llu | last: %ux%u fmt %u/%u levels %u/%u size 0x%llx/0x%llx\n",
+						            static_cast<unsigned long long>(why[0].load()),
+						            static_cast<unsigned long long>(why[1].load()),
+						            static_cast<unsigned long long>(why[2].load()),
+						            static_cast<unsigned long long>(why[3].load()),
+						            static_cast<unsigned long long>(why[4].load()),
+						            static_cast<unsigned long long>(why[5].load()), desc.info.extent.width,
+						            desc.info.extent.height, static_cast<uint32_t>(desc.info.pixel_format),
+						            static_cast<uint32_t>(image->info.pixel_format), desc.info.resources.levels,
+						            image->info.resources.levels,
+						            static_cast<unsigned long long>(desc.info.data.size),
+						            static_cast<unsigned long long>(image->info.data.size));
+					}
+				}
 				Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRejects);
 				return;
 			}
@@ -438,6 +546,13 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 			has_partner  = HasPartner(cache, pages.first, found, *image);
 			page         = pages.first;
 			page_version = cache.PageVersion(page);
+			if (!same_backing) {
+				overlap_first = static_cast<uint32_t>(region.first);
+				overlap_pages = static_cast<uint32_t>(region.last_exclusive - region.first);
+				for (uint32_t i = 0; i < overlap_pages; i++) {
+					overlap_versions[i] = cache.PageVersion(region.first + i);
+				}
+			}
 		}
 	}
 	if (!m_entries) {
@@ -472,6 +587,17 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	entry.desc            = desc;
 	entry.dcc             = dcc_desc;
 	entry.dcc_noop        = dcc_desc ? *dcc : TextureCache::MetadataNoop {};
+	entry.overlap_first    = overlap_first;
+	entry.overlap_pages    = overlap_pages;
+	entry.overlap_versions = overlap_versions;
+	if (overlap_pages != 0) {
+		static std::atomic<uint64_t> overlap_records {0};
+		const auto n = overlap_records.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n == 1 || (n & 0xffffu) == 0) {
+			std::printf("TextureBindingMemo: %llu overlap answers recorded (KYTY_TEXTURE_MEMO_OVERLAP)\n",
+			            static_cast<unsigned long long>(n));
+		}
+	}
 	binding.memo_tag      = entry.tag;
 	binding.memo_slot     = slot;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoFills);
@@ -576,7 +702,8 @@ bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<Texture
 		    image->Binding().needs_rebind || entry.requested_first < image->resident_first ||
 		    cache.PageVersion(entry.page) != entry.page_version ||
 		    (entry.has_partner && !image->alias_owner && !image->info.HasStencil()) ||
-		    (entry.dcc && !cache.MetadataPagesHold(entry.dcc_noop))) {
+		    (entry.dcc && !cache.MetadataPagesHold(entry.dcc_noop)) ||
+		    (entry.overlap_pages != 0 && (OverlapMode() == 2 || !OverlapPagesHold(cache, entry)))) {
 			return false;
 		}
 	}
@@ -630,7 +757,8 @@ uint32_t TextureBindingMemo::RepeatResolveFailure(TextureCache&                 
 		if (entry.requested_first < image->resident_first) {
 			return 4;
 		}
-		if (cache.PageVersion(entry.page) != entry.page_version) {
+		if (cache.PageVersion(entry.page) != entry.page_version ||
+		    (entry.overlap_pages != 0 && !OverlapPagesHold(cache, entry))) {
 			return 5;
 		}
 		if (entry.has_partner && !image->alias_owner && !image->info.HasStencil()) {

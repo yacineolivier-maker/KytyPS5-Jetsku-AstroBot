@@ -218,6 +218,7 @@ private:
 	static void               ApplyDcc(TextureCache& cache, const Entry& entry, Image& image);
 	// Whether a registered image other than `found` has exactly its backing range, extent and
 	// sample count on `page` (so SyncAliasFromOwner may copy into it). Caller holds cache.m_lock.
+	[[nodiscard]] static bool OverlapPagesHold(const TextureCache& cache, const Entry& entry);
 	[[nodiscard]] static bool HasPartner(const TextureCache& cache, uint64_t page, ImageId found,
 	                                     const Image& image);
 
