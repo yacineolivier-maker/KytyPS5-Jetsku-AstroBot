@@ -929,12 +929,27 @@ void EmitMipStatsCount(EmitterState& state, uint32_t index, uint32_t counted) {
 	EmitIfCondition(state, any, [&]() {
 		const auto count_index =
 		    Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, MipStatsEntries));
-		const auto add_result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), add_result,
+		const auto add = [&]() {
+			const auto add_result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), add_result,
+			                          MipStatsElement(state, count_index),
+			                          ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+			                          ConstantU32(state, 1));
+		};
+		if (!GetCodegenOptions().lod_stats_count_once) {
+			add();
+			return;
+		}
+		// KYTY_LOD_STATS_COUNT_ONCE: only while the count still reads 0 (the guest tests != 0).
+		const auto current = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current,
 		                          MipStatsElement(state, count_index),
 		                          ConstantU32(state, spv::ScopeDevice),
-		                          ConstantU32(state, spv::MemorySemanticsMaskNone),
-		                          ConstantU32(state, 1));
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+		const auto zero =
+		    Binary(state, spv::OpIEqual, TypeBool(state), current, ConstantU32(state, 0));
+		EmitIfCondition(state, zero, add);
 	});
 }
 

@@ -132,6 +132,11 @@ struct CodegenOptions {
 	// KYTY_LOD_STATS_GATE=0: record GET_LOD_STATS feedback for every sample, including images whose
 	// T# has no mip-statistics counter, and issue the finest-level AtomicUMin unconditionally.
 	bool lod_stats_gate = true;
+	// KYTY_LOD_STATS_COUNT_ONCE=1 (18/11/2026, off by default): a subgroup adds to an image's
+	// GET_LOD_STATS count only while a relaxed atomic load reads 0. The guest only tests the count
+	// for zero ("MipClamp", bd77aef1), so a count of 1 means the same; it removes the AtomicIAdd every
+	// subgroup issued on one address per image (Final Shooting: one instanced draw, 12 ms of 40).
+	bool lod_stats_count_once = false;
 	// KYTY_ROBUST_BUFFER_LOADS=0: bounds-check every plain dword storage-buffer load in the shader
 	// even when the device's robustBufferAccess2 already returns zero for out-of-range dwords.
 	bool robust_buffer_loads = true;

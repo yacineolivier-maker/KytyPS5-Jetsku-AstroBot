@@ -37,6 +37,7 @@ CodegenOptions FromEnvironment() {
 	options.single_f2i_saturation =
 	    EnvFlag("KYTY_SINGLE_F2I_SATURATION", options.single_f2i_saturation);
 	options.lod_stats_gate = EnvFlag("KYTY_LOD_STATS_GATE", options.lod_stats_gate);
+	options.lod_stats_count_once = EnvFlag("KYTY_LOD_STATS_COUNT_ONCE", options.lod_stats_count_once);
 	options.robust_buffer_loads = EnvFlag("KYTY_ROBUST_BUFFER_LOADS", options.robust_buffer_loads);
 	options.branchless_loads    = EnvFlag("KYTY_BRANCHLESS_LOADS", options.branchless_loads);
 	options.branchless_lds      = EnvFlag("KYTY_BRANCHLESS_LDS", options.branchless_lds);

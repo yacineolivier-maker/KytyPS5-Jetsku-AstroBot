@@ -117,6 +117,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.branchless_loads) {
 		b.Text("branchless_loads");
 	}
+	if (options.lod_stats_count_once) {
+		b.Text("lod_stats_count_once");
+	}
 	if (options.branchless_lds) {
 		b.Text("branchless_lds");
 	}
