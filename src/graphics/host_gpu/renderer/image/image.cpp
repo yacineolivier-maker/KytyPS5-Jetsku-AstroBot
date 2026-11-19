@@ -50,6 +50,48 @@ const TransitSkipConfig& TransitSkip() {
 	return config;
 }
 
+// Astro Bot PC (19/11, KYTY_TRANSIT_NARROW=1, default off): the destination stages of an image
+// transition follow its destination access instead of "all graphics + compute": shader reads and
+// writes wait in the shader stages only (pre-rasterization, fragment, compute), colour attachment
+// accesses in the colour output stage, depth/stencil accesses in the fragment test stages. The
+// stages are exactly the ones Vulkan allows for those accesses, so the transition still happens
+// before every access of that kind; the next pass's vertex input, early stages and attachment work
+// no longer wait for it when they do not use the image (Aerial Garden, 18/11: about 200 such
+// barriers per frame, each one draining the whole graphics pipeline).
+bool TransitNarrowEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_TRANSIT_NARROW");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// The stages that may perform `access` (besides transfer), or none when one is not known here.
+vk::PipelineStageFlags2 NarrowTransitStages(vk::AccessFlags2 access) {
+	using A = vk::AccessFlagBits2;
+	using S = vk::PipelineStageFlagBits2;
+	const vk::AccessFlags2 shader = A::eShaderRead | A::eShaderWrite | A::eShaderSampledRead |
+	                                A::eShaderStorageRead | A::eShaderStorageWrite | A::eUniformRead |
+	                                A::eInputAttachmentRead;
+	const vk::AccessFlags2 color = A::eColorAttachmentRead | A::eColorAttachmentWrite;
+	const vk::AccessFlags2 depth = A::eDepthStencilAttachmentRead | A::eDepthStencilAttachmentWrite;
+	const vk::AccessFlags2 transfer = A::eTransferRead | A::eTransferWrite;
+	if (!access || static_cast<bool>(access & ~(shader | color | depth | transfer))) {
+		return {};
+	}
+	vk::PipelineStageFlags2 stages {};
+	if (static_cast<bool>(access & shader)) {
+		stages |= S::ePreRasterizationShaders | S::eFragmentShader | S::eComputeShader;
+	}
+	if (static_cast<bool>(access & color)) {
+		stages |= S::eColorAttachmentOutput;
+	}
+	if (static_cast<bool>(access & depth)) {
+		stages |= S::eEarlyFragmentTests | S::eLateFragmentTests;
+	}
+	return stages;
+}
+
 // KYTY_GUEST_STORAGE_REPEAT (Image::GuestTransitScope): default off.
 bool GuestStorageRepeatEnabled() {
 	static const bool enabled = [] {
@@ -489,8 +531,11 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	}
 	if (!destination_access ||
 	    static_cast<bool>(destination_access & ~vk::AccessFlags2 {transfer_access})) {
-		destination_stage |=
-		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+		const auto narrow = TransitNarrowEnabled() ? NarrowTransitStages(destination_access)
+		                                           : vk::PipelineStageFlags2 {};
+		destination_stage |= narrow ? narrow
+		                            : vk::PipelineStageFlagBits2::eAllGraphics |
+		                                  vk::PipelineStageFlagBits2::eComputeShader;
 	}
 	const auto barriers =
 	    GetBarriers(destination_layout, destination_access, destination_stage, range);

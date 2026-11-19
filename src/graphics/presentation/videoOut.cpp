@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -2049,6 +2050,17 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
 	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	// Astro Bot PC (19/11, KYTY_VIDEO_OUT_RESOLUTION=<n>, default unset): the output resolution code
+	// reported to the game (2 = 4K above; 1 = the lower one). Astro Bot picks its render mode from it
+	// ("1920 x 1080*(Post:2432 x 1368)" and a 3840x2160 output buffer with a 4K report, while the
+	// window shows 1080p): a lower report may spare the 2432x1368 post-processing and the 4K output.
+	static const int forced_resolution = [] {
+		const char* value = std::getenv("KYTY_VIDEO_OUT_RESOLUTION");
+		return value != nullptr && value[0] != 0 ? std::atoi(value) : -1;
+	}();
+	if (forced_resolution >= 0) {
+		status->resolution = static_cast<uint32_t>(forced_resolution);
+	}
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
