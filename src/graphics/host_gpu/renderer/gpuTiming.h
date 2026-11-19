@@ -48,6 +48,10 @@ void NoteCalibrationExtensionEnabled(const char* name);
 void OnGuestFlip();
 // Sum of the per-flip GPU busy time published so far (0 while timing is off). KYTY_FLUIDITE.
 [[nodiscard]] uint64_t TotalBusyNs() noexcept;
+// Astro Bot PC (journal v3, 19/11): the GPU idle time between command buffers, and the part of it
+// spent before the next buffer reached vkQueueSubmit (starved by the CPU side), summed the same way.
+[[nodiscard]] uint64_t TotalIdleNs() noexcept;
+[[nodiscard]] uint64_t TotalStarvedNs() noexcept;
 
 } // namespace GpuTiming
 

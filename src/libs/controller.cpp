@@ -13,6 +13,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
+#include "graphics/presentation/fluidityLog.h" // Astro Bot PC (journal v3)
 
 #include <algorithm>
 #include <array>
@@ -1189,10 +1190,13 @@ void CycleKeyboardPlayer() {
 }
 
 void SetButton(int id, uint32_t button, bool down) {
-	Common::LockGuard lock(g_router_mutex);
-	if (auto* player = PlayerForDevice(id)) {
-		player->Button(id, button, down);
+	{
+		Common::LockGuard lock(g_router_mutex);
+		if (auto* player = PlayerForDevice(id)) {
+			player->Button(id, button, down);
+		}
 	}
+	Libs::Graphics::FluidityNoteButton(button, down); // Astro Bot PC (journal v3, manette.csv)
 }
 
 void SetAxis(int id, Axis axis, int value) {

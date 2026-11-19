@@ -576,6 +576,7 @@ struct Sample {
 	float    frame_ms   = 0;
 	float    cpu_ms     = 0; // guest main thread
 	float    gpu_ms     = 0; // GPU busy published since the previous flip (KYTY_GPU_TIMING)
+	float    gpu_idle   = 0; // v3: GPU idle between command buffers since the previous flip (KYTY_GPU_TIMING)
 	uint32_t draws      = 0;
 	uint32_t dispatches = 0;
 	uint32_t shaders    = 0; // shaders + pipelines created
@@ -590,7 +591,7 @@ struct Sample {
 };
 
 struct Raw {
-	uint64_t cycles = 0, gpu = 0, draws = 0, dispatches = 0, shaders = 0, shader_ns = 0, wait_ns = 0, upload = 0,
+	uint64_t cycles = 0, gpu = 0, gpu_idle = 0, draws = 0, dispatches = 0, shaders = 0, shader_ns = 0, wait_ns = 0, upload = 0,
 	         read = 0;
 };
 
@@ -605,6 +606,7 @@ Raw ReadRaw() {
 	}
 #endif
 	r.gpu        = GpuTiming::TotalBusyNs();
+	r.gpu_idle   = GpuTiming::TotalIdleNs();
 	r.draws      = DC::Get(DC::Counter::Draws) + DC::Get(DC::Counter::IndirectDraws);
 	r.dispatches = DC::Get(DC::Counter::Dispatches);
 	r.shaders    = DC::Get(DC::Counter::ShadersCompiled) + DC::Get(DC::Counter::PipelinesCreated);
@@ -636,7 +638,7 @@ constexpr size_t BOX_BEFORE = 30;  // frames kept from before the episode (about
 constexpr size_t BOX_MAX    = 300; // frames per episode in boite-noire.csv
 
 struct Means {
-	double   frame = 0, cpu = 0, gpu = 0, wait = 0, shader_ms = 0;
+	double   frame = 0, cpu = 0, gpu = 0, gpu_idle = 0, wait = 0, shader_ms = 0;
 	uint64_t shaders = 0, read_kb = 0, upload_kb = 0, draws = 0;
 	size_t   n = 0;
 	double   cp = -1, main = -1, others = -1, system = -1; // monitor means, -1 unknown
@@ -652,6 +654,7 @@ struct Accum {
         m.frame += s.frame_ms;
         m.cpu += s.cpu_ms;
         m.gpu += s.gpu_ms;
+        m.gpu_idle += s.gpu_idle;
         m.wait += s.wait_ms;
         m.shader_ms += s.shader_ms;
         m.shaders += s.shaders;
@@ -678,6 +681,7 @@ struct Accum {
 			r.frame /= n;
 			r.cpu /= n;
 			r.gpu /= n;
+			r.gpu_idle /= n;
 			r.wait /= n;
 			r.draws /= r.n;
 		}
@@ -714,9 +718,25 @@ const char* Cause(const Means& m, double seconds, double worst_ms, bool gpu_time
 	const double cp_share   = m.cp >= 0 ? m.cp / 100.0 : 0.0;
 	const double game_share = cpu_timed && m.frame > 0 ? m.cpu / m.frame : 0.0;
 	const double gpu_share  = gpu_timed && m.frame > 0 ? m.gpu / m.frame : 0.0;
-	const double top        = std::max({cp_share, game_share, gpu_share});
-	if (top >= 0.6) {
-		return top == cp_share ? "traduction-cp" : (top == game_share ? "cpu-jeu" : "gpu");
+	// v3 (19/11): the GPU busy time spans whole command buffers, so a GPU that waits for the CP
+	// translation between them still looks busy (Aerial Garden, 18/11: "gpu" at 25-65 % Thread_Gpu,
+	// GPU report 25-27 ms of work). The GPU is the limit only while it is (almost) never idle.
+	const double idle_share = gpu_timed && m.frame > 0 ? m.gpu_idle / m.frame : -1.0;
+	const bool   gpu_full   = gpu_share >= 0.6 && idle_share >= 0.0 && idle_share < 0.15;
+	if (gpu_full && gpu_share >= cp_share && gpu_share >= game_share) {
+		return "gpu";
+	}
+	if (cp_share >= 0.6 && cp_share >= game_share) {
+		return "traduction-cp";
+	}
+	if (game_share >= 0.6) {
+		return "cpu-jeu";
+	}
+	if (gpu_full) {
+		return "gpu";
+	}
+	if (gpu_share >= 0.6) {
+		return "gpu-attente"; // busy spans with idle gaps: waits inside its command buffers, or for them
 	}
 	if (m.wait >= 0.3 * m.frame) {
 		return "attente";
@@ -781,6 +801,8 @@ constexpr auto TRANCHE = std::chrono::seconds(5);
 constexpr auto TRACE   = std::chrono::milliseconds(500);
 
 State                  g_state; // video-out thread only
+// v3: the session start (steady clock, ns since its epoch) for the events of other threads; 0 before.
+std::atomic<int64_t>   g_session_start_ns {0};
 std::atomic<uint32_t>  g_capture_request {0};
 std::atomic<uint32_t>  g_next_image {1};
 std::atomic<bool>      g_mark_request {false};
@@ -816,9 +838,9 @@ bool RequestReport(State& s, Clock::time_point now, std::chrono::seconds gap) {
 const char* JOURNAL_HEADER = "n;heure;type;duree_s;images;ips_min_1s;pire_image_ms;cause;image_ms_moy;"
                              "cpu_jeu_ms_moy;gpu_ms_moy;attente_gpu_ms_moy;dessins_moy;shaders_crees;shaders_ms;"
                              "lecture_ko;envoi_gpu_ko;vignettes;rapport_gpu;fichiers_recents;camera;"
-                             "fil_cp_pct;fil_jeu_pct;autres_coeurs;machine_pct;fils;t_s";
+                             "fil_cp_pct;fil_jeu_pct;autres_coeurs;machine_pct;fils;t_s;gpu_inactif_ms";
 const char* TRACE_HEADER   = "t_s;heure;ips;pire_image_ms;image_ms_moy;cpu_jeu_ms;gpu_ms;attente_ms;dessins_image;"
-                             "fil_cp_pct;fil_jeu_pct;autres_coeurs;machine_pct;episode;camera";
+                             "fil_cp_pct;fil_jeu_pct;autres_coeurs;machine_pct;episode;camera;gpu_inactif_ms";
 
 // One journal line (v1 columns, then the v2 ones).
 std::string JournalLine(const State& s, const std::string& id, const char* kind, double seconds, uint32_t frames,
@@ -831,7 +853,7 @@ std::string JournalLine(const State& s, const std::string& id, const char* kind,
 	       ";" + std::to_string(m.shaders) + ";" + Fixed(m.shader_ms, 0) + ";" + std::to_string(m.read_kb) + ";" +
 	       std::to_string(m.upload_kb) + ";" + images + ";" + (report ? "oui" : "") + ";" + RecentOpens() + ";" +
 	       ReadCamera() + ";" + Opt(m.cp, 0) + ";" + Opt(m.main, 0) + ";" + Opt(m.others, 1) + ";" + Opt(m.system, 0) +
-	       ";" + s.top + ";" + Fixed(t_s, 1);
+	       ";" + s.top + ";" + Fixed(t_s, 1) + ";" + (s.gpu_timed ? Fixed(m.gpu_idle, 1) : std::string("-"));
 }
 
 double SessionSeconds(const State& s, Clock::time_point t) {
@@ -928,6 +950,7 @@ void FluidityRecordFlip() noexcept {
 	if (s.session_start == Clock::time_point {}) {
 		DC::SetCollect(true);
 		s.session_start = now;
+		g_session_start_ns.store(now.time_since_epoch().count(), std::memory_order_release);
 		s.minute_start  = now;
 		s.tsc0          = Tsc();
 		s.raw           = ReadRaw();
@@ -966,6 +989,7 @@ void FluidityRecordFlip() noexcept {
 	                      ? static_cast<float>(static_cast<double>(raw.cycles - s.raw.cycles) / tsc_per_ns * 1e-6)
 	                      : 0.0f;
 	sample.gpu_ms     = static_cast<float>(static_cast<double>(raw.gpu - s.raw.gpu) * 1e-6);
+	sample.gpu_idle   = static_cast<float>(static_cast<double>(raw.gpu_idle - s.raw.gpu_idle) * 1e-6);
 	sample.draws      = static_cast<uint32_t>(raw.draws - s.raw.draws);
 	sample.dispatches = static_cast<uint32_t>(raw.dispatches - s.raw.dispatches);
 	sample.shaders    = static_cast<uint32_t>(raw.shaders - s.raw.shaders);
@@ -1041,7 +1065,7 @@ void FluidityRecordFlip() noexcept {
 		               (s.gpu_timed ? Fixed(m.gpu, 1) : std::string("-")) + ";" + Fixed(m.wait, 1) + ";" +
 		               std::to_string(m.draws) + ";" + Opt(m.cp, 0) + ";" + Opt(m.main, 0) + ";" + Opt(m.others, 1) + ";" +
 		               Opt(m.system, 0) + ";" + (s.active ? std::to_string(s.episode_id) : std::string()) + ";" +
-		               ReadCamera());
+		               ReadCamera() + ";" + (s.gpu_timed ? Fixed(m.gpu_idle, 1) : std::string("-")));
 		s.trace_acc   = {};
 		s.trace_start = now;
 	}
@@ -1158,12 +1182,103 @@ void FluidityNotePadButton(int id, bool left_stick, bool down) noexcept {
 	}
 }
 
+namespace {
+
+// v3 (19/11): "t_s;heure" of an event of any thread, on trace.csv's clock; empty before the session.
+std::string EventStamp() {
+	const int64_t start = g_session_start_ns.load(std::memory_order_acquire);
+	if (start == 0) {
+		return {};
+	}
+	const double t = static_cast<double>(Clock::now().time_since_epoch().count() - start) *
+	                 (static_cast<double>(Clock::period::num) / static_cast<double>(Clock::period::den));
+	return Fixed(t, 2) + ";" + LocalTime("%H:%M:%S");
+}
+
+// Text for one CSV field: no separator, no line break.
+std::string Field(const char* text, size_t max) {
+	std::string out;
+	for (size_t i = 0; text[i] != 0 && i < max; i++) {
+		const char c = text[i];
+		out += c == ';' ? ',' : (c == '\r' || c == '\n' || c == '\t' ? ' ' : c);
+	}
+	while (!out.empty() && out.back() == ' ') {
+		out.pop_back();
+	}
+	return out;
+}
+
+std::mutex  g_level_mutex;
+std::string g_level; // the last level folder seen in a guest open
+
+} // namespace
+
+void FluidityNoteButton(uint32_t button, bool down) noexcept {
+	if (!Config().enabled) {
+		return;
+	}
+	static constexpr std::pair<uint32_t, const char*> NAMES[] = {
+	    {0x00004000u, "croix"},  {0x00008000u, "carre"},   {0x00001000u, "triangle"}, {0x00002000u, "rond"},
+	    {0x00000400u, "L1"},     {0x00000800u, "R1"},      {0x00000100u, "L2"},       {0x00000200u, "R2"},
+	    {0x00000002u, "L3"},     {0x00000004u, "R3"},      {0x00000008u, "options"},  {0x00000010u, "haut"},
+	    {0x00000020u, "droite"}, {0x00000040u, "bas"},     {0x00000080u, "gauche"},   {0x00100000u, "pave"}};
+	// Only real changes (the internal driver and some pads set every button each time).
+	static std::atomic<uint32_t> held {0};
+	const uint32_t before = down ? held.fetch_or(button, std::memory_order_relaxed)
+	                             : held.fetch_and(~button, std::memory_order_relaxed);
+	if (((before & button) != 0) == down) {
+		return;
+	}
+	const char* name = nullptr;
+	for (const auto& [bit, text]: NAMES) {
+		if (bit == button) {
+			name = text;
+		}
+	}
+	const std::string stamp = EventStamp();
+	if (stamp.empty()) {
+		return;
+	}
+	AppendLine("manette.csv", "t_s;heure;bouton;etat;camera",
+	           stamp + ";" + (name != nullptr ? std::string(name) : std::to_string(button)) + ";" +
+	               (down ? "appui" : "relache") + ";" + ReadCamera());
+}
+
+void FluidityNoteGameText(const char* text) noexcept {
+	if (!Config().enabled || text == nullptr || std::strncmp(text, "ActivateCheckPoint", 18) != 0) {
+		return;
+	}
+	const std::string stamp = EventStamp();
+	if (!stamp.empty()) {
+		AppendLine("points.csv", "t_s;heure;message;camera", stamp + ";" + Field(text, 200) + ";" + ReadCamera());
+	}
+}
+
 void FluidityNoteOpen(const char* path) noexcept {
 	if (!Config().enabled || path == nullptr) {
 		return;
 	}
 	if (std::strncmp(path, "/app0/", 6) != 0) {
 		return;
+	}
+	// v3: niveaux.csv, each change of the level folder the game opens files in.
+	if (std::strncmp(path, "/app0/data/prein/levels/", 24) == 0) {
+		const char* name = path + 24;
+		const char* end  = std::strchr(name, '/');
+		if (end != nullptr && end != name) {
+			const std::string level(name, static_cast<size_t>(end - name));
+			bool              changed = false;
+			{
+				std::scoped_lock lock(g_level_mutex);
+				changed = level != g_level;
+				if (changed) {
+					g_level = level;
+				}
+			}
+			if (const std::string stamp = changed ? EventStamp() : std::string(); !stamp.empty()) {
+				AppendLine("niveaux.csv", "t_s;heure;niveau;camera", stamp + ";" + level + ";" + ReadCamera());
+			}
+		}
 	}
 	std::scoped_lock lock(g_open_mutex);
 	const auto&      previous = g_opens[(g_open_next + g_opens.size() - 1) % g_opens.size()];

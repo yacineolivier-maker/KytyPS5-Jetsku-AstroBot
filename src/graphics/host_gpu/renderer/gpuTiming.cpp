@@ -188,6 +188,14 @@ uint64_t TotalBusyNs() noexcept {
 	return g_total_busy_ns.load(std::memory_order_relaxed);
 }
 
+uint64_t TotalIdleNs() noexcept {
+	return g_total_idle_ns.load(std::memory_order_relaxed);
+}
+
+uint64_t TotalStarvedNs() noexcept {
+	return g_total_starved_ns.load(std::memory_order_relaxed);
+}
+
 void OnGuestFlip() {
 	if (!Enabled()) {
 		return;

@@ -783,6 +783,15 @@ namespace {
 // `tolerance`: a return to a recorded place that does not depend on the timing of a replay. The camera
 // trails the character, so the target is a camera position as recorded in trace.csv / journal.csv.
 // "tenir <ms>" then stays on that target. A script without "boucle" now runs once (v1 restarted it).
+// v3 (19/11), the replay of a recorded path (tools: preparer-retour.py, from trace.csv and manette.csv):
+//   "passer <x> <z> [tolerance=0.6] [max_ms=8000]": like "aller", but at full speed and without stopping
+//   (a waypoint of the path); "bouton <K>[+<K>...] <ms>": presses buttons for <ms> while the next steps
+//   run (a jump during the walk); "attendre-pres <x> <z> [tolerance=1] [max_ms=300000]": waits, stick
+//   released, until the camera is within tolerance of (x, z) (the level is loaded, at its start);
+//   "attendre-calme [ms=2000] [max_ms=300000]": waits until the camera is valid and has moved less than 0.05 for
+//   <ms> (a level started directly opens on a fly-over: the game starts when the camera settles on Astro);
+//   "rejoindre": skips to the recorded waypoint ("passer") nearest the camera: the first within 3 units, else
+//   the nearest one (the recorded path may start before the place the level puts Astro at).
 class PadScript {
 public:
 	void Start() {
@@ -806,10 +815,12 @@ public:
 
 private:
 	struct Step {
-		int      kind = 0; // 0 wait, 1 hold, 2 go to a camera position
+		int      kind = 0; // 0 wait, 1 hold, 2 go to a camera position, 3 hold the target, 4 pass, 5 button,
+		                   // 6 wait near a camera position, 7 wait for a settled camera, 8 join the path
 		uint32_t keys = 0; // bit per key index
 		uint32_t ms   = 0;
 		float    x = 0, z = 0, tolerance = 0.05f;
+		uint32_t max_ms = 0; // "attendre-calme"
 	};
 
 	static void ApplyStick(float side, float forward) {
@@ -821,6 +832,7 @@ private:
 
 	// "aller": false if the file changed or the driver stops (true also on timeout, logged).
 	bool Go(const Step& s) {
+		const bool pass = s.kind == 4;
 		m_target     = s;
 		m_has_target = true;
 		float pos[3] {}, dir[3] {};
@@ -838,6 +850,7 @@ private:
 		}
 		const auto start = std::chrono::steady_clock::now();
 		for (;;) {
+			UpdateButtons();
 			if (!Libs::Graphics::FluidityCamera(pos, dir)) {
 				ApplyStick(0, 0);
 				return Sleep(50);
@@ -848,8 +861,10 @@ private:
 				break;
 			}
 			if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(s.ms)) {
-				std::printf("Kyty pilote interne : aller %.3f %.3f : delai depasse a %.3f\n", s.x, s.z, dist);
+				std::printf("Kyty pilote interne : %s %.3f %.3f : delai depasse a %.3f\n", pass ? "passer" : "aller", s.x,
+				            s.z, dist);
 				std::fflush(stdout);
+				m_timeouts++;
 				break;
 			}
 			float fx = dir[0], fz = dir[2];
@@ -865,11 +880,15 @@ private:
 			const float forward = nx * fx + nz * fz;
 			const float side    = static_cast<float>(m_side) * (-nx * fz + nz * fx);
 			// Slow down over the last 3 units (18/11: at full speed Astro ran past 0.05 30 and slid down to z 11).
-			const float speed = std::clamp(dist / 3.0f, 0.3f, 1.0f);
+			const float speed = pass ? 1.0f : std::clamp(dist / 3.0f, 0.3f, 1.0f);
 			ApplyStick(side * speed, forward * speed);
 			if (!Sleep(50)) {
 				return false;
 			}
+		}
+		if (pass) {
+			m_passed++;
+			return true; // keep the stick: the next waypoint steers on
 		}
 		ApplyStick(0, 0);
 		float p2[3] {}, d2[3] {};
@@ -878,6 +897,143 @@ private:
 			std::fflush(stdout);
 		}
 		return true;
+	}
+
+	// "bouton": the presses still running, and the button keys they hold.
+	struct Press {
+		uint32_t                              keys = 0;
+		std::chrono::steady_clock::time_point end {};
+	};
+	std::vector<Press> m_presses;
+	uint32_t           m_button_keys = 0; // what UpdateButtons last applied (key bits 8+)
+	uint32_t           m_passed      = 0; // "passer" waypoints reached
+	uint32_t           m_timeouts    = 0; // "aller"/"passer" timeouts
+
+	static constexpr uint32_t BUTTON_KEYS = ~0xffu; // keys 8+ are buttons, 0-7 sticks
+
+	static void ApplyButtons(uint32_t keys) {
+		static constexpr uint32_t BUTTONS[] = {Controller::PAD_BUTTON_CROSS,    Controller::PAD_BUTTON_SQUARE,
+		                                       Controller::PAD_BUTTON_TRIANGLE, Controller::PAD_BUTTON_CIRCLE,
+		                                       Controller::PAD_BUTTON_L1,       Controller::PAD_BUTTON_R1,
+		                                       Controller::PAD_BUTTON_L2,       Controller::PAD_BUTTON_R2,
+		                                       Controller::PAD_BUTTON_OPTIONS};
+		for (int b = 0; b < static_cast<int>(std::size(BUTTONS)); b++) {
+			Controller::SetButton(Controller::HOST_INPUT_CONTROLLER_ID, BUTTONS[b], ((keys >> (8 + b)) & 1u) != 0);
+		}
+	}
+
+	// Applies the buttons of the running presses (only on a change).
+	void UpdateButtons() {
+		const auto now  = std::chrono::steady_clock::now();
+		uint32_t   keys = 0;
+		std::erase_if(m_presses, [&](const Press& p) { return p.end <= now; });
+		for (const auto& p: m_presses) {
+			keys |= p.keys;
+		}
+		keys &= BUTTON_KEYS;
+		if (keys != m_button_keys) {
+			ApplyButtons(keys);
+			m_button_keys = keys;
+			m_active      = true;
+		}
+	}
+
+	// "attendre-calme": false if the file changed or the driver stops.
+	bool WaitCalm(const Step& s) {
+		ApplyStick(0, 0);
+		const auto start = std::chrono::steady_clock::now();
+		float      last[3] {};
+		bool       have = false;
+		auto       still_since = start;
+		for (;;) {
+			float pos[3] {}, dir[3] {};
+			const auto now = std::chrono::steady_clock::now();
+			const bool ok  = Libs::Graphics::FluidityCamera(pos, dir) &&
+			                !(std::fabs(pos[0]) < 1e-3f && std::fabs(pos[1]) < 1e-3f && std::fabs(pos[2]) < 1e-3f);
+			if (!ok) {
+				have = false;
+			} else if (!have || std::fabs(pos[0] - last[0]) + std::fabs(pos[1] - last[1]) + std::fabs(pos[2] - last[2]) > 0.05f) {
+				std::copy(pos, pos + 3, last);
+				have        = true;
+				still_since = now;
+			} else if (now - still_since >= std::chrono::milliseconds(s.ms)) {
+				std::printf("Kyty pilote interne : attendre-calme : camera posee a %.3f %.3f %.3f apres %lld s\n", pos[0],
+				            pos[1], pos[2],
+				            static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - start).count()));
+				std::fflush(stdout);
+				return true;
+			}
+			if (now - start > std::chrono::milliseconds(s.max_ms)) {
+				std::printf("Kyty pilote interne : attendre-calme : delai depasse\n");
+				std::fflush(stdout);
+				return true;
+			}
+			if (!Sleep(100)) {
+				return false;
+			}
+		}
+	}
+
+	// "rejoindre": the index of the waypoint to continue from (i: the step after "rejoindre").
+	size_t Join(size_t i) const {
+		float pos[3] {}, dir[3] {};
+		if (!Libs::Graphics::FluidityCamera(pos, dir)) {
+			return i;
+		}
+		size_t best = i, first = SIZE_MAX;
+		float  best_d = 1e30f;
+		for (size_t k = i; k < m_steps.size(); k++) {
+			if (m_steps[k].kind != 4 && m_steps[k].kind != 5) {
+				break;
+			}
+			if (m_steps[k].kind != 4) {
+				continue;
+			}
+			const float d = std::hypot(m_steps[k].x - pos[0], m_steps[k].z - pos[2]);
+			if (d < best_d) {
+				best_d = d;
+				best   = k;
+			}
+			if (first == SIZE_MAX && d <= 3.0f) {
+				first = k;
+			}
+		}
+		const size_t to = first != SIZE_MAX ? first : best;
+		std::printf("Kyty pilote interne : rejoindre : point %zu sur %zu, a %.2f de la camera %.3f %.3f\n", to - i,
+		            m_steps.size() - i, std::hypot(m_steps[to].x - pos[0], m_steps[to].z - pos[2]), pos[0], pos[2]);
+		std::fflush(stdout);
+		return to;
+	}
+
+	// "attendre-pres": false if the file changed or the driver stops.
+	bool WaitNear(const Step& s) {
+		ApplyStick(0, 0);
+		const auto start = std::chrono::steady_clock::now();
+		for (;;) {
+			float pos[3] {}, dir[3] {};
+			if (Libs::Graphics::FluidityCamera(pos, dir)) {
+				const float dx = s.x - pos[0], dz = s.z - pos[2];
+				const float dist = std::sqrt(dx * dx + dz * dz);
+				if (dist <= s.tolerance) {
+					std::printf("Kyty pilote interne : attendre-pres %.3f %.3f : atteint apres %lld s (camera %.3f %.3f)\n",
+					            s.x, s.z,
+					            static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(
+					                                       std::chrono::steady_clock::now() - start)
+					                                       .count()),
+					            pos[0], pos[2]);
+					std::fflush(stdout);
+					return true;
+				}
+			}
+			if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(s.ms)) {
+				std::printf("Kyty pilote interne : attendre-pres %.3f %.3f : delai depasse\n", s.x, s.z);
+				std::fflush(stdout);
+				return true;
+			}
+			if (!Sleep(200)) {
+				return false;
+			}
+		}
 	}
 
 	// "tenir <ms>": stays on the last "aller" target, steering back when the camera drifts past twice the
@@ -945,6 +1101,8 @@ private:
 	}
 
 	void ReleaseAll() {
+		m_presses.clear();
+		m_button_keys = 0;
 		if (m_active) {
 			Apply(0);
 			m_active = false;
@@ -1013,6 +1171,48 @@ private:
 				s.ms   = ms;
 				m_steps.push_back(s);
 				continue;
+			} else if (verb == "attendre-calme") {
+				uint32_t still = 2000, max_ms = 300000;
+				words >> still >> max_ms;
+				s.kind   = 7;
+				s.ms     = still;
+				s.max_ms = max_ms;
+				m_steps.push_back(s);
+				continue;
+			} else if (verb == "rejoindre") {
+				s.kind = 8;
+				m_steps.push_back(s);
+				continue;
+			} else if (verb == "bouton") {
+				words >> key >> ms;
+				std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::toupper(c); });
+				std::istringstream parts(key);
+				std::string        part;
+				while (std::getline(parts, part, '+')) {
+					const int i = KeyIndex(part);
+					if (i >= 8) {
+						s.keys |= 1u << i;
+					}
+				}
+				s.kind = 5;
+				s.ms   = ms;
+				m_steps.push_back(s);
+				continue;
+			} else if (verb == "passer" || verb == "attendre-pres") {
+				const bool passing = verb == "passer";
+				float      x = 0, z = 0, tolerance = passing ? 0.6f : 1.0f;
+				uint32_t   max_ms = passing ? 8000 : 300000;
+				if (!(words >> x >> z)) {
+					continue;
+				}
+				words >> tolerance >> max_ms;
+				s.kind      = passing ? 4 : 6;
+				s.x         = x;
+				s.z         = z;
+				s.tolerance = tolerance > 0 ? tolerance : 0.6f;
+				s.ms        = max_ms;
+				m_steps.push_back(s);
+				continue;
 			} else if (verb == "aller") {
 				float    x = 0, z = 0, tolerance = 0.05f;
 				uint32_t max_ms = 20000;
@@ -1051,6 +1251,9 @@ private:
 				m_reload = true;
 				return false;
 			}
+			if (!m_presses.empty() || m_button_keys != 0) {
+				UpdateButtons();
+			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(20));
 		}
 		return true;
@@ -1080,9 +1283,44 @@ private:
 					i = m_loop;
 				}
 				const auto& s = m_steps[i++];
-				if (s.kind == 2 || s.kind == 3) {
-					if (!(s.kind == 2 ? Go(s) : Hold(s.ms))) {
+				if (s.kind == 5) {
+					m_presses.push_back({s.keys, std::chrono::steady_clock::now() + std::chrono::milliseconds(s.ms)});
+					UpdateButtons();
+					continue;
+				}
+				if (s.kind == 6) {
+					if (!WaitNear(s)) {
 						break;
+					}
+					continue;
+				}
+				if (s.kind == 7) {
+					if (!WaitCalm(s)) {
+						break;
+					}
+					continue;
+				}
+				if (s.kind == 8) {
+					i = Join(i);
+					continue;
+				}
+				if (s.kind == 2 || s.kind == 3 || s.kind == 4) {
+					if (!(s.kind == 3 ? Hold(s.ms) : Go(s))) {
+						break;
+					}
+					size_t next = i;
+					while (next < m_steps.size() && m_steps[next].kind == 5) {
+						next++; // presses between waypoints keep the run going
+					}
+					if (s.kind == 4 && (next >= m_steps.size() || m_steps[next].kind != 4)) {
+						// end of a run of waypoints: stop, and say how it went
+						ApplyStick(0, 0);
+						float p2[3] {}, d2[3] {};
+						if (Libs::Graphics::FluidityCamera(p2, d2)) {
+							std::printf("Kyty pilote interne : trajet : %u points passes, %u delais, camera %.3f %.3f %.3f\n",
+							            m_passed, m_timeouts, p2[0], p2[1], p2[2]);
+							std::fflush(stdout);
+						}
 					}
 					continue;
 				}

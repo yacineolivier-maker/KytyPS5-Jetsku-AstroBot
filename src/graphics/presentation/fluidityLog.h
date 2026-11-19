@@ -49,7 +49,13 @@ void FluidityMark() noexcept;
 // Pad stick buttons, for the L3+R3 mark.
 void FluidityNotePadButton(int id, bool left_stick, bool down) noexcept;
 
-// A guest file open (any thread); only app0 data paths are kept.
+// v3 (19/11): a pad button change (any pad, any thread): manette.csv, for replaying a session's path.
+void FluidityNoteButton(uint32_t button, bool down) noexcept;
+
+// v3: a line the game printed (any thread); "ActivateCheckPoint..." lines go to points.csv.
+void FluidityNoteGameText(const char* text) noexcept;
+
+// A guest file open (any thread); only app0 data paths are kept (v3: level changes to niveaux.csv).
 void FluidityNoteOpen(const char* path) noexcept;
 
 // Guest main thread handle (THREAD_QUERY_LIMITED_INFORMATION), from its start.

@@ -13,6 +13,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/vaContext.h"
+#include "graphics/presentation/fluidityLog.h" // Astro Bot PC (journal v3)
 
 #include <cfloat>
 #include <cmath>
@@ -776,6 +777,7 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 		int s = snprintf(sn_s, sn_n, "%s", buffer.data());
 		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
 	} else {
+		Libs::Graphics::FluidityNoteGameText(buffer.data()); // Astro Bot PC (journal v3, points.csv)
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
 	}
 
