@@ -675,4 +675,35 @@ void SysFileRemoveReadonly(const std::filesystem::path& name) {
 	chmod(real_name_str.c_str(), s.st_mode | S_IWUSR);
 }
 
+
+void* SysFileOpenPositional(const std::filesystem::path& name, uint64_t* size) {
+	const int fd = open(name.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return nullptr;
+	}
+	struct stat s {};
+	if (fstat(fd, &s) != 0) {
+		close(fd);
+		return nullptr;
+	}
+	if (size != nullptr) {
+		*size = static_cast<uint64_t>(s.st_size);
+	}
+	return reinterpret_cast<void*>(static_cast<intptr_t>(fd) + 1);
+}
+
+bool SysFileReadAt(void* handle, void* data, uint32_t size, uint64_t offset, uint32_t* bytes_read) {
+	const int     fd  = static_cast<int>(reinterpret_cast<intptr_t>(handle) - 1);
+	const ssize_t got = pread(fd, data, size, static_cast<off_t>(offset));
+	if (bytes_read != nullptr) {
+		*bytes_read = got > 0 ? static_cast<uint32_t>(got) : 0;
+	}
+	return got >= 0;
+}
+
+void SysFileClosePositional(void* handle) {
+	if (handle != nullptr) {
+		close(static_cast<int>(reinterpret_cast<intptr_t>(handle) - 1));
+	}
+}
 #endif

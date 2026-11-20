@@ -75,4 +75,11 @@ bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::pa
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 void SysFileRemoveReadonly(const std::filesystem::path& name);
 
+// Astro Bot PC (20/11, KYTY_APR_PARALLEL): a read-only handle for positioned reads that several
+// threads may issue at once (no shared file position). nullptr when the file cannot be opened.
+void* SysFileOpenPositional(const std::filesystem::path& name, uint64_t* size);
+// Reads up to `size` bytes at `offset`; false on an error (bytes_read: what was read).
+bool SysFileReadAt(void* handle, void* data, uint32_t size, uint64_t offset, uint32_t* bytes_read);
+void SysFileClosePositional(void* handle);
+
 #endif /* KYTY_COMMON_PLATFORM_SYSFILEIO_H_ */

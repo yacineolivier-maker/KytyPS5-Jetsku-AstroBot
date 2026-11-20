@@ -115,6 +115,41 @@ static DWORD ReadFileIntoMemory(HANDLE handle, void* data, uint32_t size) {
 	return w + ReadFileViaBounceBuffer(handle, static_cast<uint8_t*>(data) + w, size - w);
 }
 
+void* SysFileOpenPositional(const std::filesystem::path& name, uint64_t* size) {
+	HANDLE h = CreateFileW(name.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+	                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+	if (h == INVALID_HANDLE_VALUE) {
+		return nullptr;
+	}
+	LARGE_INTEGER s {};
+	if (GetFileSizeEx(h, &s) == 0) {
+		CloseHandle(h);
+		return nullptr;
+	}
+	if (size != nullptr) {
+		*size = static_cast<uint64_t>(s.QuadPart);
+	}
+	return h;
+}
+
+bool SysFileReadAt(void* handle, void* data, uint32_t size, uint64_t offset, uint32_t* bytes_read) {
+	OVERLAPPED o {};
+	o.Offset     = static_cast<DWORD>(offset & 0xffffffffu);
+	o.OffsetHigh = static_cast<DWORD>(offset >> 32u);
+	DWORD got    = 0;
+	const BOOL ok = ReadFile(static_cast<HANDLE>(handle), data, size, &got, &o);
+	if (bytes_read != nullptr) {
+		*bytes_read = got;
+	}
+	return ok != 0 || GetLastError() == ERROR_HANDLE_EOF;
+}
+
+void SysFileClosePositional(void* handle) {
+	if (handle != nullptr) {
+		CloseHandle(static_cast<HANDLE>(handle));
+	}
+}
+
 uint64_t SysFileReadFallbackCount() {
 	return g_read_fallback_count.load(std::memory_order_relaxed);
 }

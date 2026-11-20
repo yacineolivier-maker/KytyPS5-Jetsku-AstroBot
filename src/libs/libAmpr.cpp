@@ -4,6 +4,7 @@
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
+#include "common/platform/sysFileIO.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
@@ -24,11 +25,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <atomic>
 #include <cinttypes>
@@ -1715,6 +1719,11 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
+// KYTY_APR_PARALLEL (defined further down, with ReadHostFileToGuest).
+static uint32_t AprParallelThreads();
+static int      ReadHostFileToGuestAt(const std::filesystem::path& host_path, uint64_t file_offset,
+                                      uint64_t destination, uint64_t size, uint64_t* bytes_read);
+static void     RunAprReadTasks(std::vector<std::function<void()>>& tasks);
 
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
                                    uint32_t* error_offset,
@@ -1876,7 +1885,53 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 		diagnostic->commands_signature = signature;
 	}
 
-	for (const auto& entry: ordered) {
+	for (size_t oi = 0; oi < ordered.size(); oi++) {
+		const auto& entry = ordered[oi];
+		// KYTY_APR_PARALLEL: a run of consecutive reads (all of known files) at once, then their
+		// results in record order; a run with an unknown file id goes the sequential way below.
+		if (entry.kind == CommandKind::ReadFile && AprParallelThreads() != 0) {
+			size_t end = oi;
+			while (end < ordered.size() && ordered[end].kind == CommandKind::ReadFile) {
+				end++;
+			}
+			const size_t count = end - oi;
+			std::vector<std::filesystem::path> paths(count);
+			bool                               known = count >= 2;
+			for (size_t k = 0; known && k < count; k++) {
+				known = AprShared::TryGetHostPath(state.read_file_commands[ordered[oi + k].index].file_id, &paths[k]);
+			}
+			if (known) {
+				std::vector<int>                   results(count, OK);
+				std::vector<uint64_t>              read_bytes(count, 0);
+				std::vector<std::function<void()>> tasks;
+				tasks.reserve(count);
+				for (size_t k = 0; k < count; k++) {
+					const auto& c = state.read_file_commands[ordered[oi + k].index];
+					tasks.emplace_back([&, k, c] {
+						results[k] = ReadHostFileToGuestAt(paths[k], c.file_offset, c.destination, c.size, &read_bytes[k]);
+					});
+				}
+				{
+					HangWatchdog::Scope batch("ampr-parallel", state.read_file_commands[entry.index].destination, count,
+					                          0, 0, command_buffer);
+					RunAprReadTasks(tasks);
+				}
+				for (size_t k = 0; k < count; k++) {
+					if (diagnostic != nullptr) diagnostic->read_bytes += read_bytes[k];
+					if (results[k] != OK) {
+						const auto& c = state.read_file_commands[ordered[oi + k].index];
+						Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
+						LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
+						     c.file_id, static_cast<uint32_t>(results[k]), Common::PathToString(paths[k]).c_str());
+						*execution_result = results[k];
+						*error_offset     = static_cast<uint32_t>(c.record_offset);
+						return finish(OK);
+					}
+				}
+				oi = end - 1;
+				continue;
+			}
+		}
 		switch (entry.kind) {
 			case CommandKind::ReadFile: {
 				const auto& command = state.read_file_commands[entry.index];
@@ -2162,6 +2217,152 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprShortReads);
 	}
 	return OK;
+}
+
+// Astro Bot PC (20/11, KYTY_APR_PARALLEL=<n>, default 0 = off): the consecutive file reads of one
+// command buffer run on n host threads at once instead of one after the other on the submitting
+// thread (a PS5 serves a buffer's reads together; one at a time, a level load waited for each small
+// read in turn: 20 s on a SATA disk for Aerial Garden with the file cache warm). The reads go through
+// files kept open for the process with positioned reads (several threads read one file at once);
+// commands after the reads (events, writes, counters, waits) still run only once every read before
+// them has finished, in record order, and the first failed read reports as before. Needs
+// KYTY_APR_PREPARE_WRITE=1 (destinations made writable before the copy: the reading threads are
+// host threads, outside the guest fault handling of watched pages); without it, sequential.
+static uint32_t AprParallelThreads() {
+	static const uint32_t n = [] {
+		const auto* v = std::getenv("KYTY_APR_PARALLEL");
+		const int   k = v != nullptr ? std::atoi(v) : 0;
+		return k >= 2 && AprPrepareWriteEnabled() ? static_cast<uint32_t>(std::min(k, 16)) : 0u;
+	}();
+	return n;
+}
+
+struct PositionalAprFile {
+	void*    handle = nullptr;
+	uint64_t size   = 0;
+};
+
+static const PositionalAprFile* OpenPositionalAprFile(const std::filesystem::path& host_path) {
+	static std::mutex                                                          mutex;
+	static std::unordered_map<std::string, std::unique_ptr<PositionalAprFile>> table;
+	const auto                                                                 key = Common::PathToString(host_path);
+	{
+		std::scoped_lock lock(mutex);
+		if (auto it = table.find(key); it != table.end()) {
+			return it->second.get();
+		}
+	}
+	auto file    = std::make_unique<PositionalAprFile>();
+	file->handle = SysFileOpenPositional(host_path, &file->size);
+	if (file->handle == nullptr) {
+		return nullptr;
+	}
+	std::scoped_lock lock(mutex);
+	auto [it, added] = table.emplace(key, std::move(file));
+	if (!added) {
+		SysFileClosePositional(file->handle); // another thread opened it meanwhile
+	}
+	return it->second.get();
+}
+
+// ReadHostFileToGuest for the parallel reads: same results, positioned reads, no per-file lock.
+static int ReadHostFileToGuestAt(const std::filesystem::path& host_path, uint64_t file_offset,
+                                 uint64_t destination, uint64_t size, uint64_t* bytes_read) {
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprRequestedBytes, size);
+	*bytes_read = 0;
+	if (size == 0) {
+		return OK;
+	}
+	if (!AprShared::IsValidGuestRange(destination, size, true)) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	const auto* file = OpenPositionalAprFile(host_path);
+	if (file == nullptr) {
+		LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
+		return LibKernel::KERNEL_ERROR_ENOENT;
+	}
+	if (file_offset >= file->size) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprShortReads);
+		return OK;
+	}
+	const auto readable = std::min<uint64_t>(size, file->size - file_offset);
+	(void)LibKernel::Memory::PrepareHostOverwrite(destination, readable);
+	const auto                        buffer_size = static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable));
+	thread_local std::vector<uint8_t> buffer;
+	if (buffer.size() < buffer_size) {
+		buffer.resize(buffer_size);
+	}
+	static const bool subst = std::getenv("KYTY_APP0_SUBST") != nullptr;
+	while (*bytes_read < readable) {
+		const auto request = static_cast<uint32_t>(std::min<uint64_t>(buffer_size, readable - *bytes_read));
+		uint32_t   read    = 0;
+		if (!SysFileReadAt(file->handle, buffer.data(), request, file_offset + *bytes_read, &read) || read == 0) {
+			break;
+		}
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprHostReadBytes, read);
+		if (subst) [[unlikely]] {
+			// Substitutions match whole files read from their start (small .spx text files).
+			LibKernel::FileSystem::ApplyApp0Substs(Common::PathToString(host_path), buffer.data(), read);
+		}
+		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprGuestCopiedBytes, read);
+		*bytes_read += read;
+	}
+	if (*bytes_read < size) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprShortReads);
+	}
+	return OK;
+}
+
+// A small pool of host threads for the parallel reads; Run returns once every task has finished.
+class AprReadPool {
+public:
+	explicit AprReadPool(uint32_t n) {
+		for (uint32_t i = 0; i < n; i++) {
+			m_threads.emplace_back([this] { Work(); });
+		}
+	}
+	void Run(std::vector<std::function<void()>>& tasks) {
+		std::unique_lock lock(m_mutex);
+		m_pending += tasks.size();
+		for (auto& t: tasks) {
+			m_queue.push_back(std::move(t));
+		}
+		m_ready.notify_all();
+		m_done.wait(lock, [this] { return m_pending == 0; });
+	}
+
+private:
+	void Work() {
+		for (;;) {
+			std::function<void()> task;
+			{
+				std::unique_lock lock(m_mutex);
+				m_ready.wait(lock, [this] { return !m_queue.empty(); });
+				task = std::move(m_queue.front());
+				m_queue.pop_front();
+			}
+			task();
+			std::unique_lock lock(m_mutex);
+			if (--m_pending == 0) {
+				m_done.notify_all();
+			}
+		}
+	}
+	std::mutex                        m_mutex;
+	std::condition_variable           m_ready, m_done;
+	std::deque<std::function<void()>> m_queue;
+	size_t                            m_pending = 0;
+	std::vector<std::thread>          m_threads;
+};
+
+static void RunAprReadTasks(std::vector<std::function<void()>>& tasks) {
+	static AprReadPool* pool = [] {
+		std::printf("Kyty APR : lectures en parallele sur %u fils (KYTY_APR_PARALLEL)\n", AprParallelThreads());
+		std::fflush(stdout);
+		return new AprReadPool(AprParallelThreads()); // never destroyed (threads live on)
+	}();
+	pool->Run(tasks);
 }
 
 static int KYTY_SYSV_ABI CommandBufferConstructor(void* command_buffer) {
