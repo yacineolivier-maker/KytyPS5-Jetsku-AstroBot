@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 
+#include <unordered_set>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1316,6 +1317,31 @@ void FluidityNoteGameText(const char* text) noexcept {
 	}
 }
 
+void FluidityNoteDataFile(const char* source, const std::string& path, uint64_t size) noexcept {
+	if (!Config().enabled || path.empty()) {
+		return;
+	}
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> seen;
+	{
+		std::scoped_lock lock(mutex);
+		if (!seen.insert(path).second) {
+			return;
+		}
+	}
+	const std::string stamp = EventStamp();
+	if (stamp.empty()) {
+		return;
+	}
+	std::string level;
+	{
+		std::scoped_lock lock(g_level_mutex);
+		level = g_level;
+	}
+	AppendLine("fichiers.csv", "t_s;heure;niveau;source;taille;chemin",
+	           stamp + ";" + level + ";" + source + ";" + std::to_string(size) + ";" + Field(path.c_str(), 400));
+}
+
 void FluidityNoteOpen(const char* path) noexcept {
 	if (!Config().enabled || path == nullptr) {
 		return;
@@ -1323,6 +1349,7 @@ void FluidityNoteOpen(const char* path) noexcept {
 	if (std::strncmp(path, "/app0/", 6) != 0) {
 		return;
 	}
+	FluidityNoteDataFile("ouverture", path, 0); // v4: preload list (size unknown at open)
 	// v3: niveaux.csv, each change of the level folder the game opens files in.
 	if (std::strncmp(path, "/app0/data/prein/levels/", 24) == 0) {
 		const char* name = path + 24;

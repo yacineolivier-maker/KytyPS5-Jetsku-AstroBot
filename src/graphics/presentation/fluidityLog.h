@@ -61,6 +61,11 @@ void FluidityNotePadState(int handle, uint32_t buttons, uint8_t lx, uint8_t ly, 
 // Guest flips since the session started (0 before), the frame clock of commandes.csv.
 [[nodiscard]] uint64_t FluidityFlipIndex() noexcept;
 
+// v4 (20/11, preload lists): the first read of each game data file in the session (APR reads and
+// kernel opens, any thread): fichiers.csv, "t_s;heure;niveau;source;taille;chemin", the files each
+// level loads, for reading them ahead of the game later.
+void FluidityNoteDataFile(const char* source, const std::string& path, uint64_t size) noexcept;
+
 // v3: a line the game printed (any thread); "ActivateCheckPoint..." lines go to points.csv.
 void FluidityNoteGameText(const char* text) noexcept;
 

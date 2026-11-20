@@ -7,6 +7,7 @@
 #include "common/platform/sysFileIO.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "graphics/presentation/fluidityLog.h" // Astro Bot PC (journal v4, fichiers.csv)
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -2115,9 +2116,18 @@ static std::shared_ptr<KeptAprFile> OpenKeptAprFile(const std::filesystem::path&
 	return table.emplace(std::move(key), std::move(kept)).first->second;
 }
 
+// Journal v4 (fichiers.csv, preload lists): the host path as the game names it ("/app0/data/...").
+static void NoteAprDataFile(const std::filesystem::path& host_path, uint64_t size) {
+	auto       p   = Common::PathToString(host_path);
+	std::replace(p.begin(), p.end(), '\\', '/');
+	const auto pos = p.find("/data/");
+	Libs::Graphics::FluidityNoteDataFile("apr", pos != std::string::npos ? "/app0" + p.substr(pos) : p, size);
+}
+
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	Profiler::ScopedLoadingOperation loading(Profiler::LoadingOperation::AprRead);
+	NoteAprDataFile(host_path, size);
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprRequestedBytes, size);
 	if (bytes_read == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -2269,6 +2279,7 @@ static const PositionalAprFile* OpenPositionalAprFile(const std::filesystem::pat
 static int ReadHostFileToGuestAt(const std::filesystem::path& host_path, uint64_t file_offset,
                                  uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprRequestedBytes, size);
+	NoteAprDataFile(host_path, size);
 	*bytes_read = 0;
 	if (size == 0) {
 		return OK;
