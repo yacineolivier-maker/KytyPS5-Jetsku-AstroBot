@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -70,6 +71,15 @@ constexpr uint32_t AVPLAYER_DEMUX_BUFFER_DEFAULT   = 4 * 1024 * 1024;
 constexpr uint32_t AVPLAYER_DEMUX_BUFFER_MIN       = 128 * 1024;
 constexpr uint32_t AVPLAYER_DEMUX_BUFFER_MAX       = 32 * 1024 * 1024;
 constexpr int      AVPLAYER_AUDIO_BUFFERS          = 8;
+
+// KYTY_AVPLAYER_SKIP_LATE (Player::Video): on unless set to 0.
+bool AvPlayerSkipLate() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_AVPLAYER_SKIP_LATE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 enum AvPlayerUriType : uint32_t { AvPlayerUriTypeSource = 0 };
 enum AvPlayerSourceType : uint32_t {
@@ -857,7 +867,7 @@ public:
 			result = AVPLAYER_ERROR_OPERATION_FAILED;
 		}
 		if (result == 0 && video_id) {
-			::printf("AvPlayer video started playing\n");
+			::printf("AvPlayer video started playing: %s (sync mode %u)\n", path.c_str(), sync_mode);
 		}
 		return result;
 	}
@@ -881,7 +891,15 @@ public:
 			}
 		}
 		if (was_playing_video) {
-			::printf("AvPlayer video stopped\n");
+			const auto shown = frames_shown.exchange(0);
+			::printf("AvPlayer video stopped (%llu frames shown, %llu late frames skipped; lateness mean "
+			         "%llu ms, max %llu ms; timestamp steps %llu..%llu ms, %llu over 40 ms)\n",
+			         static_cast<unsigned long long>(shown),
+			         static_cast<unsigned long long>(frames_skipped.exchange(0)),
+			         static_cast<unsigned long long>(shown != 0 ? late_sum_ms / shown : 0),
+			         static_cast<unsigned long long>(late_max_ms), static_cast<unsigned long long>(step_min_ms),
+			         static_cast<unsigned long long>(step_max_ms), static_cast<unsigned long long>(step_big));
+			late_sum_ms = late_max_ms = last_shown_ts = step_min_ms = step_max_ms = step_big = 0;
 		}
 		emit_event(stop_event, AVPLAYER_EVENT_STATE_STOP);
 		return 0;
@@ -990,10 +1008,45 @@ public:
 		if (!frame) {
 			return false;
 		}
+		// Astro Bot PC (20/11, KYTY_AVPLAYER_SKIP_LATE, default on; 0 = one frame per call as
+		// before): the game asks for a frame once per game frame, 30 times a second here (60 on a
+		// PS5), while its videos run at 60 frames a second. Handing out one frame per call played
+		// the boot logo (ps_studio_armadillo.mp4, sync mode 1: no clock check) at half speed, 8.5 s
+		// behind its sound at the end. Every older frame that is already due on the player clock
+		// (the audio position when the video has sound) is now skipped, its buffer going back to
+		// the decoder, so the frame shown is the one of the current time. Sync mode 1 still hands
+		// out the next frame without waiting for its time; it only no longer falls behind.
+		if (!deliver_seek_frame && AvPlayerSkipLate()) {
+			while (auto newer = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
+				       auto now = CurrentTimeNoLock();
+				       return now != 0 && candidate.info.time_stamp + candidate.timestamp_offset <= now;
+			       })) {
+				RecordLoopBoundary(*frame);
+				frames_skipped.fetch_add(1, std::memory_order_relaxed);
+				video_buffers.Push(std::move(frame->buffer));
+				frame = std::move(newer);
+			}
+		}
 		if (current_video) {
 			video_buffers.Push(std::move(current_video->buffer));
 		}
 		current_video = std::move(*frame);
+		frames_shown.fetch_add(1, std::memory_order_relaxed);
+		if (const auto now = CurrentTimeNoLock(); now != 0) {
+			// Lateness of the frame handed out against the player clock, and the gap between the
+			// timestamps of consecutive frames handed out (statistics printed when the video stops).
+			const auto ts   = current_video->info.time_stamp + current_video->timestamp_offset;
+			const auto late = now > ts ? now - ts : 0;
+			late_sum_ms += late;
+			late_max_ms = std::max<uint64_t>(late_max_ms, late);
+			if (last_shown_ts != 0 && ts > last_shown_ts) {
+				const auto step = ts - last_shown_ts;
+				step_min_ms     = step_min_ms == 0 ? step : std::min<uint64_t>(step_min_ms, step);
+				step_max_ms     = std::max<uint64_t>(step_max_ms, step);
+				step_big += step > 40 ? 1 : 0;
+			}
+			last_shown_ts = ts;
+		}
 		*out          = current_video->info;
 		RecordLoopBoundary(*current_video);
 		if (deliver_seek_frame) {
@@ -1141,6 +1194,19 @@ private:
 		auto* c = avcodec_alloc_context3(dec);
 		if (c == nullptr) {
 			return false;
+		}
+		// Astro Bot PC (20/11, KYTY_AVPLAYER_VIDEO_THREADS, default 4; 1 = one thread as before):
+		// the video decoder ran on one thread, about 47 frames a second for the 60 frames a second
+		// boot logo while the game loads (the CPU is busy), so the video fell up to 3 s behind its
+		// sound. Frame and slice threading keep it ahead.
+		if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+			static const int threads = [] {
+				const auto* value = std::getenv("KYTY_AVPLAYER_VIDEO_THREADS");
+				const int   n     = value != nullptr ? std::atoi(value) : 4;
+				return n >= 1 && n <= 16 ? n : 4;
+			}();
+			c->thread_count = threads;
+			c->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
 		}
 		if (avcodec_parameters_to_context(c, s->codecpar) < 0 ||
 		    avcodec_open2(c, dec, nullptr) < 0) {
@@ -1702,6 +1768,10 @@ private:
 	int32_t                                  trick_speed   = AVPLAYER_TRICK_SPEED_NORMAL;
 	uint32_t                                 sync_mode     = 0;
 	uint64_t                                 start_time_ms = 0;
+	std::atomic<uint64_t>                    frames_shown {0}; // KYTY_AVPLAYER_SKIP_LATE statistics
+	std::atomic<uint64_t>                    frames_skipped {0};
+	uint64_t                                 late_sum_ms = 0, late_max_ms = 0, last_shown_ts = 0;
+	uint64_t                                 step_min_ms = 0, step_max_ms = 0, step_big = 0;
 	uint64_t                                 last_output_loop_offset = 0;
 	uint32_t                                 pending_loop_warnings   = 0;
 	std::chrono::steady_clock::time_point    clock_start {};
