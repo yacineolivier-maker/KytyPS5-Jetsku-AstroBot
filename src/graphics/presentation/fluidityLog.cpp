@@ -803,6 +803,7 @@ constexpr auto TRACE   = std::chrono::milliseconds(500);
 State                  g_state; // video-out thread only
 // v3: the session start (steady clock, ns since its epoch) for the events of other threads; 0 before.
 std::atomic<int64_t>   g_session_start_ns {0};
+std::atomic<uint64_t>  g_flip_index {0}; // v4: guest flips since the session started (FluidityRecordFlip)
 std::atomic<uint32_t>  g_capture_request {0};
 std::atomic<uint32_t>  g_next_image {1};
 std::atomic<bool>      g_mark_request {false};
@@ -947,6 +948,7 @@ void FluidityRecordFlip() noexcept {
 	}
 	auto&      s   = g_state;
 	const auto now = Clock::now();
+	g_flip_index.fetch_add(1, std::memory_order_relaxed); // v4: frame clock of commandes.csv
 	if (s.session_start == Clock::time_point {}) {
 		DC::SetCollect(true);
 		s.session_start = now;
@@ -1242,6 +1244,66 @@ void FluidityNoteButton(uint32_t button, bool down) noexcept {
 	AppendLine("manette.csv", "t_s;heure;bouton;etat;camera",
 	           stamp + ";" + (name != nullptr ? std::string(name) : std::to_string(button)) + ";" +
 	               (down ? "appui" : "relache") + ";" + ReadCamera());
+}
+
+uint64_t FluidityFlipIndex() noexcept {
+	return g_flip_index.load(std::memory_order_relaxed);
+}
+
+void FluidityNotePadState(int handle, uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry,
+                          uint8_t l2, uint8_t r2) noexcept {
+	if (!Config().enabled) {
+		return;
+	}
+	// The game reads several pads each frame (the player's and idle ones): the line is their merge (buttons of
+	// any pad, each stick and trigger from the pad that pushes it furthest), one line per change of the merge.
+	struct Pad {
+		uint32_t buttons = 0;
+		uint8_t  v[6] {128, 128, 128, 128, 0, 0};
+	};
+	static std::mutex          mutex;
+	static std::array<Pad, 8>  pads {};
+	static Pad                 last {~0u, {}};
+	Pad                        merged;
+	{
+		std::scoped_lock lock(mutex);
+		auto&            p = pads[static_cast<size_t>(handle) % pads.size()];
+		p.buttons          = buttons;
+		const uint8_t in[6] {lx, ly, rx, ry, l2, r2};
+		std::copy(std::begin(in), std::end(in), p.v);
+		merged.buttons = 0;
+		for (const auto& q: pads) {
+			merged.buttons |= q.buttons;
+			for (int k = 0; k < 6; k++) {
+				const int c = k < 4 ? 128 : 0;
+				if (std::abs(q.v[k] - c) > std::abs(merged.v[k] - c)) {
+					merged.v[k] = q.v[k];
+				}
+			}
+		}
+		// Also one line every 10 frames without a change: the replay compares the camera with the recorded one
+		// (20/11, first replay: with lines only at changes, a stick held forward kept the starting place as the
+		// reference, and the driver walked Astro back).
+		static uint64_t last_flip = 0;
+		const uint64_t  flip      = FluidityFlipIndex();
+		if (merged.buttons == last.buttons && std::equal(std::begin(merged.v), std::end(merged.v), last.v) &&
+		    flip < last_flip + 10) {
+			return;
+		}
+		last      = merged;
+		last_flip = flip;
+	}
+	buttons = merged.buttons;
+	lx = merged.v[0], ly = merged.v[1], rx = merged.v[2], ry = merged.v[3], l2 = merged.v[4], r2 = merged.v[5];
+	const std::string stamp = EventStamp();
+	if (stamp.empty()) {
+		return;
+	}
+	char line[96];
+	std::snprintf(line, sizeof(line), "%llu;%s;%x;%u;%u;%u;%u;%u;%u;",
+	              static_cast<unsigned long long>(FluidityFlipIndex()), stamp.c_str(), buttons, lx, ly, rx, ry,
+	              l2, r2);
+	AppendLine("commandes.csv", "image;t_s;heure;boutons;lx;ly;rx;ry;l2;r2;camera", line + ReadCamera());
 }
 
 void FluidityNoteGameText(const char* text) noexcept {

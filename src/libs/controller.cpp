@@ -1472,6 +1472,18 @@ int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote) {
 	return OK;
 }
 
+// Astro Bot PC (journal v4, commandes.csv): what the game reads, for a frame-by-frame replay. The game
+// reads several pads each frame (20/11: the player's and an idle one); the journal merges them by pad.
+static void NotePadRead(int handle, const PadData& d, bool connected) {
+	if (!connected) {
+		return; // a pad that is not there (zeroed sticks) is not the player's
+	}
+	Libs::Graphics::FluidityNotePadState(handle, d.buttons, static_cast<uint8_t>(d.left_stick_x),
+	                                     static_cast<uint8_t>(d.left_stick_y), static_cast<uint8_t>(d.right_stick_x),
+	                                     static_cast<uint8_t>(d.right_stick_y), d.analog_buttons_l2,
+	                                     d.analog_buttons_r2);
+}
+
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
 
@@ -1489,6 +1501,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PlayerForHandle(handle)->ReadState(&state, &connected, &connected_count);
 
 	pad_fill_data(data, state, connected, connected_count);
+	NotePadRead(handle, *data, connected);
 
 	return OK;
 }
@@ -1523,6 +1536,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	for (int i = 0; i < ret_num; i++) {
 		pad_fill_data(&data[i], states[i], connected, connected_count);
 	}
+	NotePadRead(handle, data[ret_num - 1], connected); // the newest state
 
 	return ret_num;
 }

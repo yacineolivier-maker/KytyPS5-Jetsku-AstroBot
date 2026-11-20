@@ -821,6 +821,8 @@ private:
 		uint32_t ms   = 0;
 		float    x = 0, z = 0, tolerance = 0.05f;
 		uint32_t max_ms = 0; // "attendre-calme"
+		std::string file;    // "rejouer" (kind 9): commandes.csv, frames from..to
+		uint64_t    from = 0, to = 0;
 	};
 
 	static void ApplyStick(float side, float forward) {
@@ -1070,6 +1072,189 @@ private:
 		return true;
 	}
 
+	// v4 (20/11, "TAS" replay): "rejouer <commandes.csv> <image de debut> <image de fin> [tolerance=1.5]".
+	// commandes.csv (journal v4) holds every pad state the game read during a session, with the guest
+	// flip index and the camera. The replay applies them frame by frame on the guest flip clock (a slower
+	// game gets the same inputs per frame), from the frame the step starts at. The emulator is not
+	// deterministic (loading times, enemies), so every 10 frames the camera is compared with the recorded
+	// one: past the tolerance, the driver walks back to the recorded place ("aller") and resumes from the
+	// recorded frame nearest to where Astro now is, within the next 10 seconds of the recording.
+	struct Recorded {
+		uint64_t image = 0;
+		uint32_t buttons = 0;
+		uint8_t  axes[6] {};
+		float    x = 0, z = 0;
+		bool     has_camera = false;
+	};
+
+	static std::vector<Recorded> LoadRecording(const std::string& path, uint64_t from, uint64_t to) {
+		std::vector<Recorded> out;
+		std::ifstream         in(path, std::ios::binary);
+		std::string           line;
+		while (std::getline(in, line)) {
+			// image;t_s;heure;boutons;lx;ly;rx;ry;l2;r2;camera
+			std::vector<std::string> f;
+			std::string              cur;
+			for (char c: line) {
+				if (c == ';') {
+					f.push_back(cur);
+					cur.clear();
+				} else if (c != '\r') {
+					cur += c;
+				}
+			}
+			f.push_back(cur);
+			if (f.size() < 10 || f[0].empty() || !std::isdigit(static_cast<unsigned char>(f[0][0]))) {
+				continue;
+			}
+			Recorded r;
+			r.image = std::strtoull(f[0].c_str(), nullptr, 10);
+			if (r.image > to) {
+				break;
+			}
+			r.buttons = static_cast<uint32_t>(std::strtoul(f[3].c_str(), nullptr, 16));
+			for (int k = 0; k < 6; k++) {
+				r.axes[k] = static_cast<uint8_t>(std::clamp(std::atoi(f[4 + k].c_str()), 0, 255));
+			}
+			if (f.size() > 10) {
+				float y = 0;
+				std::istringstream cam(f[10]);
+				r.has_camera = static_cast<bool>(cam >> r.x >> y >> r.z);
+			}
+			if (r.image >= from) {
+				out.push_back(r);
+			} else {
+				// the state in force at `from`: the last one before it
+				if (out.empty()) {
+					out.push_back(r);
+				} else {
+					out[0] = r;
+				}
+				out[0].image = from;
+			}
+		}
+		return out;
+	}
+
+	static void ApplyRecorded(const Recorded& r) {
+		static constexpr uint32_t BUTTONS[] = {
+		    Controller::PAD_BUTTON_CROSS, Controller::PAD_BUTTON_SQUARE, Controller::PAD_BUTTON_TRIANGLE,
+		    Controller::PAD_BUTTON_CIRCLE, Controller::PAD_BUTTON_L1, Controller::PAD_BUTTON_R1,
+		    Controller::PAD_BUTTON_L2, Controller::PAD_BUTTON_R2, Controller::PAD_BUTTON_OPTIONS,
+		    0x00000002u /* L3 */, 0x00000004u /* R3 */, 0x00000010u, 0x00000020u, 0x00000040u, 0x00000080u /* pad */};
+		const int id = Controller::HOST_INPUT_CONTROLLER_ID;
+		for (const auto b: BUTTONS) {
+			Controller::SetButton(id, b, (r.buttons & b) != 0);
+		}
+		Controller::SetAxis(id, Controller::Axis::LeftX, r.axes[0]);
+		Controller::SetAxis(id, Controller::Axis::LeftY, r.axes[1]);
+		Controller::SetAxis(id, Controller::Axis::RightX, r.axes[2]);
+		Controller::SetAxis(id, Controller::Axis::RightY, r.axes[3]);
+		Controller::SetAxis(id, Controller::Axis::TriggerLeft, r.axes[4]);
+		Controller::SetAxis(id, Controller::Axis::TriggerRight, r.axes[5]);
+	}
+
+	// "rejouer": false if the file changed or the driver stops.
+	bool Replay(const Step& s) {
+		const auto rec = LoadRecording(s.file, s.from, s.to);
+		if (rec.empty()) {
+			std::printf("Kyty pilote interne : rejouer : aucune commande entre les images %llu et %llu de %s\n",
+			            static_cast<unsigned long long>(s.from), static_cast<unsigned long long>(s.to), s.file.c_str());
+			std::fflush(stdout);
+			return true;
+		}
+		m_active          = true;
+		int64_t  offset   = static_cast<int64_t>(Libs::Graphics::FluidityFlipIndex()) - static_cast<int64_t>(s.from);
+		size_t   k        = 0, applied = SIZE_MAX;
+		uint64_t checked  = 0;
+		uint32_t resyncs  = 0;
+		float    worst    = 0;
+		std::printf("Kyty pilote interne : rejouer : %zu etats, images %llu a %llu\n", rec.size(),
+		            static_cast<unsigned long long>(s.from), static_cast<unsigned long long>(s.to));
+		std::fflush(stdout);
+		for (;;) {
+			if (m_stop || Changed()) {
+				m_reload = !m_stop;
+				return false;
+			}
+			const auto f = static_cast<uint64_t>(std::max<int64_t>(
+			    0, static_cast<int64_t>(Libs::Graphics::FluidityFlipIndex()) - offset));
+			if (f > s.to) {
+				break;
+			}
+			while (k + 1 < rec.size() && rec[k + 1].image <= f) {
+				k++;
+			}
+			if (k != applied) {
+				ApplyRecorded(rec[k]);
+				applied = k;
+			}
+			// Position check every 10 frames, against the last recorded camera at or before this frame.
+			if (f >= checked + 10) {
+				checked = f;
+				size_t c = k;
+				while (c > 0 && !rec[c].has_camera) {
+					c--;
+				}
+				float pos[3] {}, dir[3] {};
+				if (rec[c].has_camera && Libs::Graphics::FluidityCamera(pos, dir)) {
+					const float d = std::hypot(rec[c].x - pos[0], rec[c].z - pos[2]);
+					worst         = std::max(worst, d);
+					if (d > s.tolerance) {
+						// Walk back to the recorded place, then resume from the nearest recorded frame ahead.
+						Step back {};
+						back.kind      = 2;
+						back.x         = rec[c].x;
+						back.z         = rec[c].z;
+						back.tolerance = 0.5f;
+						back.ms        = 6000;
+						Recorded neutral {};
+						std::fill(std::begin(neutral.axes), std::begin(neutral.axes) + 4, uint8_t {128});
+						ApplyRecorded(neutral);
+						m_quiet       = true;
+						const bool ok = Go(back);
+						m_quiet       = false;
+						if (!ok) {
+							return false;
+						}
+						resyncs++;
+						float p2[3] {}, d2[3] {};
+						size_t best = c;
+						if (Libs::Graphics::FluidityCamera(p2, d2)) {
+							float best_d = 1e30f;
+							for (size_t q = c; q < rec.size() && rec[q].image <= rec[c].image + 300; q++) {
+								if (!rec[q].has_camera) {
+									continue;
+								}
+								const float dq = std::hypot(rec[q].x - p2[0], rec[q].z - p2[2]);
+								if (dq < best_d) {
+									best_d = dq;
+									best   = q;
+								}
+							}
+						}
+						k       = best;
+						applied = SIZE_MAX;
+						offset  = static_cast<int64_t>(Libs::Graphics::FluidityFlipIndex()) -
+						         static_cast<int64_t>(rec[best].image);
+						checked = rec[best].image;
+						continue;
+					}
+				}
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+		Recorded neutral {};
+		std::fill(std::begin(neutral.axes), std::begin(neutral.axes) + 4, uint8_t {128});
+		ApplyRecorded(neutral);
+		float p2[3] {}, d2[3] {};
+		const bool cam = Libs::Graphics::FluidityCamera(p2, d2);
+		std::printf("Kyty pilote interne : rejouer : fini, %u recalages, ecart max %.2f, camera %.3f %.3f %.3f\n", resyncs,
+		            worst, cam ? p2[0] : 0.0f, cam ? p2[1] : 0.0f, cam ? p2[2] : 0.0f);
+		std::fflush(stdout);
+		return true;
+	}
+
 	static constexpr const char* KEYS[] = {"W", "A", "S", "D", "F", "H", "T", "G", "J", "K", "I", "L",
 	                                       "Q", "E", "Z", "C", "ENTREE"};
 
@@ -1213,6 +1398,21 @@ private:
 				s.ms        = max_ms;
 				m_steps.push_back(s);
 				continue;
+			} else if (verb == "rejouer") {
+				std::string file;
+				uint64_t    from = 0, to = 0;
+				float       tolerance = 1.5f;
+				if (!(words >> file >> from >> to)) {
+					continue;
+				}
+				words >> tolerance;
+				s.kind      = 9;
+				s.file      = file;
+				s.from      = from;
+				s.to        = to;
+				s.tolerance = tolerance > 0 ? tolerance : 1.5f;
+				m_steps.push_back(s);
+				continue;
 			} else if (verb == "aller") {
 				float    x = 0, z = 0, tolerance = 0.05f;
 				uint32_t max_ms = 20000;
@@ -1302,6 +1502,12 @@ private:
 				}
 				if (s.kind == 8) {
 					i = Join(i);
+					continue;
+				}
+				if (s.kind == 9) {
+					if (!Replay(s)) {
+						break;
+					}
 					continue;
 				}
 				if (s.kind == 2 || s.kind == 3 || s.kind == 4) {

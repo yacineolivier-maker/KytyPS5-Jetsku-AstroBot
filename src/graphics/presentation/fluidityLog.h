@@ -52,6 +52,15 @@ void FluidityNotePadButton(int id, bool left_stick, bool down) noexcept;
 // v3 (19/11): a pad button change (any pad, any thread): manette.csv, for replaying a session's path.
 void FluidityNoteButton(uint32_t button, bool down) noexcept;
 
+// v4 (20/11, "TAS" recording): the pad state the game reads (scePadRead/scePadReadState, any thread):
+// commandes.csv, one line per change of what the game sees: guest flip index, buttons, sticks and
+// triggers (0..255), camera. Replayed frame by frame by the internal pad driver ("rejouer").
+void FluidityNotePadState(int handle, uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry,
+                          uint8_t l2, uint8_t r2) noexcept;
+
+// Guest flips since the session started (0 before), the frame clock of commandes.csv.
+[[nodiscard]] uint64_t FluidityFlipIndex() noexcept;
+
 // v3: a line the game printed (any thread); "ActivateCheckPoint..." lines go to points.csv.
 void FluidityNoteGameText(const char* text) noexcept;
 
