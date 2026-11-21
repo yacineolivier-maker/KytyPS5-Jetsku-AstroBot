@@ -81,6 +81,19 @@ bool AvPlayerSkipLate() {
 	return enabled;
 }
 
+// Astro Bot PC (21/11) KYTY_AVPLAYER_STEADY=1 (default off): with KYTY_AVPLAYER_SKIP_LATE, the frame handed
+// out advances by a steady whole number of video frames (the game's call interval rounded to the frame period:
+// 2 frames of a 60 fps video at 30 game fps) instead of "the newest frame already due", whose step jumped
+// between 1 and 4 frames when the game's frame times jittered around the video's frame boundaries (tutorial
+// gesture videos trembling). It resynchronizes on the player clock when it drifts by more than a frame.
+bool AvPlayerSteady() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_AVPLAYER_STEADY");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 enum AvPlayerUriType : uint32_t { AvPlayerUriTypeSource = 0 };
 enum AvPlayerSourceType : uint32_t {
 	AvPlayerSourceUnknown  = 0,
@@ -900,6 +913,7 @@ public:
 			         static_cast<unsigned long long>(late_max_ms), static_cast<unsigned long long>(step_min_ms),
 			         static_cast<unsigned long long>(step_max_ms), static_cast<unsigned long long>(step_big));
 			late_sum_ms = late_max_ms = last_shown_ts = step_min_ms = step_max_ms = step_big = 0;
+			steady_last_now = 0;
 		}
 		emit_event(stop_event, AVPLAYER_EVENT_STATE_STOP);
 		return 0;
@@ -1017,10 +1031,33 @@ public:
 		// the decoder, so the frame shown is the one of the current time. Sync mode 1 still hands
 		// out the next frame without waiting for its time; it only no longer falls behind.
 		if (!deliver_seek_frame && AvPlayerSkipLate()) {
+			// KYTY_AVPLAYER_STEADY: limit of the frames to skip to, a steady step after the last frame shown.
+			uint64_t   steady_limit = 0;
+			const auto call_now     = CurrentTimeNoLock();
+			if (AvPlayerSteady() && call_now != 0 && last_shown_ts != 0 && steady_last_now != 0 &&
+			    steady_period_ms != 0 && call_now > steady_last_now) {
+				const uint64_t period = steady_period_ms;
+				const uint64_t steps  = std::max<uint64_t>(1, (call_now - steady_last_now + period / 2) / period);
+				uint64_t       target = last_shown_ts + steps * period;
+				if (target + period < call_now || target > call_now + period) {
+					target = call_now; // drifted by more than a frame: back on the player clock
+				}
+				steady_limit = target + period / 2;
+			}
+			steady_last_now = call_now;
 			while (auto newer = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
-				       auto now = CurrentTimeNoLock();
-				       return now != 0 && candidate.info.time_stamp + candidate.timestamp_offset <= now;
+				       auto       now = CurrentTimeNoLock();
+				       const auto ts  = candidate.info.time_stamp + candidate.timestamp_offset;
+				       if (steady_limit != 0) {
+					       return now != 0 && ts <= steady_limit && ts <= now + steady_period_ms / 2;
+				       }
+				       return now != 0 && ts <= now;
 			       })) {
+				if (const auto t0 = frame->info.time_stamp + frame->timestamp_offset,
+				    t1            = newer->info.time_stamp + newer->timestamp_offset;
+				    t1 > t0 && t1 - t0 <= 100) {
+					steady_period_ms = t1 - t0; // decoded frame spacing (16-17 ms at 60 fps)
+				}
 				RecordLoopBoundary(*frame);
 				frames_skipped.fetch_add(1, std::memory_order_relaxed);
 				video_buffers.Push(std::move(frame->buffer));
@@ -1772,6 +1809,7 @@ private:
 	std::atomic<uint64_t>                    frames_skipped {0};
 	uint64_t                                 late_sum_ms = 0, late_max_ms = 0, last_shown_ts = 0;
 	uint64_t                                 step_min_ms = 0, step_max_ms = 0, step_big = 0;
+	uint64_t                                 steady_last_now = 0, steady_period_ms = 0; // KYTY_AVPLAYER_STEADY
 	uint64_t                                 last_output_loop_offset = 0;
 	uint32_t                                 pending_loop_warnings   = 0;
 	std::chrono::steady_clock::time_point    clock_start {};
