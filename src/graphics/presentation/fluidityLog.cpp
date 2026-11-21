@@ -34,6 +34,7 @@
 #include <intrin.h>
 #include <windows.h>
 // windows.h first
+#include <psapi.h>
 #include <tlhelp32.h>
 #endif
 
@@ -395,6 +396,29 @@ std::string ReadCamera() {
 // translation) and of the guest main thread in % of one core, the top threads, the CPU the other
 // processes use (in cores) and the share of the machine in use.
 
+// ---- v5 (21/11, porteur : « capter un maximum d'informations sur la fluidité et les chargements ») ----
+// secondes.csv (une ligne par seconde) et chargements.csv (une ligne par chargement de niveau), écrits par
+// le fil de surveillance. Rien par dessin : des compteurs atomiques posés par le fil de présentation et les
+// ouvertures de fichiers, le reste lu une fois par seconde (processus, machine, GPU par NVML).
+std::atomic<uint64_t> g_v5_flips {0};      // images présentées
+std::atomic<uint32_t> g_v5_worst_us {0};   // pire image de la seconde (µs), remis à 0 chaque seconde
+std::atomic<uint32_t> g_v5_slow {0};       // images de la seconde plus longues que 34,5 ms (sous 29 i/s)
+std::atomic<uint32_t> g_v5_very_slow {0};  // images de plus de 50 ms
+std::atomic<uint64_t> g_v5_new_files {0};  // fichiers du jeu lus pour la première fois
+std::mutex            g_v5_level_mutex;
+std::string           g_v5_level;           // dernier dossier de niveau ouvert (hors ui_*)
+uint64_t              g_v5_level_changes = 0; // compteur de changements (sous le verrou)
+
+struct V5Machine {
+	double      seconds    = 1.0;
+	float       system_pct = -1;
+	float       others     = -1;
+	double      emu_cores  = -1; // processeur de l'émulateur, en cœurs
+	double      emu_kernel = -1; // dont noyau Windows
+	std::string threads;         // tous les fils nommés >= 1 %
+};
+void V5Second(const V5Machine& m);
+
 struct Load {
 	float       cp_pct     = -1; // Thread_Gpu, -1 unknown
 	float       main_pct   = -1; // Thread_Main / MainThread
@@ -510,21 +534,35 @@ void MonitorLoop() {
 		for (size_t i = 0; i < rows.size() && i < 6; i++) {
 			load.top += (i == 0 ? "" : " ") + rows[i].name + "=" + std::to_string(static_cast<int>(rows[i].pct + 0.5));
 		}
+		V5Machine v5;
+		v5.seconds = d_s;
+		for (size_t i = 0; i < rows.size(); i++) { // v5: tous les fils nommés
+			v5.threads += (i == 0 ? "" : " ") + rows[i].name + "=" + std::to_string(static_cast<int>(rows[i].pct + 0.5));
+		}
 		GetSystemTimes(&idle, &kernel, &user);
 		GetProcessTimes(GetCurrentProcess(), &c, &e, &pk, &pu);
 		const uint64_t s_busy = FileTime(kernel) + FileTime(user) - FileTime(idle);
 		const uint64_t p_time = FileTime(pk) + FileTime(pu);
+		static uint64_t last_pk = FileTime(pk);
 		const double   window = d_s * 1e7; // 100 ns units
 		if (window > 0) {
 			const double busy  = static_cast<double>(s_busy - last_busy);
 			const double proc  = static_cast<double>(p_time - last_proc);
 			load.system_pct    = static_cast<float>(100.0 * busy / (window * cpus));
 			load.others        = static_cast<float>(std::max(0.0, busy - proc) / window);
+			v5.emu_cores       = proc / window;
+			v5.emu_kernel      = static_cast<double>(FileTime(pk) - last_pk) / window;
 		}
+		last_pk   = FileTime(pk);
 		last_busy = s_busy;
 		last_proc = p_time;
-		std::scoped_lock lock(g_load_mutex);
-		g_load = std::move(load);
+		v5.system_pct = load.system_pct;
+		v5.others     = load.others;
+		{
+			std::scoped_lock lock(g_load_mutex);
+			g_load = std::move(load);
+		}
+		V5Second(v5);
 	}
 }
 #endif
@@ -924,6 +962,347 @@ void WriteMark(State& s, Clock::time_point now) {
 	AppendLine("journal.csv", JOURNAL_HEADER, line);
 }
 
+// ---- v5 : secondes.csv et chargements.csv (voir g_v5_*) ------------------------------------------
+#if defined(_WIN32)
+// GPU NVIDIA par NVML (nvml.dll du pilote), chargé à la première seconde ; absent : colonnes vides.
+struct Nvml {
+	using Init     = int (*)();
+	using Handle   = int (*)(unsigned, void**);
+	struct Util {
+		unsigned gpu, memory;
+	};
+	struct Mem {
+		unsigned long long total, free, used;
+	};
+	using GetUtil  = int (*)(void*, Util*);
+	using GetMem   = int (*)(void*, Mem*);
+	using GetClock = int (*)(void*, int, unsigned*);
+	using GetTemp  = int (*)(void*, int, unsigned*);
+	using GetPower = int (*)(void*, unsigned*);
+	using GetLimit = int (*)(void*, unsigned long long*);
+	using GetPstate = int (*)(void*, int*);
+	bool      ok     = false;
+	void*     device = nullptr;
+	GetUtil   util   = nullptr;
+	GetMem    mem    = nullptr;
+	GetClock  clock  = nullptr;
+	GetTemp   temp   = nullptr;
+	GetPower  power  = nullptr;
+	GetLimit  limits = nullptr;
+	GetPstate pstate = nullptr;
+	Nvml() {
+		HMODULE dll = LoadLibraryW(L"nvml.dll");
+		if (dll == nullptr) {
+			dll = LoadLibraryW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+		}
+		if (dll == nullptr) {
+			return;
+		}
+		auto init   = reinterpret_cast<Init>(GetProcAddress(dll, "nvmlInit_v2"));
+		auto handle = reinterpret_cast<Handle>(GetProcAddress(dll, "nvmlDeviceGetHandleByIndex_v2"));
+		util        = reinterpret_cast<GetUtil>(GetProcAddress(dll, "nvmlDeviceGetUtilizationRates"));
+		mem         = reinterpret_cast<GetMem>(GetProcAddress(dll, "nvmlDeviceGetMemoryInfo"));
+		clock       = reinterpret_cast<GetClock>(GetProcAddress(dll, "nvmlDeviceGetClockInfo"));
+		temp        = reinterpret_cast<GetTemp>(GetProcAddress(dll, "nvmlDeviceGetTemperature"));
+		power       = reinterpret_cast<GetPower>(GetProcAddress(dll, "nvmlDeviceGetPowerUsage"));
+		limits      = reinterpret_cast<GetLimit>(GetProcAddress(dll, "nvmlDeviceGetCurrentClocksThrottleReasons"));
+		pstate      = reinterpret_cast<GetPstate>(GetProcAddress(dll, "nvmlDeviceGetPerformanceState"));
+		ok = init != nullptr && handle != nullptr && init() == 0 && handle(0, &device) == 0 && device != nullptr;
+	}
+};
+
+// Bridage du GPU en clair (raisons NVML, hors « inactif »).
+std::string NvmlLimits(unsigned long long r) {
+	static constexpr std::pair<unsigned long long, const char*> NAMES[] = {
+	    {0x2ull, "horloges-appli"}, {0x4ull, "puissance"},       {0x8ull, "ralenti-materiel"},
+	    {0x10ull, "synchro"},       {0x20ull, "thermique"},      {0x40ull, "thermique-materiel"},
+	    {0x80ull, "frein-puissance"}, {0x100ull, "horloge-ecran"}};
+	std::string out;
+	for (const auto& [bit, name]: NAMES) {
+		if ((r & bit) != 0) {
+			out += (out.empty() ? "" : "+") + std::string(name);
+		}
+	}
+	return out;
+}
+
+// Les 3 autres processus les plus gourmands (en cœurs), relevés toutes les 5 s.
+std::string TopOtherProcesses(double seconds) {
+	struct Proc {
+		HANDLE      handle = nullptr;
+		std::string name;
+		uint64_t    time = 0;
+		bool        seen = false;
+	};
+	static std::vector<std::pair<DWORD, Proc>> procs;
+	const DWORD self = GetCurrentProcessId();
+	std::vector<std::pair<double, std::string>> rows;
+	for (auto& p: procs) {
+		p.second.seen = false;
+	}
+	if (HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0); snap != INVALID_HANDLE_VALUE) {
+		PROCESSENTRY32W pe {};
+		pe.dwSize = sizeof(pe);
+		for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+			if (pe.th32ProcessID == self || pe.th32ProcessID == 0) {
+				continue;
+			}
+			auto it = std::find_if(procs.begin(), procs.end(), [&](const auto& q) { return q.first == pe.th32ProcessID; });
+			FILETIME c {}, e {}, k {}, u {};
+			if (it == procs.end()) {
+				Proc p;
+				p.handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+				if (p.handle == nullptr) {
+					continue;
+				}
+				for (const wchar_t* w = pe.szExeFile; *w != 0; w++) {
+					p.name += *w < 128 ? static_cast<char>(*w) : '?';
+				}
+				if (p.name.size() > 4 && p.name.compare(p.name.size() - 4, 4, ".exe") == 0) {
+					p.name.resize(p.name.size() - 4);
+				}
+				if (GetProcessTimes(p.handle, &c, &e, &k, &u) != 0) {
+					p.time = FileTime(k) + FileTime(u);
+				}
+				p.seen = true;
+				procs.emplace_back(pe.th32ProcessID, std::move(p));
+				continue;
+			}
+			auto& p = it->second;
+			p.seen  = true;
+			if (GetProcessTimes(p.handle, &c, &e, &k, &u) == 0) {
+				continue;
+			}
+			const uint64_t t = FileTime(k) + FileTime(u);
+			const double cores = seconds > 0 ? static_cast<double>(t - p.time) / (seconds * 1e7) : 0.0;
+			p.time = t;
+			if (cores >= 0.05) {
+				rows.emplace_back(cores, p.name);
+			}
+		}
+		CloseHandle(snap);
+	}
+	std::erase_if(procs, [](auto& p) {
+		if (!p.second.seen) {
+			CloseHandle(p.second.handle);
+			return true;
+		}
+		return false;
+	});
+	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+	std::string out;
+	for (size_t i = 0; i < rows.size() && i < 3; i++) {
+		out += (i == 0 ? "" : " ") + rows[i].second + "=" + Fixed(rows[i].first, 2);
+	}
+	return out;
+}
+#endif
+
+const char* SECONDS_HEADER =
+    "t_s;heure;niveau;ips;pire_image_ms;images_sous_29;images_50ms_plus;dessins_s;calculs_s;shaders_crees;shaders_ms;"
+    "fichiers_nouveaux;jeu_lu_mo;envoi_gpu_mo;disque_lu_mo;lectures_disque;disque_ecrit_mo;emu_coeurs;emu_noyau_coeurs;"
+    "machine_pct;autres_coeurs;ram_emu_mo;ram_privee_mo;fautes_pages;ram_libre_mo;gpu_pct;gpu_memoire_pct;vram_mo;"
+    "gpu_mhz;vram_mhz;gpu_temp_c;gpu_w;gpu_etat;gpu_bridage;autres_processus;fils;camera";
+const char* LOADS_HEADER =
+    "niveau;heure_debut;t_debut_s;depuis_lancement_s;duree_s;secondes_a_0_ips;niveaux_ouverts;fichiers_nouveaux;"
+    "jeu_lu_mo;disque_lu_mo;lectures_disque;shaders_crees;shaders_ms;emu_coeurs_moy;emu_noyau_moy;machine_pct_moy;"
+    "autres_coeurs_moy;gpu_pct_moy;ram_emu_mo_max;ram_libre_mo_min;autres_processus;cause_probable";
+
+void V5Second(const V5Machine& m) {
+#if defined(_WIN32)
+	const int64_t start = g_session_start_ns.load(std::memory_order_acquire);
+	if (start == 0) {
+		return;
+	}
+	const double t = static_cast<double>(Clock::now().time_since_epoch().count() - start) *
+	                 (static_cast<double>(Clock::period::num) / static_cast<double>(Clock::period::den));
+	// Ce que le fil de présentation et les ouvertures ont compté depuis la seconde précédente.
+	static uint64_t last_flips = g_v5_flips.load();
+	static uint64_t last_files = g_v5_new_files.load();
+	static Raw      last_raw   = ReadRaw();
+	const uint64_t  flips      = g_v5_flips.load(std::memory_order_relaxed);
+	const uint64_t  files      = g_v5_new_files.load(std::memory_order_relaxed);
+	const Raw       raw        = ReadRaw();
+	const double    fps        = static_cast<double>(flips - last_flips) / std::max(0.2, m.seconds);
+	const double    worst_ms   = g_v5_worst_us.exchange(0, std::memory_order_relaxed) / 1000.0;
+	const uint32_t  slow       = g_v5_slow.exchange(0, std::memory_order_relaxed);
+	const uint32_t  very_slow  = g_v5_very_slow.exchange(0, std::memory_order_relaxed);
+	const uint64_t  new_files  = files - last_files;
+	const double    read_mo    = static_cast<double>(raw.read - last_raw.read) / 1048576.0;
+	const double    upload_mo  = static_cast<double>(raw.upload - last_raw.upload) / 1048576.0;
+	const uint64_t  shaders    = raw.shaders - last_raw.shaders;
+	const double    shader_ms  = static_cast<double>(raw.shader_ns - last_raw.shader_ns) * 1e-6;
+	const uint64_t  draws      = raw.draws - last_raw.draws;
+	const uint64_t  dispatches = raw.dispatches - last_raw.dispatches;
+	last_flips = flips;
+	last_files = files;
+	last_raw   = raw;
+	// Processus : mémoire, fautes de page, entrées-sorties disque.
+	static uint64_t last_faults = 0, last_read = 0, last_reads = 0, last_write = 0;
+	PROCESS_MEMORY_COUNTERS_EX pmc {};
+	pmc.cb                  = sizeof(pmc);
+	double ws_mo = -1, private_mo = -1;
+	uint64_t faults = 0;
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)) != 0) {
+		ws_mo      = static_cast<double>(pmc.WorkingSetSize) / 1048576.0;
+		private_mo = static_cast<double>(pmc.PrivateUsage) / 1048576.0;
+		faults     = pmc.PageFaultCount - std::min<uint64_t>(pmc.PageFaultCount, last_faults);
+		last_faults = pmc.PageFaultCount;
+	}
+	IO_COUNTERS io {};
+	double disk_read_mo = -1, disk_write_mo = -1;
+	uint64_t disk_reads = 0;
+	if (GetProcessIoCounters(GetCurrentProcess(), &io) != 0) {
+		if (last_read != 0) {
+			disk_read_mo  = static_cast<double>(io.ReadTransferCount - last_read) / 1048576.0;
+			disk_write_mo = static_cast<double>(io.WriteTransferCount - last_write) / 1048576.0;
+			disk_reads    = io.ReadOperationCount - last_reads;
+		}
+		last_read  = io.ReadTransferCount;
+		last_reads = io.ReadOperationCount;
+		last_write = io.WriteTransferCount;
+	}
+	MEMORYSTATUSEX ms {};
+	ms.dwLength       = sizeof(ms);
+	const double free_mo = GlobalMemoryStatusEx(&ms) != 0 ? static_cast<double>(ms.ullAvailPhys) / 1048576.0 : -1;
+	// GPU.
+	static Nvml nvml;
+	std::string gpu = ";;;;;;;;;";
+	double      gpu_pct = -1;
+	if (nvml.ok) {
+		Nvml::Util u {};
+		Nvml::Mem  mm {};
+		unsigned   gclk = 0, mclk = 0, temp = 0, mw = 0;
+		unsigned long long lim = 0;
+		int        ps = -1;
+		const bool hu = nvml.util != nullptr && nvml.util(nvml.device, &u) == 0;
+		const bool hm = nvml.mem != nullptr && nvml.mem(nvml.device, &mm) == 0;
+		const bool hg = nvml.clock != nullptr && nvml.clock(nvml.device, 0, &gclk) == 0;
+		const bool hc = nvml.clock != nullptr && nvml.clock(nvml.device, 2, &mclk) == 0;
+		const bool ht = nvml.temp != nullptr && nvml.temp(nvml.device, 0, &temp) == 0;
+		const bool hp = nvml.power != nullptr && nvml.power(nvml.device, &mw) == 0;
+		const bool hl = nvml.limits != nullptr && nvml.limits(nvml.device, &lim) == 0;
+		const bool hs = nvml.pstate != nullptr && nvml.pstate(nvml.device, &ps) == 0;
+		gpu_pct = hu ? u.gpu : -1;
+		gpu = (hu ? std::to_string(u.gpu) : "") + ";" + (hu ? std::to_string(u.memory) : "") + ";" +
+		      (hm ? std::to_string(mm.used >> 20u) : "") + ";" + (hg ? std::to_string(gclk) : "") + ";" +
+		      (hc ? std::to_string(mclk) : "") + ";" + (ht ? std::to_string(temp) : "") + ";" +
+		      (hp ? Fixed(mw / 1000.0, 0) : "") + ";" + (hs ? "P" + std::to_string(ps) : "") + ";" +
+		      (hl ? NvmlLimits(lim) : "");
+	}
+	// Autres processus, toutes les 5 s.
+	static std::string others_text;
+	static int         others_tick = 0;
+	static double      others_window = 0;
+	others_window += m.seconds;
+	if (++others_tick >= 5) {
+		others_text   = TopOtherProcesses(others_window);
+		others_tick   = 0;
+		others_window = 0;
+	}
+	std::string level;
+	uint64_t    level_changes = 0;
+	{
+		std::scoped_lock lock(g_v5_level_mutex);
+		level         = g_v5_level;
+		level_changes = g_v5_level_changes;
+	}
+	AppendLine("secondes.csv", SECONDS_HEADER,
+	           Fixed(t, 1) + ";" + LocalTime("%H:%M:%S") + ";" + level + ";" + Fixed(fps, 1) + ";" + Fixed(worst_ms, 0) +
+	               ";" + std::to_string(slow) + ";" + std::to_string(very_slow) + ";" + std::to_string(draws) + ";" +
+	               std::to_string(dispatches) + ";" + std::to_string(shaders) + ";" + Fixed(shader_ms, 0) + ";" +
+	               std::to_string(new_files) + ";" + Fixed(read_mo, 1) + ";" + Fixed(upload_mo, 1) + ";" +
+	               Opt(disk_read_mo, 1) + ";" + std::to_string(disk_reads) + ";" + Opt(disk_write_mo, 1) + ";" +
+	               Opt(m.emu_cores, 2) + ";" + Opt(m.emu_kernel, 2) + ";" + Opt(m.system_pct, 0) + ";" +
+	               Opt(m.others, 2) + ";" + Opt(ws_mo, 0) + ";" + Opt(private_mo, 0) + ";" + std::to_string(faults) +
+	               ";" + Opt(free_mo, 0) + ";" + gpu + ";" + others_text + ";" + m.threads + ";" + ReadCamera());
+
+	// Chargements : de l'ouverture d'un nouveau dossier de niveau jusqu'à 2 secondes de suite à 20 i/s ou plus.
+	struct LoadAcc {
+		bool        active = false;
+		double      t0 = 0, since_launch = 0;
+		std::string heure, level, levels;
+		uint64_t    files = 0, shaders = 0, reads = 0;
+		double      read_mo = 0, disk_mo = 0, shader_ms = 0, emu = 0, kern = 0, sys = 0, oth = 0, gpu = 0;
+		double      ws_max = 0, free_min = 1e12;
+		int         n = 0, zero = 0, good = 0, gpu_n = 0;
+		std::string others;
+	};
+	static LoadAcc  acc;
+	static uint64_t seen_changes = 0;
+	if (level_changes != seen_changes) {
+		seen_changes = level_changes;
+		if (!acc.active) {
+			acc        = {};
+			acc.active = true;
+			acc.t0     = t;
+			acc.heure  = LocalTime("%H:%M:%S");
+			acc.level  = level;
+			FILETIME c {}, e {}, k {}, u {};
+			GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+			FILETIME now_ft {};
+			GetSystemTimeAsFileTime(&now_ft);
+			acc.since_launch = static_cast<double>(FileTime(now_ft) - FileTime(c)) * 1e-7;
+		}
+		if (acc.levels.find(level) == std::string::npos) {
+			acc.levels += (acc.levels.empty() ? "" : " ") + level;
+		}
+	}
+	if (acc.active) {
+		acc.n++;
+		acc.files += new_files;
+		acc.read_mo += read_mo;
+		acc.disk_mo += std::max(0.0, disk_read_mo);
+		acc.reads += disk_reads;
+		acc.shaders += shaders;
+		acc.shader_ms += shader_ms;
+		acc.emu += std::max(0.0, m.emu_cores);
+		acc.kern += std::max(0.0, m.emu_kernel);
+		acc.sys += std::max(0.0f, m.system_pct);
+		acc.oth += std::max(0.0f, m.others);
+		if (gpu_pct >= 0) {
+			acc.gpu += gpu_pct;
+			acc.gpu_n++;
+		}
+		acc.ws_max   = std::max(acc.ws_max, ws_mo);
+		acc.free_min = std::min(acc.free_min, free_mo);
+		acc.zero += fps < 0.5 ? 1 : 0;
+		if (!others_text.empty()) {
+			acc.others = others_text;
+		}
+		acc.good = fps >= 20.0 ? acc.good + 1 : 0;
+		if (acc.good >= 2 && t - acc.t0 >= 2.0) {
+			const double n = std::max(1, acc.n - 2); // les 2 secondes fluides de la fin ne comptent pas
+			const double duration = std::max(0.0, t - acc.t0 - 2.0 * m.seconds);
+			// Cause probable, d'après les moyennes du chargement.
+			const char* cause = "processeur-emulateur";
+			if (acc.oth / n >= 2.0) {
+				cause = "autres-programmes";
+			} else if (acc.shader_ms / std::max(1.0, duration * 1000.0) >= 0.3) {
+				cause = "shaders";
+			} else if (acc.disk_mo / std::max(1.0, duration) >= 200.0) {
+				cause = "disque";
+			} else if (acc.files / std::max(1.0, duration) >= 150.0) {
+				cause = "ouvertures-fichiers";
+			} else if (acc.sys / n < 60.0) {
+				cause = "attente";
+			}
+			AppendLine("chargements.csv", LOADS_HEADER,
+			           acc.level + ";" + acc.heure + ";" + Fixed(acc.t0, 1) + ";" + Fixed(acc.since_launch, 0) + ";" +
+			               Fixed(duration, 1) + ";" + std::to_string(acc.zero) + ";" + acc.levels + ";" +
+			               std::to_string(acc.files) + ";" + Fixed(acc.read_mo, 0) + ";" + Fixed(acc.disk_mo, 0) + ";" +
+			               std::to_string(acc.reads) + ";" + std::to_string(acc.shaders) + ";" + Fixed(acc.shader_ms, 0) +
+			               ";" + Fixed(acc.emu / n, 2) + ";" + Fixed(acc.kern / n, 2) + ";" + Fixed(acc.sys / n, 0) + ";" +
+			               Fixed(acc.oth / n, 2) + ";" + (acc.gpu_n > 0 ? Fixed(acc.gpu / acc.gpu_n, 0) : std::string()) +
+			               ";" + Fixed(acc.ws_max, 0) + ";" + Fixed(acc.free_min, 0) + ";" + acc.others + ";" + cause);
+			acc.active = false;
+		}
+	}
+#else
+	(void)m;
+#endif
+}
+
 } // namespace
 
 bool FluidityEnabled() noexcept {
@@ -980,6 +1359,19 @@ void FluidityRecordFlip() noexcept {
 	const double dt_ms =
 	    s.last == Clock::time_point {} ? 0.0 : std::chrono::duration<double, std::milli>(now - s.last).count();
 	s.last = now;
+	{ // v5 : compteurs de la seconde (secondes.csv)
+		g_v5_flips.fetch_add(1, std::memory_order_relaxed);
+		const auto us = static_cast<uint32_t>(std::min(dt_ms * 1000.0, 4.0e9));
+		uint32_t   prev = g_v5_worst_us.load(std::memory_order_relaxed);
+		while (us > prev && !g_v5_worst_us.compare_exchange_weak(prev, us, std::memory_order_relaxed)) {
+		}
+		if (dt_ms > 34.5) {
+			g_v5_slow.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (dt_ms > 50.0) {
+			g_v5_very_slow.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 
 	// Black-box sample.
 	const Raw    raw  = ReadRaw();
@@ -1329,6 +1721,7 @@ void FluidityNoteDataFile(const char* source, const std::string& path, uint64_t 
 			return;
 		}
 	}
+	g_v5_new_files.fetch_add(1, std::memory_order_relaxed); // v5
 	const std::string stamp = EventStamp();
 	if (stamp.empty()) {
 		return;
@@ -1362,6 +1755,13 @@ void FluidityNoteOpen(const char* path) noexcept {
 				changed = level != g_level;
 				if (changed) {
 					g_level = level;
+				}
+			}
+			if (changed && level.rfind("ui_", 0) != 0) { // v5 : un chargement commence (chargements.csv)
+				std::scoped_lock lock(g_v5_level_mutex);
+				if (level != g_v5_level) {
+					g_v5_level = level;
+					g_v5_level_changes++;
 				}
 			}
 			if (const std::string stamp = changed ? EventStamp() : std::string(); !stamp.empty()) {
