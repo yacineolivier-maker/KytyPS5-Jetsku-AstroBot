@@ -8918,7 +8918,17 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				    (g_gpu_state != nullptr && g_gpu_state->HasRunnableComputeWork())) {
 					break;
 				}
-				std::this_thread::yield();
+				// Astro Bot PC (21/11, KYTY_CP_STARVED_NO_YIELD=1, défaut 0) : sur une machine saturée,
+				// SwitchToThread rend le cœur à un fil du jeu et Thread_Gpu revient parfois une tranche
+				// de temps plus tard, alors que l'op suivante est déjà prête (profil Sky Aztec : 9 % du
+				// temps de Thread_Gpu hors processeur ici). L'attente reste bornée à 2 ms comme avant.
+				static const bool no_yield = [] {
+					const char* v = std::getenv("KYTY_CP_STARVED_NO_YIELD");
+					return v != nullptr && v[0] == '1';
+				}();
+				if (!no_yield) {
+					std::this_thread::yield();
+				}
 			}
 			if (!produced) {
 				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands() && service_allowed()) {
