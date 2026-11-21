@@ -1,4 +1,4 @@
-#include "kernel/fileSystem.h"
+﻿#include "kernel/fileSystem.h"
 
 #include "common/archive.h"
 #include "common/assert.h"
@@ -440,12 +440,12 @@ bool IsOpenDescriptor(int d) {
 	return file != nullptr && file->opened;
 }
 
-// Astro Bot PC (21/11, plan 30 i/s étape 4b, KYTY_PRELOAD_DIR=<dossier>, défaut désactivé) : quand le jeu ouvre
-// pour la première fois un fichier du dossier d'un niveau (/app0/data/prein/levels/<niveau>/), les fichiers que ce
-// niveau a lus lors de la série des 105 niveaux (<dossier>\<niveau>.txt, « taille;chemin /app0 » dans l'ordre de
-// lecture du jeu) sont lus en arrière-plan, sur KYTY_PRELOAD_THREADS fils (4 par défaut), dans le cache de Windows :
-// le jeu les y trouve au lieu d'attendre le disque une petite lecture à la fois. Un nouveau niveau interrompt la
-// lecture anticipée du précédent. Rien n'est écrit et le jeu n'attend jamais ces lectures.
+// Astro Bot PC (21/11, plan 30 i/s Ã©tape 4b, KYTY_PRELOAD_DIR=<dossier>, dÃ©faut dÃ©sactivÃ©) : quand le jeu ouvre
+// pour la premiÃ¨re fois un fichier du dossier d'un niveau (/app0/data/prein/levels/<niveau>/), les fichiers que ce
+// niveau a lus lors de la sÃ©rie des 105 niveaux (<dossier>\<niveau>.txt, Â« taille;chemin /app0 Â» dans l'ordre de
+// lecture du jeu) sont lus en arriÃ¨re-plan, sur KYTY_PRELOAD_THREADS fils (4 par dÃ©faut), dans le cache de Windows :
+// le jeu les y trouve au lieu d'attendre le disque une petite lecture Ã  la fois. Un nouveau niveau interrompt la
+// lecture anticipÃ©e du prÃ©cÃ©dent. Rien n'est Ã©crit et le jeu n'attend jamais ces lectures.
 namespace {
 std::atomic<uint32_t> g_preload_generation {0};
 
@@ -456,8 +456,8 @@ void PreloadLevel(const std::string& level) {
 	}();
 	static const int threads = [] {
 		const char* v = std::getenv("KYTY_PRELOAD_THREADS");
-		const int   n = v != nullptr ? std::atoi(v) : 4;
-		return n >= 1 && n <= 16 ? n : 4;
+		const int   n = v != nullptr ? std::atoi(v) : 8;
+		return n >= 1 && n <= 16 ? n : 8;
 	}();
 	if (dir.empty()) {
 		return;
@@ -466,16 +466,33 @@ void PreloadLevel(const std::string& level) {
 	if (!list) {
 		return;
 	}
-	auto files = std::make_shared<std::vector<std::string>>();
+	// v2 (21/11 A/B) : la v1 lisait les fichiers entiers (Casino : 6,9 Go lus pour 2,9 Go demandÃ©s par le jeu, en
+	// concurrence avec ses lectures). La taille de la liste est celle de la premiÃ¨re lecture du jeu : on ne lit que
+	// ce dÃ©but (arrondi Ã  256 Kio), les dossiers sont ignorÃ©s.
+	struct Item {
+		std::string path;
+		uint64_t    size;
+	};
+	auto files = std::make_shared<std::vector<Item>>();
 	for (std::string line; std::getline(list, line);) {
 		if (!line.empty() && line.back() == '\r') {
 			line.pop_back();
 		}
 		if (const auto sep = line.find(';'); sep != std::string::npos) {
-			files->push_back(line.substr(sep + 1));
+			const uint64_t size = std::strtoull(line.c_str(), nullptr, 10);
+			files->push_back({line.substr(sep + 1), (size + 0x3ffffu) & ~uint64_t {0x3ffffu}});
 		}
 	}
-	const uint32_t generation = g_preload_generation.fetch_add(1) + 1;
+	// Un sous-niveau ouvert pendant le chargement (Final Shooting ouvre enemy_final) ne doit pas interrompre la
+	// lecture du niveau : seul un niveau ouvert plus de 45 s aprÃ¨s la derniÃ¨re lecture anticipÃ©e l'interrompt.
+	static std::atomic<int64_t> last_start_ms {0};
+	const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                           std::chrono::steady_clock::now().time_since_epoch())
+	                           .count();
+	const int64_t  previous   = last_start_ms.exchange(now_ms);
+	const uint32_t generation = (previous == 0 || now_ms - previous > 45000)
+	                                ? g_preload_generation.fetch_add(1) + 1
+	                                : g_preload_generation.load();
 	std::thread([files, generation, level] {
 		const auto            start = std::chrono::steady_clock::now();
 		std::atomic<size_t>   next {0};
@@ -493,14 +510,24 @@ void PreloadLevel(const std::string& level) {
 					if (i >= files->size()) {
 						return;
 					}
-					const auto real = GetRealFilename((*files)[i]);
+					const auto&     item = (*files)[i];
+					const auto      real = GetRealFilename(item.path);
+					std::error_code ec;
+					if (real.empty() || !std::filesystem::is_regular_file(real, ec)) {
+						done.fetch_add(1, std::memory_order_relaxed);
+						continue;
+					}
 					std::ifstream in(real, std::ios::binary);
-					while (in && g_preload_generation.load(std::memory_order_relaxed) == generation) {
-						in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-						bytes.fetch_add(static_cast<uint64_t>(in.gcount()), std::memory_order_relaxed);
-						if (in.gcount() == 0) {
+					uint64_t      left = item.size;
+					while (in && left != 0 && g_preload_generation.load(std::memory_order_relaxed) == generation) {
+						const auto chunk = static_cast<std::streamsize>(std::min<uint64_t>(left, buffer.size()));
+						in.read(buffer.data(), chunk);
+						const auto got = static_cast<uint64_t>(in.gcount());
+						bytes.fetch_add(got, std::memory_order_relaxed);
+						if (got == 0) {
 							break;
 						}
+						left -= std::min(left, got);
 					}
 					done.fetch_add(1, std::memory_order_relaxed);
 				}
