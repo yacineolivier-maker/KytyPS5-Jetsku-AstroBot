@@ -94,6 +94,24 @@ public:
 		m_head.store(head + 1u, std::memory_order_seq_cst);
 	}
 
+	// Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER, drawPrep.cpp Engine::TryTakeoverHead): the resolver
+	// committed the head from its own preparation while a worker still prepares the slot. The head
+	// advances, but the slot keeps its state (Claimed, then Done when the worker finishes) instead
+	// of Free, so the producer knows not to refill it before the worker is done (TailHeld).
+	void RetireAbandoned() noexcept { m_head.store(Head() + 1u, std::memory_order_seq_cst); }
+
+	// Producer, before Reserve (KYTY_DRAW_PREP_TAKEOVER only): the next position's slot was retired
+	// abandoned (its state is not Free), and whether its worker still prepares it. A slot retired
+	// by Retire is always Free here.
+	[[nodiscard]] bool TailAbandoned() const noexcept {
+		return (m_slots[Tail() & m_mask].state.load(std::memory_order_acquire) & 3u) !=
+		       static_cast<uint64_t>(State::Free);
+	}
+	[[nodiscard]] bool TailHeld() const noexcept {
+		return (m_slots[Tail() & m_mask].state.load(std::memory_order_acquire) & 3u) ==
+		       static_cast<uint64_t>(State::Claimed);
+	}
+
 	// Workers.
 	[[nodiscard]] bool HasClaimable() const noexcept {
 		return m_next_claim.load(std::memory_order_acquire) <

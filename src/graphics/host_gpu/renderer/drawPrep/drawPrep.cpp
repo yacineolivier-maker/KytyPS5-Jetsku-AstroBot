@@ -1296,6 +1296,149 @@ struct Engine::Workers {
 	std::vector<std::thread> threads;
 };
 
+// Astro Bot PC - KYTY_DRAW_PREP_TAKEOVER (read once at start-up; default off; parallel mode).
+//
+// Diagnostic CommitStats/CpGaps lines show that the resolver (Thread_Gpu) rarely waits for a head
+// slot a worker holds (< 0.5 % of the draws), but long when it does (37-140 us on average at Pirate
+// Island, 1-4 ms per frame; ReadyHead 15 % of Thread_Gpu's samples at Sky Aztec), far beyond a
+// preparation's usual cost (~5-15 us): the worker holding the head was descheduled (the machine
+// runs at 95-100 %), or its preparation is slow.
+//  - KYTY_DRAW_PREP_TAKEOVER=stats: no behaviour change; every wait for a held head is timed and a
+//    console line every 10 s gives their count, total and duration histogram ("DrawPrep head 10s").
+//  - KYTY_DRAW_PREP_TAKEOVER=<us> (1..2000; 2000 = the 2 ms deadlock guard of ReadyHead's wait,
+//    which services cross-thread commands past it): the same, and when a worker still holds the head
+//    after <us> microseconds, the resolver prepares the draw itself, from a copy of the slot's
+//    inputs (kind, arguments, register snapshot: the fields a preparing thread only reads), into
+//    its own slot (m_takeover_slot), exactly as it prepares a head no worker has claimed (exact
+//    clean predicate, run key, no binding plan), and commits that. The slot is retired
+//    "abandoned" (Window::RetireAbandoned): the worker finishes its preparation into the window
+//    slot, which nobody reads any more, and the producer refills that slot only once the worker is
+//    done (AwaitReusableTail), dropping its binding plan then (FillSlot does not reset it; a
+//    committed slot's plan is reset by Commit). Only draw commits (CommitHead: CommitPublished,
+//    Drain, a full window in non-sequencer mode) take over; indirect draws and dispatches wait as
+//    before.
+// What the commit sees is what it sees for an unclaimed head: the preparation is a pure function of
+// the copied snapshot and of guest memory read through the exact predicate at commit time, and
+// Validate checks it the same way. Unset or 0: nothing here runs (no clock read, no check).
+namespace {
+
+struct TakeoverSetting {
+	bool     stats  = false; // time head waits (both modes)
+	bool     act    = false; // take over held heads
+	uint64_t after_ns = 0;
+};
+
+const TakeoverSetting& Takeover() {
+	static const TakeoverSetting setting = [] {
+		TakeoverSetting s;
+		const auto* value = EnvValue("KYTY_DRAW_PREP_TAKEOVER");
+		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+			return s;
+		}
+		s.stats = true;
+		if (std::strcmp(value, "stats") == 0) {
+			return s;
+		}
+		const auto us = std::strtoul(value, nullptr, 10);
+		if (us == 0) {
+			return s; // unparsable: statistics only
+		}
+		s.act      = true;
+		s.after_ns = uint64_t {std::clamp<unsigned long>(us, 1ul, 2000ul)} * 1000u;
+		return s;
+	}();
+	return setting;
+}
+
+// Head-wait histogram bounds (us); the last bucket is open.
+constexpr std::array<uint64_t, 10> kTakeoverBounds {2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000};
+
+struct TakeoverStats {
+	// Resolver (GPU thread) only.
+	uint64_t waits = 0;
+	uint64_t wait_ns = 0;
+	std::array<uint64_t, kTakeoverBounds.size() + 1u> bucket_count {};
+	std::array<uint64_t, kTakeoverBounds.size() + 1u> bucket_ns {};
+	uint64_t takeovers      = 0;
+	uint64_t takeover_ns    = 0; // the resolver's own preparations (copy, prepare, run key)
+	uint64_t worker_later   = 0; // the worker had not finished when the resolver's preparation did
+	uint64_t worker_first   = 0; // it had (the takeover gained nothing)
+	uint64_t last_print_ns  = 0;
+	// Producer (sequencer) side: refills that waited for an abandoned slot's worker.
+	std::atomic<uint64_t> reuse_waits {0};
+	std::atomic<uint64_t> reuse_wait_ns {0};
+	std::atomic<uint64_t> reuse_plan_resets {0};
+};
+
+TakeoverStats& GetTakeoverStats() {
+	static TakeoverStats stats;
+	return stats;
+}
+
+void NoteHeadWait(uint64_t ns) {
+	auto& s = GetTakeoverStats();
+	s.waits++;
+	s.wait_ns += ns;
+	size_t bucket = 0;
+	while (bucket < kTakeoverBounds.size() && ns >= kTakeoverBounds[bucket] * 1000u) {
+		bucket++;
+	}
+	s.bucket_count[bucket]++;
+	s.bucket_ns[bucket] += ns;
+}
+
+// GPU thread, after a draw commit: one console line every 10 s (counts since the previous line).
+void PrintTakeoverSummary() {
+	auto&      s   = GetTakeoverStats();
+	const auto now = NowNs();
+	if (s.last_print_ns == 0) {
+		s.last_print_ns = now;
+		return;
+	}
+	if (now - s.last_print_ns < 10'000'000'000ull) {
+		return;
+	}
+	const double seconds = static_cast<double>(now - s.last_print_ns) * 1e-9;
+	s.last_print_ns      = now;
+	std::string buckets;
+	char        text[160];
+	for (size_t i = 0; i < s.bucket_count.size(); i++) {
+		if (i < kTakeoverBounds.size()) {
+			std::snprintf(text, sizeof(text), " <%" PRIu64 ":%" PRIu64 "/%.1fms", kTakeoverBounds[i],
+			              s.bucket_count[i], static_cast<double>(s.bucket_ns[i]) * 1e-6);
+		} else {
+			std::snprintf(text, sizeof(text), " >=%" PRIu64 ":%" PRIu64 "/%.1fms", kTakeoverBounds.back(),
+			              s.bucket_count[i], static_cast<double>(s.bucket_ns[i]) * 1e-6);
+		}
+		buckets += text;
+	}
+	const auto reuse_waits  = s.reuse_waits.exchange(0, std::memory_order_relaxed);
+	const auto reuse_ns     = s.reuse_wait_ns.exchange(0, std::memory_order_relaxed);
+	const auto plan_resets  = s.reuse_plan_resets.exchange(0, std::memory_order_relaxed);
+	std::printf("DrawPrep head %.0fs (KYTY_DRAW_PREP_TAKEOVER=%s): %" PRIu64
+	            " waits for a held head, %.1f ms (%.2f ms/s); by duration us:%s; takeovers %" PRIu64
+	            " (own preparations %.1f ms, worker still busy after %" PRIu64 ", worker done first %" PRIu64
+	            "); abandoned slots refilled %" PRIu64 ", of which waited for their worker %" PRIu64
+	            " (%.2f ms)\n",
+	            seconds, Takeover().act ? "on" : "stats", s.waits, static_cast<double>(s.wait_ns) * 1e-6,
+	            static_cast<double>(s.wait_ns) * 1e-6 / seconds, buckets.c_str(), s.takeovers,
+	            static_cast<double>(s.takeover_ns) * 1e-6, s.worker_later, s.worker_first,
+	            plan_resets, reuse_waits, static_cast<double>(reuse_ns) * 1e-6);
+	std::fflush(stdout);
+	const auto last = s.last_print_ns;
+	s.waits         = 0;
+	s.wait_ns       = 0;
+	s.bucket_count.fill(0);
+	s.bucket_ns.fill(0);
+	s.takeovers    = 0;
+	s.takeover_ns  = 0;
+	s.worker_later = 0;
+	s.worker_first = 0;
+	s.last_print_ns = last;
+}
+
+} // namespace
+
 Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
                std::function<void()> after_commit, uint32_t lane)
     : m_renderer(renderer), m_mode(GetMode()), m_service_commands(std::move(service_commands)),
@@ -1358,6 +1501,20 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		     m_workers->gate.HotCount(),
 		     wake_backlog, cold_spin_us, cold_token ? 1 : 0, steal.min_unclaimed, steal_us,
 		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode());
+		// Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER).
+		if (Takeover().stats) {
+			m_takeover_on = true;
+			if (Takeover().act) {
+				m_takeover_slot  = std::make_unique<Slot>();
+				m_takeover_guard = true;
+			}
+			LOGF("DrawPrep: KYTY_DRAW_PREP_TAKEOVER: %s\n",
+			     Takeover().act ? "the resolver prepares a head a worker holds too long" : "statistics only");
+			if (Takeover().act) {
+				LOGF("DrawPrep: KYTY_DRAW_PREP_TAKEOVER after %u us\n",
+				     static_cast<uint32_t>(Takeover().after_ns / 1000u));
+			}
+		}
 	}
 }
 
@@ -1428,6 +1585,9 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 	if (window.Full()) {
 		CommitHead();
 	}
+	if (m_takeover_guard) [[unlikely]] {
+		AwaitReusableTail(); // Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER)
+	}
 	FillSlot(window.Reserve(), submit_id, index_args, auto_args, context, user_config, shaders);
 	window.Publish();
 	m_real_tail = window.Tail(); // no speculative slots outside thread mode
@@ -1454,6 +1614,9 @@ uint64_t Engine::Publish(const DrawIndexArgs* index_args, const DrawAutoArgs* au
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSubmitted);
 	const auto position = window.Tail();
 	m_real_tail         = position + 1u;
+	if (m_takeover_guard) [[unlikely]] {
+		AwaitReusableTail(); // Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER)
+	}
 	// The submission id is the resolver's (CommitPublished); the repeat trace is off in this mode.
 	auto& slot = window.Reserve();
 	FillSlot(slot, 0, index_args, auto_args, context, user_config, shaders);
@@ -1481,6 +1644,9 @@ bool Engine::PublishSpeculative(const DrawIndexArgs* index_args, const DrawAutoA
 	auto& window = m_workers->window;
 	if (window.Full()) {
 		return false;
+	}
+	if (m_takeover_guard) [[unlikely]] {
+		AwaitReusableTail(); // Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER)
 	}
 	auto& slot = window.Reserve();
 	FillSlot(slot, 0, index_args, auto_args, context, user_config, shaders);
@@ -1598,7 +1764,124 @@ uint64_t Engine::WaitHeadPrepared(uint64_t position, bool& unclaimed) {
 	return NowNs() - start;
 }
 
+// Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER, see Takeover()). Producer thread, before Reserve.
+void Engine::AwaitReusableTail() {
+	auto& window = m_workers->window;
+	if (!window.TailAbandoned()) [[likely]] {
+		return;
+	}
+	auto& stats = GetTakeoverStats();
+	if (window.TailHeld()) {
+		// The abandoned head's worker still prepares into this slot: let it finish.
+		const auto start = NowNs();
+		for (uint32_t spins = 0; window.TailHeld(); spins++) {
+			if ((spins & 1023u) == 1023u) {
+				std::this_thread::yield();
+			} else {
+				CpuRelax();
+			}
+		}
+		stats.reuse_waits.fetch_add(1, std::memory_order_relaxed);
+		stats.reuse_wait_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+	}
+	// Done (acquired): the worker's writes, its binding plan among them, are visible and final.
+	// FillSlot does not reset the plan (Commit does, for a committed slot), so drop it here.
+	window.Reserve().plan.Reset();
+	stats.reuse_plan_resets.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER, see Takeover()). GPU thread, at a draw commit.
+Engine::Slot* Engine::TryTakeoverHead(uint64_t& held_since) {
+	held_since   = 0;
+	auto& window = m_workers->window;
+	EXIT_IF(window.Empty());
+	if (!window.HeadClaimed()) {
+		return nullptr; // unclaimed (ReadyHead prepares it here) or done
+	}
+	const auto& setting = Takeover();
+	const auto  start   = NowNs();
+	if (!setting.act) {
+		// Statistics only: the caller times ReadyHead's own wait, unchanged.
+		held_since = start;
+		return nullptr;
+	}
+	for (uint32_t spins = 0;; spins++) {
+		if (!window.HeadClaimed()) {
+			// The worker finished within the threshold: ReadyHead finds the head done.
+			NoteHeadWait(NowNs() - start);
+			return nullptr;
+		}
+		CpuRelax();
+		if ((spins & 15u) == 15u && NowNs() - start >= setting.after_ns) {
+			break;
+		}
+	}
+	EXIT_IF(Speculative());
+	const auto take_start = NowNs();
+	NoteHeadWait(take_start - start);
+	// The worker only reads these fields of the slot (it writes prepared, plan, run_* and repeat),
+	// and the producer does not write the slot before it is retired and the worker is done.
+	const auto& head   = window.HeadPayload();
+	auto&       own    = *m_takeover_slot;
+	own.kind           = head.kind;
+	own.submit_id      = head.submit_id;
+	own.index_args     = head.index_args;
+	own.auto_args      = head.auto_args;
+	own.dispatch_args  = head.dispatch_args;
+	own.registers      = head.registers;
+	own.eligible       = head.eligible;
+	own.after_stop     = head.after_stop;
+	own.speculative    = head.speculative;
+	own.spec_packets   = head.spec_packets;
+	own.spec_inputs    = head.spec_inputs;
+	own.repeat_packet  = head.repeat_packet;
+	own.worker_prepared = false;
+	own.plan.Reset();
+	{
+		// What ReadyHead does for a head no worker claimed: the exact clean predicate, no plan.
+		const CpGaps::Scope gap(CpGaps::Cat::HeadSelf);
+		PrepareSlot(m_renderer.GetPipelineCache(), own, true);
+		HashForRepeatTrace(own);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
+	}
+	auto& stats = GetTakeoverStats();
+	stats.takeovers++;
+	stats.takeover_ns += NowNs() - take_start;
+	if (window.HeadDone()) {
+		stats.worker_first++;
+	} else {
+		stats.worker_later++;
+	}
+	return &own;
+}
+
 void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
+	if (m_takeover_on) [[unlikely]] {
+		// Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER).
+		uint64_t held_since = 0;
+		if (auto* own = TryTakeoverHead(held_since); own != nullptr) {
+			EXIT_IF(own->kind == DrawKind::Dispatch);
+			if (patch != nullptr) {
+				(*patch)(*own);
+			}
+			Commit(*own);
+			m_workers->window.RetireAbandoned();
+			PrintTakeoverSummary();
+			return;
+		}
+		auto& slot = ReadyHead();
+		if (held_since != 0) {
+			NoteHeadWait(NowNs() - held_since);
+		}
+		EXIT_IF(slot.kind == DrawKind::Dispatch);
+		if (patch != nullptr) {
+			(*patch)(slot);
+		}
+		Commit(slot);
+		m_workers->window.Retire();
+		PrintTakeoverSummary();
+		return;
+	}
 	auto& slot = ReadyHead();
 	// A dispatch slot is only ever taken by its own op (ExecuteDispatch).
 	EXIT_IF(slot.kind == DrawKind::Dispatch);
@@ -1750,6 +2033,9 @@ uint64_t Engine::PublishDispatch(const DispatchArgs& args, const HW::Context& co
 	}
 	const auto position = window.Tail();
 	m_real_tail         = position + 1u;
+	if (m_takeover_guard) [[unlikely]] {
+		AwaitReusableTail(); // Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER)
+	}
 	auto& slot          = window.Reserve();
 	slot.submit_id      = 0;
 	slot.kind           = DrawKind::Dispatch;

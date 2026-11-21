@@ -388,6 +388,14 @@ private:
 	// The head slot once prepared (by a worker, or here); the caller commits or uses it, then
 	// retires it.
 	Slot& ReadyHead();
+	// Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER=<us>|stats, default off): see drawPrep.cpp. Returns the
+	// resolver's own preparation of the head (m_takeover_slot) when a worker held the head longer
+	// than the threshold; null otherwise (ReadyHead then runs as before).
+	// held_since: statistics-only mode, when the head was held (0 otherwise).
+	Slot* TryTakeoverHead(uint64_t& held_since);
+	// Producer side of KYTY_DRAW_PREP_TAKEOVER: before refilling the next slot, waits while the
+	// worker of an abandoned head still prepares it, then drops its binding plan.
+	void AwaitReusableTail();
 	void NoteFence();
 	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
 	              const DrawAutoArgs* auto_args, const HW::Context& context,
@@ -398,6 +406,9 @@ private:
 	std::function<void()>    m_service_commands;
 	std::function<void()>    m_after_commit;
 	std::unique_ptr<Slot>    m_inline_slot;
+	std::unique_ptr<Slot>    m_takeover_slot; // Astro Bot PC (KYTY_DRAW_PREP_TAKEOVER)
+	bool                     m_takeover_guard = false; // the producer checks for abandoned slots
+	bool                     m_takeover_on    = false; // statistics or takeover
 	std::unique_ptr<Workers> m_workers; // parallel mode: the window and its threads
 	uint64_t                 m_draws_since_fence = 0;
 	uint8_t                  m_stop_pending      = 0; // sequencer only (NoteStop)
