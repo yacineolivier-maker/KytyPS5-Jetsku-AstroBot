@@ -21,6 +21,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 #include <cinttypes>
 #include <cstdlib>
 #include <climits>
@@ -434,6 +440,106 @@ bool IsOpenDescriptor(int d) {
 	return file != nullptr && file->opened;
 }
 
+// Astro Bot PC (21/11, plan 30 i/s étape 4b, KYTY_PRELOAD_DIR=<dossier>, défaut désactivé) : quand le jeu ouvre
+// pour la première fois un fichier du dossier d'un niveau (/app0/data/prein/levels/<niveau>/), les fichiers que ce
+// niveau a lus lors de la série des 105 niveaux (<dossier>\<niveau>.txt, « taille;chemin /app0 » dans l'ordre de
+// lecture du jeu) sont lus en arrière-plan, sur KYTY_PRELOAD_THREADS fils (4 par défaut), dans le cache de Windows :
+// le jeu les y trouve au lieu d'attendre le disque une petite lecture à la fois. Un nouveau niveau interrompt la
+// lecture anticipée du précédent. Rien n'est écrit et le jeu n'attend jamais ces lectures.
+namespace {
+std::atomic<uint32_t> g_preload_generation {0};
+
+void PreloadLevel(const std::string& level) {
+	static const std::string dir = [] {
+		const char* v = std::getenv("KYTY_PRELOAD_DIR");
+		return std::string(v != nullptr ? v : "");
+	}();
+	static const int threads = [] {
+		const char* v = std::getenv("KYTY_PRELOAD_THREADS");
+		const int   n = v != nullptr ? std::atoi(v) : 4;
+		return n >= 1 && n <= 16 ? n : 4;
+	}();
+	if (dir.empty()) {
+		return;
+	}
+	std::ifstream list(std::filesystem::path(dir) / (level + ".txt"), std::ios::binary);
+	if (!list) {
+		return;
+	}
+	auto files = std::make_shared<std::vector<std::string>>();
+	for (std::string line; std::getline(list, line);) {
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
+		if (const auto sep = line.find(';'); sep != std::string::npos) {
+			files->push_back(line.substr(sep + 1));
+		}
+	}
+	const uint32_t generation = g_preload_generation.fetch_add(1) + 1;
+	std::thread([files, generation, level] {
+		const auto            start = std::chrono::steady_clock::now();
+		std::atomic<size_t>   next {0};
+		std::atomic<uint64_t> bytes {0};
+		std::atomic<size_t>   done {0};
+		std::vector<std::thread> workers;
+		for (int t = 0; t < threads; t++) {
+			workers.emplace_back([&] {
+				std::vector<char> buffer(1u << 20u);
+				for (;;) {
+					if (g_preload_generation.load(std::memory_order_relaxed) != generation) {
+						return; // another level started
+					}
+					const size_t i = next.fetch_add(1);
+					if (i >= files->size()) {
+						return;
+					}
+					const auto real = GetRealFilename((*files)[i]);
+					std::ifstream in(real, std::ios::binary);
+					while (in && g_preload_generation.load(std::memory_order_relaxed) == generation) {
+						in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+						bytes.fetch_add(static_cast<uint64_t>(in.gcount()), std::memory_order_relaxed);
+						if (in.gcount() == 0) {
+							break;
+						}
+					}
+					done.fetch_add(1, std::memory_order_relaxed);
+				}
+			});
+		}
+		for (auto& w: workers) {
+			w.join();
+		}
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+		std::printf("Kyty prechargement : %s : %zu/%zu fichiers, %llu Mo en %lld ms%s\n", level.c_str(), done.load(),
+		            files->size(), static_cast<unsigned long long>(bytes.load() >> 20u), static_cast<long long>(ms),
+		            g_preload_generation.load() != generation ? " (interrompu par un autre niveau)" : "");
+		std::fflush(stdout);
+	}).detach();
+}
+
+void PreloadNoteOpen(const char* path) {
+	static constexpr char prefix[] = "/app0/data/prein/levels/";
+	if (std::strncmp(path, prefix, sizeof(prefix) - 1) != 0) {
+		return;
+	}
+	const char* name = path + sizeof(prefix) - 1;
+	const char* end  = std::strchr(name, '/');
+	if (end == nullptr || end == name) {
+		return;
+	}
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> started;
+	std::string                            level(name, static_cast<size_t>(end - name));
+	{
+		std::scoped_lock lock(mutex);
+		if (!started.insert(level).second) {
+			return; // once per level and session (a second visit finds the files in the cache)
+		}
+	}
+	PreloadLevel(level);
+}
+} // namespace
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
@@ -443,6 +549,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	Libs::Graphics::FluidityNoteOpen(path);
+	PreloadNoteOpen(path); // KYTY_PRELOAD_DIR
 
 	auto flags_u = static_cast<uint32_t>(flags);
 
