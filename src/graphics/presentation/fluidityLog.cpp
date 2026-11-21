@@ -203,6 +203,17 @@ public:
 	void Push(Job job) {
 		{
 			std::scoped_lock lock(m_mutex);
+			// v5.2 (21/11) : un ajout à un fichier déjà en attente est fusionné avec lui, au lieu d'occuper une place
+			// de plus : au démarrage d'une session (budget de place, rafale de fichiers.csv pendant le chargement),
+			// la file dépassait 256 travaux et jetait des lignes, dont parfois l'en-tête de trace.csv.
+			if (job.append && !job.capture) {
+				for (auto it = m_jobs.rbegin(); it != m_jobs.rend(); ++it) {
+					if (it->append && !it->capture && it->path == job.path) {
+						it->bytes.insert(it->bytes.end(), job.bytes.begin(), job.bytes.end());
+						return;
+					}
+				}
+			}
 			if (m_jobs.size() > 256) { // never let a stuck disk hold memory
 				return;
 			}
