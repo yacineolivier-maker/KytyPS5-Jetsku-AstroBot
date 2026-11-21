@@ -1217,7 +1217,7 @@ void V5Second(const V5Machine& m) {
 	               Opt(m.others, 2) + ";" + Opt(ws_mo, 0) + ";" + Opt(private_mo, 0) + ";" + std::to_string(faults) +
 	               ";" + Opt(free_mo, 0) + ";" + gpu + ";" + others_text + ";" + m.threads + ";" + ReadCamera());
 
-	// Chargements : de l'ouverture d'un nouveau dossier de niveau jusqu'à 2 secondes de suite à 20 i/s ou plus.
+	// Chargements : de l'ouverture d'un nouveau dossier de niveau jusqu'à la fin des lectures (voir v5.1 plus bas).
 	struct LoadAcc {
 		bool        active = false;
 		double      t0 = 0, since_launch = 0;
@@ -1226,6 +1226,7 @@ void V5Second(const V5Machine& m) {
 		double      read_mo = 0, disk_mo = 0, shader_ms = 0, emu = 0, kern = 0, sys = 0, oth = 0, gpu = 0;
 		double      ws_max = 0, free_min = 1e12;
 		int         n = 0, zero = 0, good = 0, gpu_n = 0;
+		double      last_busy = 0; // dernière seconde avec lecture du jeu (>= 5 fichiers, 5 Mo) ou shaders
 		std::string others;
 	};
 	static LoadAcc  acc;
@@ -1270,10 +1271,16 @@ void V5Second(const V5Machine& m) {
 		if (!others_text.empty()) {
 			acc.others = others_text;
 		}
+		// v5.1 : le jeu garde ~30 i/s sur ses écrans de chargement, donc la fin se lit sur l'activité : le chargement
+		// dure jusqu'à la dernière seconde où le jeu lit encore (>= 5 nouveaux fichiers ou >= 5 Mo) ou crée des
+		// shaders, suivie de 3 s calmes et fluides (>= 20 i/s). Plafond 180 s (flux de streaming en jeu).
+		if (acc.n == 1 || new_files >= 5 || read_mo >= 5.0 || shaders > 0) {
+			acc.last_busy = t;
+		}
 		acc.good = fps >= 20.0 ? acc.good + 1 : 0;
-		if (acc.good >= 2 && t - acc.t0 >= 2.0) {
-			const double n = std::max(1, acc.n - 2); // les 2 secondes fluides de la fin ne comptent pas
-			const double duration = std::max(0.0, t - acc.t0 - 2.0 * m.seconds);
+		if ((acc.good >= 3 && t - acc.last_busy >= 3.0) || t - acc.t0 >= 180.0) {
+			const double duration = std::max(0.0, acc.last_busy - acc.t0 + m.seconds);
+			const double n        = std::max(1, acc.n); // moyennes sur toute la fenêtre observée
 			// Cause probable, d'après les moyennes du chargement.
 			const char* cause = "processeur-emulateur";
 			if (acc.oth / n >= 2.0) {
