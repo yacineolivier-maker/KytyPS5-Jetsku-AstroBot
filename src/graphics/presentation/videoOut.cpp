@@ -1670,8 +1670,7 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	// Astro Bot PC (22/11, chantier A du plan 30 i/s) : taille des images d'affichage déclarées par le jeu,
 	// toujours écrite dans la console (le journal LOGF est silencieux en production).
 	::printf("VideoOut: buffers registered: set %d, %d buffer(s), %ux%u (pitch %u), format 0x%016" PRIx64
-	         ", category %d
-",
+	         ", category %d\n",
 	         set_index, buffer_num, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	         attribute->pixel_format, category);
 	std::fflush(stdout);
@@ -2073,8 +2072,7 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	}
 	static std::atomic<uint32_t> reported {UINT32_MAX};
 	if (reported.exchange(status->resolution) != status->resolution) {
-		::printf("VideoOut: output status reported to the game: resolution code %u (window %ux%u, ATTRIBUTE3 0x%x)
-",
+		::printf("VideoOut: output status reported to the game: resolution code %u (window %ux%u, ATTRIBUTE3 0x%x)\n",
 		         status->resolution, ctx->width, ctx->height, static_cast<unsigned>(attribute3));
 		std::fflush(stdout);
 	}
