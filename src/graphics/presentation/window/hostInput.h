@@ -36,6 +36,9 @@ void               HostInputToggleGamepadTouchPad(int id);
 void               HostInputDisconnectGamepadTouchPad(int id);
 [[nodiscard]] HostInputTouchPadVisualState GetHostInputTouchPadVisualState();
 void               HostInputToggleMouseToJoystick();
+// Astro Bot PC (menu de sortie KYTY_QUIT_MENU) : suspend les entrees hote interrogees hors
+// evenements (souris vers stick F7, pave tactile simule) et garde le curseur visible.
+void               HostInputSetSuspended(bool suspended);
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
 
 } // namespace Libs::Graphics

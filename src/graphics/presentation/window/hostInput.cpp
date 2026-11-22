@@ -1841,6 +1841,43 @@ void HostInputToggleMouseToJoystick() {
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
+namespace {
+bool g_input_suspended = false; // fil de la fenetre seulement
+} // namespace
+
+void HostInputSetSuspended(bool suspended) {
+	if (g_input_suspended == suspended) {
+		return;
+	}
+	g_input_suspended = suspended;
+	if (suspended) {
+		g_input_pulse.ReleaseAll(ApplyHostKey);
+		HostInputSetTouchPadMode(false);
+		int gamepad_touch_id = -1;
+		{
+			std::scoped_lock lock(g_touchpad_mutex);
+			gamepad_touch_id = g_gamepad_touchpad.enabled ? g_gamepad_touchpad.id : -1;
+		}
+		if (gamepad_touch_id >= 0) {
+			HostInputDisconnectGamepadTouchPad(gamepad_touch_id);
+		}
+		if (g_mouse.enabled) {
+			SetRelativeMouseMode(false);
+			g_mouse.next_poll = 0;
+			CenterMouseStick();
+		}
+		SDL_ShowCursor();
+	} else {
+		if (g_mouse.enabled) {
+			SetRelativeMouseMode(true);
+			g_mouse.next_poll = 0;
+		}
+		if (Config::HideCursorEnabled()) {
+			g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
+		}
+	}
+}
+
 bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	// Astro Bot PC (13/11) : voir Fsr3::HoldWindowPump.
 	if (Fsr3::HoldWindowPump()) {
@@ -1849,7 +1886,7 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	}
 	// -1 waits without a deadline (until max_wait_ms below).
 	int timeout = g_input_pulse.Poll(SDL_GetTicks(), ApplyHostKey);
-	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
+	if (!g_mouse.enabled || g_input_suspended || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
 	} else {
@@ -1861,7 +1898,7 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 		timeout              = timeout < 0 ? mouse_wait : std::min(timeout, mouse_wait);
 	}
 
-	if (g_cursor_hide_at != 0 && !TouchPadModeActive()) {
+	if (g_cursor_hide_at != 0 && !TouchPadModeActive() && !g_input_suspended) {
 		const auto now_ms = SDL_GetTicks();
 		const int  cursor_timeout =
 		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
@@ -1876,7 +1913,7 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
-	if (Config::HideCursorEnabled() && !TouchPadModeActive()) {
+	if (Config::HideCursorEnabled() && !TouchPadModeActive() && !g_input_suspended) {
 		const auto now_ms = SDL_GetTicks();
 		if (has_event && !g_mouse.enabled && IsCursorActivity(*event) &&
 		    SDL_GetWindowFromEvent(event) == g_mouse_window) {
