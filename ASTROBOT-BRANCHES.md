@@ -18,7 +18,7 @@ default**, and with the switch off the behaviour is the one of the base.
 | Branch | Kind | Switch | Status |
 |---|---|---|---|
 | `astrobot-pc` | the playable configuration (5 fixes below in one commit) | see below | compiled; tested in game on the Jetsku U59 base |
-| `astrobot-experiments` | archive of all experiments (125 commits) | many, all off by default | used in game for measurements; state of 17 Nov, replaced by `astrobot-experiments-22-11` |
+| `astrobot-experiments` | archive of all experiments (125 commits) | many, all off by default | same as `astrobot-experiments-22-11` since 22 Nov 2026 (fast-forwarded; the 17 Nov state is commit `ce4d0b4b`) |
 | `astrobot-experiments-22-11` | `astrobot-experiments` + 26 commits (17-22 Nov 2026) | many, all off by default unless stated | the build played on the test machine since 22 Nov; see the last section |
 | `fix/esc-exits-fullscreen` | fix | none (always on) | compiled; tested in game on the Jetsku U59 base (as part of `astrobot-pc`) |
 | `feature/app0-overlay-subst` | feature | `KYTY_APP0_OVERLAY`, `KYTY_APP0_SUBST` | compiled; tested in game on the Jetsku U59 base (as part of `astrobot-pc`) |
