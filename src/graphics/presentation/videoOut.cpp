@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <list>
@@ -1666,6 +1667,15 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     attribute->aspect_ratio, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	     attribute->option, category);
 
+	// Astro Bot PC (22/11, chantier A du plan 30 i/s) : taille des images d'affichage déclarées par le jeu,
+	// toujours écrite dans la console (le journal LOGF est silencieux en production).
+	::printf("VideoOut: buffers registered: set %d, %d buffer(s), %ux%u (pitch %u), format 0x%016" PRIx64
+	         ", category %d
+",
+	         set_index, buffer_num, attribute->width, attribute->height, attribute->pitch_in_pixel,
+	         attribute->pixel_format, category);
+	std::fflush(stdout);
+
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
 	}
@@ -2060,6 +2070,13 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	}();
 	if (forced_resolution >= 0) {
 		status->resolution = static_cast<uint32_t>(forced_resolution);
+	}
+	static std::atomic<uint32_t> reported {UINT32_MAX};
+	if (reported.exchange(status->resolution) != status->resolution) {
+		::printf("VideoOut: output status reported to the game: resolution code %u (window %ux%u, ATTRIBUTE3 0x%x)
+",
+		         status->resolution, ctx->width, ctx->height, static_cast<unsigned>(attribute3));
+		std::fflush(stdout);
 	}
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
