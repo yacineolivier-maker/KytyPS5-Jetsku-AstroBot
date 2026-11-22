@@ -10,6 +10,7 @@
 #include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/presentation/window/fsr3FrameGen.h"
+#include "graphics/presentation/window/presentAntiAliasing.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -342,6 +343,7 @@ private:
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	PresentFilter                  m_filter; // KYTY_PRESENT_BOX_DOWNSCALE
+	PresentAntiAliasing            m_aa;     // KYTY_PRESENT_AA (presentAntiAliasing.h)
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
 };
@@ -641,6 +643,7 @@ void Swapchain::Destroy() {
 	m_overlay_descriptors = nullptr;
 	m_overlay_sampler     = nullptr;
 	m_filter.Release(graphics.device);
+	m_aa.Release(graphics);
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
@@ -1096,7 +1099,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                      : vk::Extent2D {};
 	const bool filtered = source != nullptr && PresentBoxDownscaleEnabled() &&
 	                      PresentNeedsFilter(source_extent, m_extent);
-	if (filtered) {
+	const auto ensure_source_view = [&] {
 		if (source->view == nullptr) {
 			vk::ImageViewCreateInfo view {};
 			view.image            = source->image.image;
@@ -1107,12 +1110,39 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			    m_window.graphic_ctx.device.createImageView(&view, nullptr, &source->view),
 			    "create presentation source view");
 		}
+	};
+	// Astro Bot PC (KYTY_PRESENT_AA, presentAntiAliasing.h) : SMAA 1x sur l'image du jeu, a sa
+	// taille, avant la copie vers la chaine ; le blit (ou PresentFilter) lit alors l'image lissee.
+	// Sans la variable, ou en HDR, ou pour une image noire, rien de ceci n'est enregistre.
+	bool antialiased = false;
+	if (source != nullptr && !source->blank && !source->hdr && !m_hdr_active &&
+	    PresentAaRequested() != PresentAaMode::Off) {
+		ensure_source_view();
 		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                vk::AccessFlagBits2::eShaderRead);
+		antialiased = m_aa.Record(m_window.graphic_ctx, vk_command, source->view,
+		                          source->image.format, source_extent);
+	}
+	if (filtered) {
+		if (antialiased) {
+			m_aa.TransitOutput(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
+			                   vk::AccessFlagBits2::eShaderSampledRead,
+			                   vk::PipelineStageFlagBits2::eFragmentShader);
+		} else {
+			ensure_source_view();
+			source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
+			                vk::AccessFlagBits2::eShaderRead);
+		}
+	} else if (antialiased) {
+		m_aa.TransitOutput(vk_command, vk::ImageLayout::eTransferSrcOptimal,
+		                   vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
 	} else if (source != nullptr) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
 	}
+	const vk::Image present_source = antialiased ? m_aa.OutputImage()
+	                                 : source != nullptr ? source->image.image
+	                                                     : vk::Image {};
 	if (draw_overlay) {
 		overlay.frame->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                       vk::AccessFlagBits2::eShaderRead);
@@ -1140,7 +1170,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &to_transfer);
 
 	if (filtered) {
-		m_filter.Record(m_window.graphic_ctx.device, vk_command, source->view, 0, source_extent,
+		m_filter.Record(m_window.graphic_ctx.device, vk_command,
+		                antialiased ? m_aa.OutputView() : source->view, 0, source_extent,
 		                m_image_views[m_image_index], m_format, m_extent);
 	} else if (source != nullptr) {
 		vk::ImageBlit region {};
@@ -1158,7 +1189,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
 		region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
 		region.dstOffsets[1].z               = 1;
-		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
+		vk_command.blitImage(present_source, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
 	} else {

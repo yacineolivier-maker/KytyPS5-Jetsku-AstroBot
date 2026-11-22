@@ -463,6 +463,36 @@ add_gpu_blit_shader(gpu_blit_color32_to_depth gpu_blit_color32_to_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_video_out_downscale gpu_video_out_downscale.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+# Astro Bot PC (KYTY_PRESENT_AA) : SMAA 1x a la presentation (window/presentAntiAliasing.cpp).
+# Sources officielles de SMAA (github.com/iryoku/smaa 71c806a8, licence MIT) dans 3rdparty/smaa.
+set(smaa_dir "${KYTY_THIRD_PARTY_DIR}/smaa")
+function(add_gpu_present_smaa_shader shader_name stage pass preset)
+	set(shader_source "${gpu_tiler_shader_dir}/gpu_present_smaa.${stage}")
+	set(shader_spv "${gpu_blit_generated_dir}/${shader_name}.spv")
+	set(shader_header "${gpu_blit_generated_dir}/${shader_name}_spv.h")
+	string(TOUPPER "${shader_name}_SPV" shader_symbol)
+	add_custom_command(
+		OUTPUT "${shader_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		        -DSMAA_PASS=${pass} -DSMAA_PRESET_${preset} "-I${smaa_dir}"
+		        -o "${shader_spv}" "${shader_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
+		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${shader_source}" "${smaa_dir}/SMAA.hlsl"
+		VERBATIM
+	)
+	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
+endfunction()
+foreach(smaa_stage vert frag)
+	add_gpu_present_smaa_shader(gpu_present_smaa_edges_high_${smaa_stage} ${smaa_stage} 0 HIGH)
+	add_gpu_present_smaa_shader(gpu_present_smaa_edges_ultra_${smaa_stage} ${smaa_stage} 0 ULTRA)
+	add_gpu_present_smaa_shader(gpu_present_smaa_weights_high_${smaa_stage} ${smaa_stage} 1 HIGH)
+	add_gpu_present_smaa_shader(gpu_present_smaa_weights_ultra_${smaa_stage} ${smaa_stage} 1 ULTRA)
+	add_gpu_present_smaa_shader(gpu_present_smaa_blend_${smaa_stage} ${smaa_stage} 2 HIGH)
+endforeach()
+set_source_files_properties("${KYTY_SOURCE_DIR}/graphics/presentation/window/presentAntiAliasing.cpp"
+	PROPERTIES INCLUDE_DIRECTORIES "${smaa_dir}")
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 set(gpu_dcc_generated_dir "${PROJECT_BINARY_DIR}/gpu_dcc_shaders")
