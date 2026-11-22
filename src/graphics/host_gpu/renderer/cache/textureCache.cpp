@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <array>
 #include <optional>
+#include <set>
 #include <atomic>
 #include <bit>
 #include <cinttypes>
@@ -4687,6 +4688,23 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc,
 	RequireFullResidency(id);
 	TouchImage(image);
 	MarkImageGpuModified(image);
+	// Astro Bot PC (22/11, sortie 1080p) : KYTY_RT_SIZE_LOG=1 écrit dans la console chaque taille de cible de
+	// couleur nouvelle (une fois par taille), pour savoir à quelle résolution le jeu rend chaque étape.
+	static const bool size_log = [] {
+		const char* v = std::getenv("KYTY_RT_SIZE_LOG");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (size_log) {
+		static std::mutex         size_mutex;
+		static std::set<uint64_t> sizes;
+		const uint64_t key = (uint64_t {image.info.extent.width} << 32u) | image.info.extent.height;
+		std::scoped_lock size_lock {size_mutex};
+		if (sizes.insert(key).second) {
+			::printf("Kyty render target size: %ux%u (first use)\n", image.info.extent.width,
+			         image.info.extent.height);
+			std::fflush(stdout);
+		}
+	}
 	image.usage.render_target = true;
 	RefreshImage(id, RefreshIntent::Write);
 	// KYTY_ALIAS_BYTES: the draw can write only inside its scissor. The target owns the 64 KiB

@@ -1536,6 +1536,24 @@ KYTY_SYSV_ABI int VideoOutClose(int handle) {
 	return DriverState().Close(handle) ? OK : VIDEO_OUT_ERROR_INVALID_HANDLE;
 }
 
+// Astro Bot PC (22/11, sortie 1080p) : adresse de retour dans le code du jeu et adresses du code du jeu (eboot
+// 0x900000000-0x9074c0000) trouvées dans les 4 Ko de pile au-dessus : pile d'appels approximative, pour retrouver
+// où le jeu choisit la taille de ses images d'affichage.
+[[gnu::noinline]] static void PrintGuestCallers(const char* what, const void* ret, const void* frame) {
+	::printf("VideoOut: %s called from 0x%016llx; stack:", what, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ret)));
+	const auto* p = static_cast<const uint64_t*>(frame);
+	int found = 0;
+	for (int i = 0; i < 512 && found < 16; i++) {
+		const uint64_t v = p[i];
+		if (v >= 0x900000000ull && v < 0x9074c0000ull) {
+			::printf(" +0x%llx", static_cast<unsigned long long>(v - 0x900000000ull));
+			found++;
+		}
+	}
+	::printf("\n");
+	std::fflush(stdout);
+}
+
 KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribute,
                                                uint64_t pixel_format, uint32_t tiling_mode,
                                                uint32_t width, uint32_t height, uint64_t option,
@@ -1554,6 +1572,10 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
 	     "\t dcc_cb_register_clear_color = %016" PRIx64 "\n",
 	     pixel_format, tiling_mode, width, height, option, dcc_control,
 	     dcc_cb_register_clear_color);
+
+	::printf("VideoOut: SetBufferAttribute2 %ux%u format 0x%016llx\n", width, height,
+	         static_cast<unsigned long long>(pixel_format));
+	PrintGuestCallers("SetBufferAttribute2", __builtin_return_address(0), __builtin_frame_address(0));
 
 	memset(attribute, 0, sizeof(VideoOutBufferAttribute2));
 
@@ -1674,6 +1696,7 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	         set_index, buffer_num, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	         attribute->pixel_format, category);
 	std::fflush(stdout);
+	PrintGuestCallers("RegisterBuffers2", __builtin_return_address(0), __builtin_frame_address(0));
 
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
