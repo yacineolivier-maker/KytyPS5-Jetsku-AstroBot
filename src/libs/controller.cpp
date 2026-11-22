@@ -1189,9 +1189,41 @@ void CycleKeyboardPlayer() {
 	}
 }
 
+// Astro Bot PC (22/11) KYTY_PAD_ACTIVE_FIRST=1 : la manette sur laquelle on appuie devient le joueur 1. Les pads
+// sont donnés aux joueurs dans l ordre où Windows les signale : un récepteur sans fil à deux emplacements (une
+// manette éteinte) peut ainsi faire de la manette utilisée le joueur 2, que l écran titre d Astro Bot ignore.
+static bool PadActiveFirst() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_PAD_ACTIVE_FIRST");
+		return v != nullptr && v[0] == '1';
+	}();
+	return enabled;
+}
+
+// Caller holds g_router_mutex.
+static void MakePlayerOne(int id) {
+	auto it = std::find_if(g_pad_players.begin(), g_pad_players.end(), [id](const auto& pad) { return pad.first == id; });
+	if (it == g_pad_players.end() || it->second == 0) {
+		return;
+	}
+	const int previous = it->second;
+	for (auto& pad: g_pad_players) {
+		if (pad.second == 0) {
+			pad.second = previous;
+		}
+	}
+	it->second = 0;
+	::printf("Controller %d becomes player 1 (KYTY_PAD_ACTIVE_FIRST)\n", id);
+	std::fflush(stdout);
+	RefreshPlayers();
+}
+
 void SetButton(int id, uint32_t button, bool down) {
 	{
 		Common::LockGuard lock(g_router_mutex);
+		if (down && PadActiveFirst() && id != HOST_INPUT_CONTROLLER_ID) {
+			MakePlayerOne(id);
+		}
 		if (auto* player = PlayerForDevice(id)) {
 			player->Button(id, button, down);
 		}
